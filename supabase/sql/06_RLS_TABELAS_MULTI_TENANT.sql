@@ -161,7 +161,10 @@ BEGIN
         AND table_name = tbl
     ) THEN
 
-      REVOKE ALL ON TABLE public.%I FROM anon;
+     EXECUTE format(
+  'REVOKE ALL ON TABLE public.%I FROM anon',
+  tbl
+);
 
       EXECUTE format(
         'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO authenticated',
