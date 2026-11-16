@@ -9,8 +9,8 @@
  * 3. Cache Storage Segregado: Permite purga seletiva de versões antigas sem perder cache de fotos.
  */
 
-const CACHE_APP_SHELL = 'porttohub-shell-v6';
-const CACHE_ESTATICOS_ASSETS = 'porttohub-assets-v6';
+const CACHE_APP_SHELL = 'porttohub-shell-v7';
+const CACHE_ESTATICOS_ASSETS = 'porttohub-assets-v7';
 
 const ASSETS_ESSENCIAIS = [
   '/',
@@ -52,11 +52,12 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
 
-  // Nunca intercepta/cacheia Auth, API, Supabase REST/Storage, URLs assinadas ou módulos Vite dev
+  // Nunca intercepta/cacheia Auth, API, /env-config.js, Supabase REST/Storage, URLs assinadas ou módulos Vite dev
   if (
     url.protocol === 'ws:' ||
     url.protocol === 'wss:' ||
     url.hostname.includes('supabase.co') ||
+    url.pathname === '/env-config.js' ||
     url.pathname.startsWith('/src/') ||
     url.pathname.startsWith('/@') ||
     url.pathname.startsWith('/node_modules/') ||

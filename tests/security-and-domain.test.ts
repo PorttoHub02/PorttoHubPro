@@ -717,3 +717,36 @@ test('Formatação detalhada de erros Supabase (rede, apikey, RLS e Auth)', () =
   assert.ok(errRls.includes('42501'));
   assert.ok(errRls.toLowerCase().includes('rls'));
 });
+
+test('Infraestrutura oficial: diagnóstico seguro em banco vazio, Worker porttohubpro, /env-config.js e README sem contradições', () => {
+  const sql00b = fs.readFileSync(path.resolve('supabase/sql/00B_DIAGNOSTICO_DESTINO.sql'), 'utf8');
+  const sql07 = fs.readFileSync(path.resolve('supabase/sql/07_STORAGE_PRIVADO_POLICIES.sql'), 'utf8');
+  const sql09 = fs.readFileSync(path.resolve('supabase/sql/09_VALIDACAO_SEGURANCA.sql'), 'utf8');
+  const wranglerRaw = fs.readFileSync(path.resolve('wrangler.jsonc'), 'utf8');
+  const wranglerCfg = JSON.parse(wranglerRaw);
+  const swCode = fs.readFileSync(path.resolve('public/sw.js'), 'utf8');
+  const readmeCode = fs.readFileSync(path.resolve('README.md'), 'utf8');
+
+  // 00B não pode conter FROM public.<tabela> direto fora de string dinâmica protegida por to_regclass
+  assert.equal(/^\s*FROM\s+public\.(operadores|condominios|moradores|encomendas_itens)\b/im.test(sql00b), false);
+  assert.ok(sql00b.includes("to_regclass('public.operadores')"));
+  assert.ok(sql00b.includes("to_regclass('public.condominios')"));
+  assert.ok(sql00b.includes("to_regclass('public.moradores')"));
+  assert.ok(sql00b.includes("to_regclass('public.encomendas_itens')"));
+
+  // 07 e 09 consistentes com sequência única oficial
+  assert.equal(sql07.includes('somente DEPOIS que a versão atualizada'), false);
+  assert.ok(sql09.includes('RESUMO CONSOLIDADO'));
+
+  // Worker existente porttohubpro + /env-config.js antes de assets
+  assert.equal(wranglerCfg.name, 'porttohubpro');
+  assert.ok(Array.isArray(wranglerCfg.assets?.run_worker_first));
+  assert.ok(wranglerCfg.assets.run_worker_first.includes('/api/*'));
+  assert.ok(wranglerCfg.assets.run_worker_first.includes('/env-config.js'));
+
+  // Service worker não pode cachear /env-config.js
+  assert.ok(swCode.includes("url.pathname === '/env-config.js'"));
+
+  // README explicitamente proíbe rodar script 10 na instalação normal
+  assert.ok(readmeCode.includes('NÃO execute `10_ROLLBACK_OU_RECUPERACAO.sql` durante a instalação normal'));
+});

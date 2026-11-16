@@ -7,13 +7,14 @@
 --      por links públicos abertos na internet.
 --   2. Remove políticas antigas TO public e exige usuário autenticado + acesso
 --      ao condomínio dono da pasta (condominios/{condominio_id}/...).
---   3. Permite leitura controlada de arquivos legados que ainda estejam na raiz
---      durante a janela de transição, apenas para usuários autenticados.
 --
--- IMPORTANTE:
---   Aplique este script somente DEPOIS que a versão atualizada do aplicativo
---   (com suporte a URLs assinadas e upload em condominios/{condominio_id}/...)
---   já estiver no ar e os operadores autenticados via Supabase Auth.
+-- QUANDO EXECUTAR (SEQUÊNCIA ÚNICA OFICIAL):
+--   - Em banco NOVO / implantação inicial: execute normalmente na ordem oficial,
+--     logo após 06_RLS_TABELAS_MULTI_TENANT.sql e antes de 08 e 09, garantindo
+--     que o Storage já nasça 100% privado antes da publicação no Cloudflare.
+--   - Em atualização de sistema legado em produção: certifique-se de que o
+--     frontend publicado já utiliza URLs assinadas e prefixo
+--     condominios/{condominio_id}/... antes de aplicar este bloqueio.
 -- ============================================================================
 
 BEGIN;

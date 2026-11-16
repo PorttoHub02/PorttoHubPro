@@ -1,5 +1,5 @@
 -- ============================================================================
--- PORTTOHUB PRO — 01_DIAGNOSTICO_DESTINO.sql (100% SOMENTE LEITURA)
+-- PORTTOHUB PRO — 00B_DIAGNOSTICO_DESTINO.sql (100% SOMENTE LEITURA)
 -- ============================================================================
 -- O QUE ESTE ARQUIVO FAZ:
 --   Inspeciona o banco de dados Supabase de DESTINO (onde o PorttoHub Pro vai
@@ -9,6 +9,7 @@
 --
 -- SEGURANÇA:
 --   Este script contém APENAS consultas SELECT (somente leitura).
+--   Funciona normalmente mesmo com o banco 100% VAZIO (0 tabelas em public).
 --   Ele NÃO altera, NÃO apaga e NÃO cria nada no banco.
 --
 -- ONDE EXECUTAR:
@@ -16,7 +17,7 @@
 --   2. No menu esquerdo, clique em "SQL Editor".
 --   3. Clique em "+ New query".
 --   4. Cole TODO este script e clique em "Run".
---   5. Envie o resultado antes de executar os scripts de alteração final de FK/RLS.
+--   5. Confira o resumo final retornado antes de executar o script 01.
 -- ============================================================================
 
 -- 1. TABELAS EXISTENTES NO SCHEMA PUBLIC, RLS E VOLUME ESTIMADO
@@ -189,31 +190,122 @@ FROM auth.users
 ORDER BY created_at DESC;
 
 SELECT
-  id,
-  nome,
-  login,
-  funcao,
-  perfil,
-  nivel_acesso,
-  condominio_id,
-  ativo,
-  created_at
-FROM public.operadores
-ORDER BY nome;
+  x.id,
+  x.nome,
+  x.login,
+  x.funcao,
+  x.perfil,
+  x.nivel_acesso,
+  x.condominio_id,
+  x.ativo,
+  x.created_at
+FROM (
+  SELECT CASE
+    WHEN to_regclass('public.operadores') IS NOT NULL
+      THEN query_to_xml(
+        'SELECT o.id::text, o.nome::text, o.login::text, (to_jsonb(o)->>''funcao'') AS funcao, (to_jsonb(o)->>''perfil'') AS perfil, (to_jsonb(o)->>''nivel_acesso'') AS nivel_acesso, o.condominio_id::text, o.ativo::text, o.created_at::text FROM public.operadores o ORDER BY o.nome',
+        false, false, ''
+      )
+    ELSE '<table><row><id>-</id><nome>TABELA public.operadores AINDA NAO EXISTE (normal em banco novo antes do script 01)</nome><login>-</login><funcao>-</funcao><perfil>-</perfil><nivel_acesso>-</nivel_acesso><condominio_id>-</condominio_id><ativo>-</ativo><created_at>-</created_at></row></table>'::xml
+  END AS doc
+) src,
+XMLTABLE(
+  '/table/row'
+  PASSING src.doc
+  COLUMNS
+    id TEXT PATH 'id',
+    nome TEXT PATH 'nome',
+    login TEXT PATH 'login',
+    funcao TEXT PATH 'funcao',
+    perfil TEXT PATH 'perfil',
+    nivel_acesso TEXT PATH 'nivel_acesso',
+    condominio_id TEXT PATH 'condominio_id',
+    ativo TEXT PATH 'ativo',
+    created_at TEXT PATH 'created_at'
+) x;
 
--- 13. CONDOMINIOS NO DESTINO E CONFERENCIA DE INTEGRIDADE DE ENCOMENDAS/MORADORES
-SELECT id, nome, ativo, created_at FROM public.condominios ORDER BY nome;
+-- 13. CONDOMINIOS NO DESTINO E CONFERENCIA DE INTEGRIDADE DE ENCOMENDAS/MORADORES (SEGURO PARA BANCO VAZIO)
+SELECT
+  x.id,
+  x.nome,
+  x.ativo,
+  x.created_at
+FROM (
+  SELECT CASE
+    WHEN to_regclass('public.condominios') IS NOT NULL
+      THEN query_to_xml(
+        'SELECT c.id::text, c.nome::text, c.ativo::text, c.created_at::text FROM public.condominios c ORDER BY c.nome',
+        false, false, ''
+      )
+    ELSE '<table><row><id>-</id><nome>TABELA public.condominios AINDA NAO EXISTE (normal em banco novo antes do script 01)</nome><ativo>-</ativo><created_at>-</created_at></row></table>'::xml
+  END AS doc
+) src,
+XMLTABLE(
+  '/table/row'
+  PASSING src.doc
+  COLUMNS
+    id TEXT PATH 'id',
+    nome TEXT PATH 'nome',
+    ativo TEXT PATH 'ativo',
+    created_at TEXT PATH 'created_at'
+) x;
 
 SELECT
   'moradores_sem_condominio_valido' AS verificacao,
-  COUNT(*) AS quantidade
-FROM public.moradores m
-LEFT JOIN public.condominios c ON c.id::text = m.condominio_id::text
-WHERE m.condominio_id IS NULL OR c.id IS NULL
+  CASE
+    WHEN to_regclass('public.moradores') IS NOT NULL
+     AND to_regclass('public.condominios') IS NOT NULL
+      THEN (xpath('/table/row/quantidade/text()', query_to_xml(
+        'SELECT COUNT(*)::text AS quantidade FROM public.moradores m LEFT JOIN public.condominios c ON c.id::text = m.condominio_id::text WHERE m.condominio_id IS NULL OR c.id IS NULL',
+        false, false, ''
+      )))[1]::text
+    ELSE 'N/A (tabelas ainda nao existem — normal antes do script 01)'
+  END AS quantidade
 UNION ALL
 SELECT
   'encomendas_sem_condominio_valido',
-  COUNT(*)
-FROM public.encomendas_itens e
-LEFT JOIN public.condominios c ON c.id::text = e.condominio_id::text
-WHERE e.condominio_id IS NULL OR c.id IS NULL;
+  CASE
+    WHEN to_regclass('public.encomendas_itens') IS NOT NULL
+     AND to_regclass('public.condominios') IS NOT NULL
+      THEN (xpath('/table/row/quantidade/text()', query_to_xml(
+        'SELECT COUNT(*)::text AS quantidade FROM public.encomendas_itens e LEFT JOIN public.condominios c ON c.id::text = e.condominio_id::text WHERE e.condominio_id IS NULL OR c.id IS NULL',
+        false, false, ''
+      )))[1]::text
+    ELSE 'N/A (tabelas ainda nao existem — normal antes do script 01)'
+  END;
+
+-- 14. RESUMO GERAL DO DIAGNOSTICO (SEMPRE VISIVEL NO SQL EDITOR)
+SELECT
+  'Tabelas no schema public' AS item,
+  (SELECT COUNT(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')) AS resultado,
+  '0 significa banco novo/zerado pronto para o script 01' AS observacao
+UNION ALL
+SELECT
+  'Tabela operadores existe?',
+  CASE WHEN to_regclass('public.operadores') IS NOT NULL THEN 'SIM' ELSE 'NAO (normal antes do script 01)' END,
+  'Sera criada no script 01'
+UNION ALL
+SELECT
+  'Tabela condominios existe?',
+  CASE WHEN to_regclass('public.condominios') IS NOT NULL THEN 'SIM' ELSE 'NAO (normal antes do script 01)' END,
+  'Sera criada no script 01'
+UNION ALL
+SELECT
+  'Tabela moradores existe?',
+  CASE WHEN to_regclass('public.moradores') IS NOT NULL THEN 'SIM' ELSE 'NAO (normal antes do script 01)' END,
+  'Sera criada no script 01'
+UNION ALL
+SELECT
+  'Tabela encomendas_itens existe?',
+  CASE WHEN to_regclass('public.encomendas_itens') IS NOT NULL THEN 'SIM' ELSE 'NAO (normal antes do script 01)' END,
+  'Sera criada no script 01'
+UNION ALL
+SELECT
+  'Usuarios cadastrados em auth.users',
+  (SELECT COUNT(*)::text FROM auth.users),
+  'O 1o Administrador sera criado antes do script 03'
+UNION ALL
+SELECT
+  'Bucket encomendas existe no Storage?',
+  CASE WHEN EXISTS (SELECT 1 FROM storage.buckets WHERE id = 'encomendas') THEN 'SIM' ELSE 'NAO (sera criado no script 07)' END,
+  'Sera configurado como privado no script 07';

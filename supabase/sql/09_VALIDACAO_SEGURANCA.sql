@@ -61,3 +61,93 @@ WHERE acesso_global_condominios = TRUE;
 SELECT id, nome, login, email, condominio_id, ativo
 FROM public.operadores
 WHERE auth_user_id IS NULL AND COALESCE(ativo, TRUE) = TRUE;
+
+-- 7. RESUMO CONSOLIDADO PARA CONFERENCIA RAPIDA NO SQL EDITOR
+SELECT * FROM (
+  SELECT
+    1 AS ordem,
+    '1. Politicas permissivas (USING true)' AS verificacao,
+    (
+      SELECT COUNT(*) FROM pg_policies
+      WHERE schemaname IN ('public', 'storage')
+        AND (COALESCE(qual, '') IN ('true', '(true)') OR COALESCE(with_check, '') IN ('true', '(true)'))
+    ) AS valor_encontrado,
+    'Esperado: 0' AS criterio,
+    CASE WHEN (
+      SELECT COUNT(*) FROM pg_policies
+      WHERE schemaname IN ('public', 'storage')
+        AND (COALESCE(qual, '') IN ('true', '(true)') OR COALESCE(with_check, '') IN ('true', '(true)'))
+    ) = 0 THEN 'OK' ELSE 'ATENCAO' END AS status
+  UNION ALL
+  SELECT
+    2,
+    '2. Tabelas public sem RLS ativo',
+    (
+      SELECT COUNT(*) FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity = FALSE
+    ),
+    'Esperado: 0',
+    CASE WHEN (
+      SELECT COUNT(*) FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity = FALSE
+    ) = 0 THEN 'OK' ELSE 'ATENCAO' END
+  UNION ALL
+  SELECT
+    3,
+    '3. Permissoes diretas para anon em public',
+    (
+      SELECT COUNT(*) FROM information_schema.role_table_grants
+      WHERE table_schema = 'public' AND grantee = 'anon'
+    ),
+    'Esperado: 0',
+    CASE WHEN (
+      SELECT COUNT(*) FROM information_schema.role_table_grants
+      WHERE table_schema = 'public' AND grantee = 'anon'
+    ) = 0 THEN 'OK' ELSE 'ATENCAO' END
+  UNION ALL
+  SELECT
+    4,
+    '4. Bucket encomendas configurado como privado',
+    (
+      SELECT COUNT(*) FROM storage.buckets
+      WHERE id = 'encomendas' AND public = FALSE
+    ),
+    'Esperado: 1',
+    CASE WHEN (
+      SELECT COUNT(*) FROM storage.buckets
+      WHERE id = 'encomendas' AND public = FALSE
+    ) = 1 THEN 'OK' ELSE 'ATENCAO' END
+  UNION ALL
+  SELECT
+    5,
+    '5. Administradores globais ativos vinculados ao Auth',
+    (
+      SELECT COUNT(*) FROM public.operadores
+      WHERE acesso_global_condominios = TRUE
+        AND COALESCE(ativo, TRUE) = TRUE
+        AND auth_user_id IS NOT NULL
+    ),
+    'Esperado: >= 1',
+    CASE WHEN (
+      SELECT COUNT(*) FROM public.operadores
+      WHERE acesso_global_condominios = TRUE
+        AND COALESCE(ativo, TRUE) = TRUE
+        AND auth_user_id IS NOT NULL
+    ) >= 1 THEN 'OK' ELSE 'ATENCAO' END
+  UNION ALL
+  SELECT
+    6,
+    '6. Operadores ativos ainda sem auth_user_id',
+    (
+      SELECT COUNT(*) FROM public.operadores
+      WHERE auth_user_id IS NULL AND COALESCE(ativo, TRUE) = TRUE
+    ),
+    'Esperado: 0',
+    CASE WHEN (
+      SELECT COUNT(*) FROM public.operadores
+      WHERE auth_user_id IS NULL AND COALESCE(ativo, TRUE) = TRUE
+    ) = 0 THEN 'OK' ELSE 'ATENCAO' END
+) resumo
+ORDER BY ordem;

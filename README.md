@@ -39,49 +39,55 @@ Aplicação web/PWA multi-condomínio (multi-tenant) para operação de portaria
 
 ---
 
-## 2. Variáveis de Ambiente
+## 2. Variáveis de Ambiente e Método Oficial de Configuração
 
 Veja `.env.example`. Nunca comite chaves reais ou tokens no repositório.
 
-### Frontend (`VITE_*` — públicas no bundle)
-- `VITE_SUPABASE_URL`
-- `VITE_SUPABASE_ANON_KEY`
+### Método Oficial Único no Cloudflare Worker (`porttohubpro`)
+O Worker possui o endpoint dinâmico `GET /env-config.js`, que lê as variáveis de ambiente do próprio Worker e as entrega ao navegador antes do carregamento da aplicação React. Portanto, **não é necessário duplicar variáveis de build e runtime**:
 
-### Servidor / Cloudflare Workers Secrets (privadas — somente backend)
-- `SUPABASE_URL`
-- `SUPABASE_ANON_KEY`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `UPSTASH_REDIS_REST_URL`
-- `UPSTASH_REDIS_REST_TOKEN`
-- `GEMINI_API_KEY` (opcional, para `/api/ocr-etiqueta`)
-- `GEMINI_OCR_MODEL` (padrão `gemini-4-hydrogen`)
-- `GITHUB_TOKEN` (opcional, leitura de versão em `/api/github-versao`)
+#### Variáveis Públicas (cadastrar como **Text / Plaintext** em *Variables and Secrets*)
+- `SUPABASE_URL` — URL do projeto Supabase (ex.: `https://npqcrifwkfovrrsnktyb.supabase.co`)
+- `SUPABASE_ANON_KEY` — Chave pública `anon` do projeto Supabase
 
-> Em produção no Cloudflare Worker, `GET /env-config.js` injeta dinamicamente `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY` públicos no cliente, permitindo atualização via Worker secrets sem hardcode.
+> *(Opcional em builds locais com `.env`: `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`. Em produção no Cloudflare Worker, `SUPABASE_URL` e `SUPABASE_ANON_KEY` já alimentam tanto o backend `/api/*` quanto o frontend via `/env-config.js`.)*
+
+#### Secrets Privados (cadastrar como **Secret / Encrypted** em *Variables and Secrets*)
+- `SUPABASE_SERVICE_ROLE_KEY` — Chave administrativa server-only (obrigatória para provisionamento de operadores; nunca exposta ao navegador)
+- `UPSTASH_REDIS_REST_URL` — Endpoint REST do Upstash Redis
+- `UPSTASH_REDIS_REST_TOKEN` — Token REST do Upstash Redis
+- `GEMINI_API_KEY` — *(opcional)* Chave Gemini para `/api/ocr-etiqueta`
+- `GITHUB_TOKEN` — *(opcional)* Token read-only para `/api/github-versao`
 
 ---
 
-## 3. Migrações Supabase (`supabase/sql/`)
+## 3. Sequência Oficial Completa das Migrações Supabase (`supabase/sql/`)
 
-Execute no SQL Editor do projeto Supabase novo na ordem exata abaixo (scripts idempotentes e não destrutivos):
+Execute no **SQL Editor** do projeto Supabase novo na ordem exata abaixo (todos os scripts são idempotentes e não destrutivos):
 
-1. `00B_DIAGNOSTICO_DESTINO.sql` — Diagnóstico prévio do projeto destino
-2. `01_CRIAR_TABELAS_DO_ZERO.sql` — Criação das tabelas operacionais (já sem coluna `senha` em `operadores`)
-3. `02_PREPARAR_ESTRUTURA_OPERADORES.sql` — Colunas Auth/RBAC de operadores (compatibilidade legada não destrutiva)
-4. `03_VINCULAR_OPERADORES_A_AUTH.sql` — Vínculo `operadores.auth_user_id` com `auth.users`
-5. `04_VINCULOS_OPERADOR_CONDOMINIO.sql` — Tabela multi-vínculo `operador_condominios`
-6. `05_FUNCOES_AUTORIZACAO.sql` — Funções `SECURITY DEFINER` de autorização (`operador_pode_acessar_condominio`, `operador_tem_acesso_global`, `operador_pode_gerenciar_operadores`, etc.)
-7. `05B_FUNCOES_PASSE_QR.sql` — RPC transacional `validar_e_consumir_passe_qr` com `FOR UPDATE`
-8. `06_RLS_TABELAS_MULTI_TENANT.sql` — Habilitação e políticas RLS por condomínio em todas as tabelas
-9. `07_STORAGE_PRIVADO_POLICIES.sql` — Bucket privado `encomendas` e políticas estritas por prefixo `condominios/{condominio_id}/...`
-10. `08_INDICES_E_CONSTRAINTS.sql` — Índices compostos por `condominio_id` e constraints de integridade (`ux_passes_qr_condo_token`, `chk_passes_qr_usos_limite`, etc.)
-11. `09_VALIDACAO_SEGURANCA.sql` — Auditoria automatizada de RLS, funções, storage e tabelas
-12. `10_ROLLBACK_OU_RECUPERACAO.sql` — Procedimentos de reversão segura sem `DROP TABLE`
+1. `00B_DIAGNOSTICO_DESTINO.sql` — Diagnóstico somente leitura (seguro mesmo em banco 100% vazio)
+2. `01_CRIAR_TABELAS_DO_ZERO.sql` — Criação das 35 tabelas operacionais (já sem coluna `senha` em `operadores`)
+3. `02_PREPARAR_ESTRUTURA_OPERADORES.sql` — Colunas Auth/RBAC e índices únicos de operadores
+4. **PASSO MANUAL NO PAINEL AUTH (obrigatório antes do script 03):**
+   - Acesse **Authentication -> Users -> Add user -> Create new user**
+   - Informe o e-mail e senha forte do 1º Administrador Geral e mantenha **Auto Confirm User** marcado
+5. `03_VINCULAR_OPERADORES_A_AUTH.sql` — Edite os 3 campos (`v_email_admin`, `v_nome_admin`, `v_nome_condominio`) e execute para criar o 1º condomínio e vincular o Administrador Geral
+6. `04_VINCULOS_OPERADOR_CONDOMINIO.sql` — Tabela oficial multi-vínculo `operador_condominios`
+7. `05_FUNCOES_AUTORIZACAO.sql` — Funções `SECURITY DEFINER` de autorização (`operador_pode_acessar_condominio`, `operador_tem_acesso_global`, `operador_pode_gerenciar_operadores`, etc.)
+8. `05B_FUNCOES_PASSE_QR.sql` — RPC transacional `validar_e_consumir_passe_qr` com `FOR UPDATE`
+9. `06_RLS_TABELAS_MULTI_TENANT.sql` — Habilitação e políticas RLS por condomínio em todas as tabelas
+10. `07_STORAGE_PRIVADO_POLICIES.sql` — Bucket privado `encomendas` e políticas estritas por prefixo `condominios/{condominio_id}/...` (executado nesta etapa em banco novo antes de publicar o app)
+11. `08_INDICES_E_CONSTRAINTS.sql` — Índices compostos por `condominio_id` e constraints de integridade (`ux_passes_qr_condo_token`, `chk_passes_qr_usos_limite`, etc.)
+12. `09_VALIDACAO_SEGURANCA.sql` — Auditoria automatizada final (deve exibir `OK` nos 6 itens do resumo)
+
+> **ATENÇÃO — NÃO EXECUTAR NA INSTALAÇÃO NORMAL:**
+> O arquivo `10_ROLLBACK_OU_RECUPERACAO.sql` é uma ferramenta manual de **contingência/emergência** (uso exclusivo de suporte caso um operador específico perca vínculo posteriormente). **NÃO execute `10_ROLLBACK_OU_RECUPERACAO.sql` durante a instalação normal.**
 
 ---
 
 ## 4. Endpoints Backend (`/api/*`)
 
+- `GET /env-config.js` — Injeta configuração pública do Supabase (`VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`) no cliente em runtime
 - `GET /api/health` — Saúde do servidor/Worker e status de configuração (sem segredos)
 - `GET /api/github-versao` — Último commit do repositório `PorttoHub02/PorttoHubPro`
 - `POST /api/ocr-etiqueta` — Extração OCR de etiquetas via Gemini no backend (requer JWT)
@@ -91,7 +97,9 @@ Execute no SQL Editor do projeto Supabase novo na ordem exata abaixo (scripts id
 
 ---
 
-## 5. Scripts e Implantação (Cloudflare Workers)
+## 5. Scripts e Implantação (Cloudflare Worker `porttohubpro`)
+
+O arquivo `wrangler.jsonc` aponta diretamente para `"name": "porttohubpro"`, reutilizando o Worker já existente na conta Cloudflare sem criar serviços duplicados.
 
 ```bash
 npm install
@@ -99,17 +107,13 @@ npm run dev       # Servidor Express + Vite na porta 3000
 npm test          # Suíte de testes de segurança, domínio e auditoria
 npm run lint      # Verificação TypeScript (tsc --noEmit)
 npm run build     # Build de produção em ./dist
-npm run deploy    # Build + wrangler deploy para Cloudflare Workers (wrangler.jsonc)
+npm run deploy    # Build + wrangler deploy no Worker existente (porttohubpro)
 ```
 
-Para configurar secrets no Cloudflare Worker:
+Para configurar secrets via CLI no Worker `porttohubpro` (ou cadastre pelo painel Cloudflare em *Workers & Pages -> porttohubpro -> Settings -> Variables and Secrets*):
 ```bash
-npx wrangler secret put SUPABASE_URL
-npx wrangler secret put SUPABASE_ANON_KEY
 npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
 npx wrangler secret put UPSTASH_REDIS_REST_URL
 npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
-npx wrangler secret put VITE_SUPABASE_URL
-npx wrangler secret put VITE_SUPABASE_ANON_KEY
 npx wrangler secret put GEMINI_API_KEY
 ```
