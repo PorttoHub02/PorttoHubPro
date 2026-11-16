@@ -1,4 +1,13 @@
-import { supabase } from './supabase';
+import { createClient } from '@supabase/supabase-js';
+import {
+  supabase,
+  obterSupabaseUrl,
+  obterSupabaseKey,
+  formatarErroDetalhadoSupabase
+} from './supabase';
+
+export const OPERADOR_SAFE_COLUMNS =
+  'id,condominio_id,auth_user_id,nome,login,email,funcao,cargo,perfil,telefone,unidade,turno,turno_padrao,nivel_acesso,nivel_acesso_custom_id,permissoes,foto_url,acesso_global_condominios,exigir_troca_senha,migrado_auth_em,ativo,created_at,updated_at';
 
 export interface CondominioResumo {
   id: string;
@@ -293,4 +302,166 @@ export function resolverContextoCondominiosOperador(params: {
     condominiosPermitidos: permitidos,
     condominioInicialId: preferido || permitidos[0].id
   };
+}
+
+/**
+ * Reautentica um operador entrante via Supabase Auth usando um cliente efêmero sem persistência
+ * (persistSession: false), garantindo que a sessão principal do operador atual não seja
+ * substituída indevidamente nem armazene tokens/senhas em localStorage.
+ */
+export async function verificarCredenciaisOperadorSupabaseAuth(params: {
+  email: string;
+  password: string;
+  expectedAuthUserId?: string | null;
+  authVerifier?: (email: string, password: string) => Promise<{ userId: string | null; error?: any }>;
+}): Promise<{ ok: boolean; authUserId?: string; error?: string }> {
+  const emailLimpo = String(params.email || '').trim().toLowerCase();
+  const senhaLimpa = String(params.password || '');
+
+  if (!emailLimpo || !emailLimpo.includes('@')) {
+    return {
+      ok: false,
+      error: 'Operador entrante sem e-mail válido vinculado ao Supabase Auth. Solicite ao administrador configurar o acesso em Cadastros.'
+    };
+  }
+  if (!senhaLimpa) {
+    return { ok: false, error: 'Informe a senha de acesso do operador entrante.' };
+  }
+
+  try {
+    let userId: string | null = null;
+
+    if (params.authVerifier) {
+      const customRes = await params.authVerifier(emailLimpo, senhaLimpa);
+      if (customRes.error || !customRes.userId) {
+        return {
+          ok: false,
+          error: customRes.error
+            ? formatarErroDetalhadoSupabase(customRes.error, 'Reautenticação Supabase Auth')
+            : 'Credenciais inválidas no Supabase Auth.'
+        };
+      }
+      userId = customRes.userId;
+    } else {
+      const url = obterSupabaseUrl();
+      const anonKey = obterSupabaseKey();
+      if (!url || !anonKey) {
+        return { ok: false, error: 'Configuração Supabase ausente no ambiente.' };
+      }
+
+      const memoryStorage = {
+        getItem: (_key: string) => null,
+        setItem: (_key: string, _value: string) => {},
+        removeItem: (_key: string) => {}
+      };
+
+      const ephemeralClient = createClient(url, anonKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+          storage: memoryStorage as any,
+          storageKey: 'porttohub-ephemeral-reauth'
+        }
+      });
+
+      const { data, error } = await ephemeralClient.auth.signInWithPassword({
+        email: emailLimpo,
+        password: senhaLimpa
+      });
+      await ephemeralClient.auth.signOut().catch(() => {});
+
+      if (error || !data?.user?.id) {
+        return {
+          ok: false,
+          error: error
+            ? formatarErroDetalhadoSupabase(error, 'Reautenticação Supabase Auth')
+            : 'Credenciais inválidas no Supabase Auth.'
+        };
+      }
+      userId = data.user.id;
+    }
+
+    if (params.expectedAuthUserId && userId !== params.expectedAuthUserId) {
+      return {
+        ok: false,
+        error: 'A conta autenticada no Supabase Auth não corresponde ao auth_user_id vinculado a este operador.'
+      };
+    }
+
+    return { ok: true, authUserId: userId };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: formatarErroDetalhadoSupabase(err, 'Falha ao validar credenciais no Supabase Auth')
+    };
+  }
+}
+
+/**
+ * Busca operador ativo usando apenas colunas seguras (nunca select('*') nem senha)
+ * dentro do condomínio autorizado para validação na troca de posto/ronda.
+ */
+export async function buscarOperadorParaReautenticacao(params: {
+  condominioId: string;
+  operadorId?: string;
+  identificador?: string;
+}): Promise<{ operador: any | null; error?: string }> {
+  const { condominioId, operadorId, identificador } = params;
+  if (!isCondominioIdValido(condominioId)) {
+    return { operador: null, error: 'Condomínio inválido para validar operador.' };
+  }
+
+  try {
+    if (operadorId) {
+      const { data, error } = await supabase
+        .from('operadores')
+        .select(OPERADOR_SAFE_COLUMNS)
+        .eq('id', operadorId)
+        .eq('condominio_id', condominioId)
+        .eq('ativo', true)
+        .maybeSingle();
+
+      if (error) return { operador: null, error: formatarErroDetalhadoSupabase(error, 'Consulta de operador') };
+      return { operador: data || null };
+    }
+
+    const limpo = String(identificador || '').trim().toLowerCase();
+    if (!limpo) return { operador: null, error: 'Informe o login ou e-mail do operador entrante.' };
+
+    const ehEmail = limpo.includes('@');
+    const queryBase = supabase
+      .from('operadores')
+      .select(OPERADOR_SAFE_COLUMNS)
+      .eq('ativo', true)
+      .eq('condominio_id', condominioId);
+
+    const { data, error } = ehEmail
+      ? await queryBase.ilike('email', limpo).maybeSingle()
+      : await queryBase.ilike('login', limpo).maybeSingle();
+
+    if (error) return { operador: null, error: formatarErroDetalhadoSupabase(error, 'Consulta de operador') };
+    if (data) return { operador: data };
+
+    // Fallback por nome apenas dentro do mesmo condomínio
+    const { data: porNome, error: errNome } = await supabase
+      .from('operadores')
+      .select(OPERADOR_SAFE_COLUMNS)
+      .eq('ativo', true)
+      .eq('condominio_id', condominioId)
+      .ilike('nome', `%${limpo}%`)
+      .limit(2);
+
+    if (errNome) return { operador: null, error: formatarErroDetalhadoSupabase(errNome, 'Consulta de operador') };
+    if (Array.isArray(porNome) && porNome.length === 1) {
+      return { operador: porNome[0] };
+    }
+    if (Array.isArray(porNome) && porNome.length > 1) {
+      return { operador: null, error: 'Mais de um operador encontrado com este nome. Informe o login ou e-mail exato.' };
+    }
+
+    return { operador: null };
+  } catch (err: any) {
+    return { operador: null, error: formatarErroDetalhadoSupabase(err, 'Erro ao consultar operador') };
+  }
 }

@@ -37,6 +37,10 @@ import {
 } from 'lucide-react';
 import ModalGerenciarSetores from '../components/ModalGerenciarSetores';
 import { SetorRonda, SETORES_RONDA_PADRAO, carregarSetoresRonda } from '../services/setoresRonda';
+import {
+  buscarOperadorParaReautenticacao,
+  verificarCredenciaisOperadorSupabaseAuth
+} from '../services/autorizacaoService';
 
 interface RondasProps {
   usuarioLogado?: any;
@@ -230,7 +234,7 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
     try {
       const { data, error } = await supabase
         .from('operadores')
-        .select('id, nome, login, perfil, nivel_acesso, condominio_id, ativo')
+        .select('id, nome, login, email, auth_user_id, perfil, nivel_acesso, condominio_id, ativo')
         .eq('condominio_id', usuarioLogado.condominio_id)
         .eq('ativo', true)
         .order('nome');
@@ -1116,23 +1120,32 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
       return;
     }
 
-    if (!senhaLoginEntrante.trim()) {
-      setMensagem({ tipo: 'erro', texto: 'Digite a senha.' });
+    if (!senhaLoginEntrante) {
+      setMensagem({ tipo: 'erro', texto: 'Digite a senha Supabase Auth do operador entrante.' });
       return;
     }
 
     setLoading(true);
 
     try {
-      const { data: opData, error: opError } = await supabase
-        .from('operadores')
-        .select('*')
-        .eq('id', operadorSelecionadoId)
-        .eq('condominio_id', usuarioLogado.condominio_id)
-        .single();
+      const buscaOp = await buscarOperadorParaReautenticacao({
+        condominioId: usuarioLogado.condominio_id,
+        operadorId: operadorSelecionadoId
+      });
 
-      if (opError || !opData) throw new Error('Operador não encontrado.');
-      if (opData.senha !== senhaLoginEntrante.trim()) throw new Error('Senha incorreta!');
+      if (buscaOp.error) throw new Error(buscaOp.error);
+      const opData = buscaOp.operador;
+      if (!opData) throw new Error('Operador não encontrado neste condomínio.');
+
+      const reauthRes = await verificarCredenciaisOperadorSupabaseAuth({
+        email: opData.email || '',
+        password: senhaLoginEntrante,
+        expectedAuthUserId: opData.auth_user_id || null
+      });
+
+      if (!reauthRes.ok) {
+        throw new Error(reauthRes.error || 'Credenciais inválidas no Supabase Auth!');
+      }
 
       // UNIFICAÇÃO: Grava diretamente na tabela canônica 'passagens_posto'
       const agora = new Date();
@@ -1148,6 +1161,8 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
           codigo: codigoPas,
           operador_sainte_nome: operadorRondaAtual,
           operador_entrante_nome: opData.nome,
+          operador_sainte_id: usuarioLogado?.id || null,
+          operador_entrante_id: opData.id || null,
           observacoes: ocorrenciasPlantao.trim() || 'Troca rápida de ronda/posto realizada.',
           status: 'Concluída'
         }]);
@@ -1951,10 +1966,10 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-slate-800 mb-1">Senha do Operador Entrante</label>
+                <label className="block text-xs font-bold text-slate-800 mb-1">Senha Supabase Auth do Operador Entrante</label>
                 <input
                   type="password"
-                  placeholder="Digite a senha de confirmação"
+                  placeholder="Digite a senha de confirmação (Supabase Auth)"
                   value={senhaLoginEntrante}
                   onChange={(e) => setSenhaLoginEntrante(e.target.value)}
                   style={{ color: '#000000', backgroundColor: '#ffffff', WebkitTextFillColor: '#000000' }}

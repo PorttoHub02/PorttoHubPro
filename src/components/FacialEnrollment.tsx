@@ -20,15 +20,6 @@ interface FacialEnrollmentProps {
   onDone: () => void;
 }
 
-const PRESET_AVATARS = [
-  'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=300',
-  'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=300',
-  'https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&q=80&w=300',
-  'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=300',
-  'https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=300',
-  'https://images.unsplash.com/photo-1580489944761-15a19d654956?auto=format&fit=crop&q=80&w=300'
-];
-
 export const FacialEnrollment: React.FC<FacialEnrollmentProps> = ({
   condo,
   onSaveResident,
@@ -64,10 +55,6 @@ export const FacialEnrollment: React.FC<FacialEnrollmentProps> = ({
     } catch (err) {
       console.warn('Camera error:', err);
       setIsCameraActive(false);
-      // Auto select first preset avatar if no camera
-      if (!capturedPhoto && !selectedAvatarPreset) {
-        setSelectedAvatarPreset(PRESET_AVATARS[0]);
-      }
     }
   };
 
@@ -102,26 +89,39 @@ export const FacialEnrollment: React.FC<FacialEnrollmentProps> = ({
     }
   };
 
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        setCapturedPhoto(reader.result);
+        setSelectedAvatarPreset('');
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
   // Handle Submit
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const finalPhoto = capturedPhoto || selectedAvatarPreset || PRESET_AVATARS[0];
+    const finalPhoto = capturedPhoto || selectedAvatarPreset || '';
 
     const fullUnit = block ? `${block} - Apto ${unitNumber}` : `Apto ${unitNumber}`;
 
     const newResident: Resident = {
-      id: `res_${Date.now()}`,
+      id: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `res_${Date.now()}`,
       condoId: condo.id, // Strictly scoped to current condominium
       name: name.trim(),
       unit: fullUnit,
       block: block,
       type: type,
       status: 'Ativo',
-      document: docNumber.trim() || '000.000.000-00',
-      phone: phone.trim() || '(11) 90000-0000',
+      document: docNumber.trim(),
+      phone: phone.trim(),
       email: email.trim(),
       vehiclePlate: vehiclePlate.trim().toUpperCase(),
-      faceEnrolled: true,
+      faceEnrolled: Boolean(finalPhoto),
       avatar: finalPhoto,
       accessSchedule: accessSchedule,
       createdAt: new Date().toISOString().split('T')[0]
@@ -138,9 +138,9 @@ export const FacialEnrollment: React.FC<FacialEnrollmentProps> = ({
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-extrabold text-white">Cadastramento Biométrico Facial</h2>
+          <h2 className="text-xl font-extrabold text-white">Cadastramento de Foto de Identificação (Demo)</h2>
           <p className="text-xs text-slate-400 mt-0.5">
-            Cadastro com vetorização facial e isolamento no condomínio <strong className="text-cyan-400">{condo.name}</strong>.
+            Captura fotográfica isolada para o condomínio <strong className="text-cyan-400">{condo.name}</strong> (sem extração de vetor biométrico real neste módulo).
           </p>
         </div>
 
@@ -154,11 +154,11 @@ export const FacialEnrollment: React.FC<FacialEnrollmentProps> = ({
 
       <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
         
-        {/* PHOTO CAPTURE & AVATAR PICKER (5 COLS) */}
+        {/* PHOTO CAPTURE & UPLOAD (5 COLS) */}
         <div className="md:col-span-5 bg-slate-900/40 border border-slate-800 rounded-3xl p-5 flex flex-col space-y-4">
           <div className="text-xs font-bold text-white flex items-center justify-between">
-            <span>Foto Biométrica Facial</span>
-            <span className="text-[10px] text-emerald-400 font-mono">Anti-Spoofing Ativo</span>
+            <span>Foto de Identificação</span>
+            <span className="text-[10px] text-amber-300 font-mono">Modo Demonstração</span>
           </div>
 
           {/* Camera Frame */}
@@ -208,41 +208,20 @@ export const FacialEnrollment: React.FC<FacialEnrollmentProps> = ({
             )}
           </div>
 
-          {/* Presets Gallery fallback */}
+          {/* Upload de arquivo local */}
           <div className="pt-2 border-t border-slate-800/80 space-y-2">
-            <span className="text-[10px] uppercase font-bold text-slate-400 block tracking-wider">
-              Ou escolha foto de teste do banco:
-            </span>
-            <div className="grid grid-cols-6 gap-2">
-              {PRESET_AVATARS.map((url, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => {
-                    setSelectedAvatarPreset(url);
-                    setCapturedPhoto(null);
-                  }}
-                  className={`relative aspect-square rounded-xl overflow-hidden border-2 transition ${
-                    selectedAvatarPreset === url
-                      ? 'border-cyan-400 ring-2 ring-cyan-400/30'
-                      : 'border-slate-800 hover:border-slate-600'
-                  }`}
-                >
-                  <img src={url} alt={`Preset ${idx}`} className="w-full h-full object-cover" />
-                </button>
-              ))}
-            </div>
+            <label className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 py-2.5 rounded-xl text-xs font-semibold transition flex items-center justify-center space-x-2 cursor-pointer">
+              <Upload className="w-3.5 h-3.5" />
+              <span>Enviar Foto do Dispositivo</span>
+              <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
+            </label>
           </div>
 
-          {/* Biometric Validation Checklist */}
+          {/* Info de Isolamento sem métricas simuladas */}
           <div className="bg-slate-950/80 border border-slate-800 p-3 rounded-2xl text-[11px] font-mono space-y-1.5 text-slate-400">
-            <div className="flex items-center text-emerald-400">
-              <CheckCircle2 className="w-3.5 h-3.5 mr-1.5 shrink-0" />
-              <span>Detecção de Vivacidade (Liveness): 99.1%</span>
-            </div>
-            <div className="flex items-center text-emerald-400">
-              <CheckCircle2 className="w-3.5 h-3.5 mr-1.5 shrink-0" />
-              <span>Vetorização 128D Gerada com Sucesso</span>
+            <div className="flex items-center text-amber-300">
+              <AlertTriangle className="w-3.5 h-3.5 mr-1.5 shrink-0" />
+              <span>Motor biométrico facial não acoplado (apenas foto cadastral)</span>
             </div>
             <div className="flex items-center text-cyan-400">
               <ShieldCheck className="w-3.5 h-3.5 mr-1.5 shrink-0" />

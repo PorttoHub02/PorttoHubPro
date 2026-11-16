@@ -557,7 +557,6 @@ CREATE TABLE IF NOT EXISTS public.operadores (
   auth_user_id UUID,
   nome TEXT NOT NULL,
   login TEXT UNIQUE NOT NULL,
-  senha TEXT,
   funcao TEXT DEFAULT 'Porteiro',
   cargo TEXT DEFAULT 'Porteiro',
   perfil TEXT DEFAULT 'operador',

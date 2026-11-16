@@ -88,7 +88,6 @@ CREATE TABLE IF NOT EXISTS public.operadores (
   nome TEXT NOT NULL,
   login TEXT UNIQUE NOT NULL,
   email TEXT,
-  senha TEXT,
   funcao TEXT DEFAULT 'Porteiro',
   cargo TEXT DEFAULT 'Porteiro',
   perfil TEXT DEFAULT 'operador',

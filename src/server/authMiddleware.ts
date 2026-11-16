@@ -79,10 +79,12 @@ export async function authenticateRequest(
   }
   const jwt = match[1].trim();
 
+  const fetchFn: typeof fetch = typeof (env as any)?.__fetchImpl === 'function' ? (env as any).__fetchImpl : fetch;
+
   // 1. Verifica token no Supabase Auth
   let authUser: any = null;
   try {
-    const userResp = await fetch(`${cfg.url}/auth/v1/user`, {
+    const userResp = await fetchFn(`${cfg.url}/auth/v1/user`, {
       method: 'GET',
       headers: {
         apikey: cfg.anonKey,
@@ -113,7 +115,7 @@ export async function authenticateRequest(
   let operador: any = null;
   try {
     const opCols = 'id,nome,login,email,perfil,nivel_acesso,condominio_id,acesso_global_condominios,ativo,auth_user_id';
-    const opResp = await fetch(
+    const opResp = await fetchFn(
       `${cfg.url}/rest/v1/operadores?select=${opCols}&auth_user_id=eq.${encodeURIComponent(authUser.id)}&limit=1`,
       { headers: baseHeaders }
     );
@@ -125,7 +127,7 @@ export async function authenticateRequest(
     }
 
     if (!operador && authUser.email) {
-      const emailResp = await fetch(
+      const emailResp = await fetchFn(
         `${cfg.url}/rest/v1/operadores?select=${opCols}&email=ilike.${encodeURIComponent(String(authUser.email).trim().toLowerCase())}&limit=1`,
         { headers: baseHeaders }
       );
@@ -158,7 +160,7 @@ export async function authenticateRequest(
 
   // Carrega vínculos explícitos em operador_condominios (se tabela existir)
   try {
-    const linkResp = await fetch(
+    const linkResp = await fetchFn(
       `${cfg.url}/rest/v1/operador_condominios?select=condominio_id,ativo&operador_id=eq.${encodeURIComponent(operador.id)}`,
       { headers: baseHeaders }
     );
@@ -200,7 +202,7 @@ export function podeGerenciarOperadores(ctx: AuthContext, targetCondominioId?: s
   if (ctx.eAdminGlobal) return true;
   const perfil = String(ctx.operador.perfil || '').toLowerCase();
   const nivel = Number(ctx.operador.nivel_acesso ?? 99);
-  const cargoGestor = perfil === 'admin' || perfil === 'master' || perfil === 'supervisor' || nivel <= 2;
+  const cargoGestor = perfil === 'admin' || perfil === 'admin_geral' || perfil === 'master' || perfil === 'supervisor' || nivel <= 2;
   if (!cargoGestor) return false;
   if (!targetCondominioId) return false;
   return isCondominioAutorizado(ctx, targetCondominioId);

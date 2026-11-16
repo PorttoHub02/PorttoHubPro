@@ -68,16 +68,7 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
     countdown: 0
   });
 
-  const [livenessScore, setLivenessScore] = useState<number>(98.7);
-
-  // Micro-fluctuation for liveness score to look real-time
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const variation = (Math.random() * 0.6 - 0.3);
-      setLivenessScore(prev => Number(Math.min(99.8, Math.max(97.2, prev + variation)).toFixed(1)));
-    }, 1800);
-    return () => clearInterval(interval);
-  }, []);
+  const [livenessScore] = useState<number | null>(null);
 
   // --- CAMERA INITIALIZATION ---
   const startCamera = async () => {
@@ -102,7 +93,7 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
       }
     } catch (err) {
       console.warn('Camera access error:', err);
-      setCameraError('Câmera não disponível no ambiente ou permissão negada. O totem continuará funcionando perfeitamente via simulação biométrica.');
+      setCameraError('Câmera não disponível neste ambiente ou permissão negada. Você ainda pode testar o simulador visual abaixo.');
       setIsCameraActive(false);
     }
   };
@@ -213,12 +204,12 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
         // Top HUD Status Badge
         ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
         const labelText = scanningStatus === 'matched' 
-          ? '● FACE RECONHECIDA' 
+          ? '● SIMULAÇÃO: LIBERADO' 
           : scanningStatus === 'denied' 
-          ? '✕ ACESSO NEGADO' 
+          ? '✕ SIMULAÇÃO: NEGADO' 
           : scanningStatus === 'detecting'
-          ? '⟳ COMPARANDO VETOR BIOMÉTRICO...'
-          : '⌖ POSICIONE O ROSTO NO TOTEM';
+          ? '⟳ SIMULANDO VALIDAÇÃO...'
+          : '⌖ PREVIEW DE CÂMERA (DEMO)';
         
         ctx.font = 'bold 12px Inter, sans-serif';
         const textMetrics = ctx.measureText(labelText);
@@ -278,7 +269,7 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
           return;
         }
 
-        const resident = activeResidents[Math.floor(Math.random() * activeResidents.length)];
+        const resident = activeResidents[0];
         audioService.playSuccessChime();
         audioService.playGateRelayClick();
         setScanningStatus('matched');
@@ -288,34 +279,30 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
           name: resident.name,
           unit: resident.unit,
           type: resident.type,
-          avatar: resident.avatar,
+          avatar: resident.avatar || undefined,
           timestamp: timeStr,
-          confidenceScore: 99.4,
-          livenessScore: livenessScore,
-          method: 'Reconhecimento Facial'
+          method: 'Simulação Visual (Demo)'
         });
 
-        // Trigger Pedestrian gate relay for 4 seconds
+        // Trigger Pedestrian gate relay simulation for 4 seconds
         setRelayGateStatus({
           pedestrian: true,
           vehicle: false,
           countdown: 4
         });
 
-        // Dispatch access log
+        // Dispatch simulation preview callback
         const newLog: AccessLog = {
-          id: `log_${Date.now()}`,
-          condoId: condo.id, // Strictly scoped
+          id: `log_demo_${Date.now()}`,
+          condoId: condo.id,
           residentName: resident.name,
           unit: resident.unit || 'Geral',
           timestamp: timeStr,
           date: dateStr,
           status: 'Liberado',
           method: 'Reconhecimento Facial',
-          gate: 'Portão Pedestre Social',
-          confidenceScore: 99.4,
-          livenessScore: livenessScore,
-          photoUrl: resident.avatar
+          gate: 'Portão Pedestre Social (Simulado)',
+          photoUrl: resident.avatar || undefined
         };
         onNewLog(newLog);
 
@@ -324,10 +311,10 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
         const resident = blockedResidents.length > 0 
           ? blockedResidents[0] 
           : {
-              name: 'Indivíduo Não Autorizado',
+              name: 'Indivíduo Bloqueado (Simulação)',
               unit: 'Registro Bloqueado',
-              avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=250',
-              type: 'Prestador'
+              avatar: '',
+              type: 'Visitante'
             };
 
         audioService.playDeniedBuzzer();
@@ -338,28 +325,24 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
           name: resident.name,
           unit: resident.unit,
           type: resident.type,
-          reason: 'Cadastro Bloqueado ou Não Autorizado pela Administração',
-          avatar: resident.avatar,
+          reason: 'Simulação de cadastro bloqueado ou não autorizado',
+          avatar: resident.avatar || undefined,
           timestamp: timeStr,
-          confidenceScore: 98.1,
-          livenessScore: livenessScore,
-          method: 'Reconhecimento Facial'
+          method: 'Simulação Visual (Demo)'
         });
 
         const newLog: AccessLog = {
-          id: `log_${Date.now()}`,
-          condoId: condo.id, // Strictly scoped
+          id: `log_demo_${Date.now()}`,
+          condoId: condo.id,
           residentName: resident.name,
           unit: resident.unit || 'Geral',
           timestamp: timeStr,
           date: dateStr,
           status: 'Negado',
           method: 'Reconhecimento Facial',
-          gate: 'Portão Pedestre Social',
-          reason: 'Cadastro Bloqueado / Restrição Administrativa',
-          confidenceScore: 98.1,
-          livenessScore: livenessScore,
-          photoUrl: resident.avatar
+          gate: 'Portão Pedestre Social (Simulado)',
+          reason: 'Cadastro Bloqueado / Simulação',
+          photoUrl: resident.avatar || undefined
         };
         onNewLog(newLog);
 
@@ -369,29 +352,24 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
 
         setLastMatchResult({
           status: 'Negado',
-          name: 'Pessoa Desconhecida / Não Cadastrada',
+          name: 'Pessoa Desconhecida (Simulação)',
           unit: 'Não Identificada',
-          reason: `Rosto não encontrado no banco de dados biométrico de ${condo.name}`,
-          avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&q=80&w=250',
+          reason: `Simulação de visitante sem vínculo ativo em ${condo.name}`,
           timestamp: timeStr,
-          confidenceScore: 32.5,
-          livenessScore: livenessScore,
-          method: 'Reconhecimento Facial'
+          method: 'Simulação Visual (Demo)'
         });
 
         const newLog: AccessLog = {
-          id: `log_${Date.now()}`,
+          id: `log_demo_${Date.now()}`,
           condoId: condo.id,
-          residentName: 'Pessoa Não Identificada (Alerta)',
+          residentName: 'Pessoa Não Identificada (Simulação)',
           unit: 'Portaria Externa',
           timestamp: timeStr,
           date: dateStr,
           status: 'Negado',
           method: 'Reconhecimento Facial',
-          gate: 'Portão Pedestre Social',
-          reason: 'Biometria Inexistente no Condomínio',
-          confidenceScore: 32.5,
-          livenessScore: livenessScore
+          gate: 'Portão Pedestre Social (Simulado)',
+          reason: 'Simulação: Pessoa não cadastrada'
         };
         onNewLog(newLog);
 
@@ -483,6 +461,15 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
   return (
     <div className="space-y-6 max-w-6xl mx-auto">
       
+      {/* Banner explícito de Modo Demonstração */}
+      <div className="bg-amber-950/40 border border-amber-500/40 text-amber-200 px-4 py-3 rounded-2xl flex items-start gap-3 text-xs">
+        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+        <div>
+          <strong className="uppercase tracking-wide text-amber-300">Modo Demonstração / Simulador Visual:</strong>{' '}
+          Este painel ilustra o fluxo de totem de portaria utilizando os moradores reais cadastrados em <strong>{condo.name}</strong>. Não realiza biometria facial real nem aciona hardware físico (relés/cancelas) nesta versão web. Para validar convites reais com controle atômico de uso, utilize a aba <strong>Validador QR</strong>.
+        </div>
+      </div>
+
       {/* Top Warning Banner */}
       <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div className="flex items-center space-x-3">
@@ -490,11 +477,11 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
             <Building2 className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="font-bold text-white text-sm">
-              Totem Validador Facial &bull; <span className="text-cyan-400">{condo.name}</span>
+            <h3 className="font-bold text-white text-sm flex items-center gap-2">
+              Simulador Visual de Totem &bull; <span className="text-cyan-400">{condo.name}</span>
             </h3>
             <p className="text-xs text-slate-400">
-              Escopo biométrico estrito do condomínio <code className="text-emerald-400 font-mono">{condo.code}</code> ({residents.length} moradores aptos).
+              Escopo isolado do condomínio <code className="text-emerald-400 font-mono">{condo.code}</code> ({residents.length} moradores cadastrados).
             </p>
           </div>
         </div>
@@ -571,13 +558,13 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
             {/* Scanner HUD Footer Bar */}
             <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between bg-slate-950/80 backdrop-blur-md px-4 py-2.5 rounded-xl border border-slate-800/80 z-10">
               <div className="flex items-center space-x-2">
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
+                <span className={`w-2.5 h-2.5 rounded-full ${isCameraActive ? 'bg-cyan-400' : 'bg-amber-400'}`} />
                 <span className="text-xs font-semibold text-slate-200">
-                  Anti-Spoofing / Liveness: <strong className="text-cyan-400 font-mono">{livenessScore}%</strong>
+                  Biometria / Hardware: <strong className="text-amber-300 font-mono">Simulação Visual (Demo)</strong>
                 </span>
               </div>
-              <span className="text-[10px] font-mono text-emerald-400 uppercase font-bold tracking-wider">
-                ● AO VIVO (30 FPS)
+              <span className="text-[10px] font-mono text-amber-300 uppercase font-bold tracking-wider">
+                {isCameraActive ? 'PREVIEW WEBCAM' : 'MODO SIMULAÇÃO'}
               </span>
             </div>
           </div>
@@ -659,9 +646,9 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
             {scanningStatus === 'detecting' && (
               <div className="h-full flex flex-col items-center justify-center text-center p-6 space-y-3">
                 <RefreshCw className="w-10 h-10 text-cyan-400 animate-spin" />
-                <h4 className="font-bold text-white text-base">Processando Biometria Facial...</h4>
+                <h4 className="font-bold text-white text-base">Simulando Leitura do Totem...</h4>
                 <p className="text-xs text-cyan-400 font-mono">
-                  Buscando vetor no banco de dados {condo.code}
+                  Consultando cadastro local de {condo.code} (Modo Demo)
                 </p>
               </div>
             )}
@@ -739,18 +726,16 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
                   </div>
                 )}
 
-                {/* Match Vector & Liveness Details */}
+                {/* Simulation Mode Notice */}
                 <div className="grid grid-cols-2 gap-2 text-[11px] font-mono bg-slate-950/70 p-3 rounded-xl border border-slate-800/80">
                   <div>
-                    <span className="text-slate-500 block">Confiança Match:</span>
-                    <span className="text-cyan-400 font-bold">
-                      {lastMatchResult.confidenceScore ? `${lastMatchResult.confidenceScore}%` : 'N/A'}
-                    </span>
+                    <span className="text-slate-500 block">Modo de Operação:</span>
+                    <span className="text-amber-300 font-bold">Demonstração Visual</span>
                   </div>
                   <div>
-                    <span className="text-slate-500 block">Liveness Anti-Spoof:</span>
-                    <span className="text-emerald-400 font-bold">
-                      {lastMatchResult.livenessScore ? `${lastMatchResult.livenessScore}%` : 'N/A'}
+                    <span className="text-slate-500 block">Biometria Real:</span>
+                    <span className="text-slate-300 font-bold">
+                      {livenessScore === null ? 'Não integrada' : `${livenessScore}%`}
                     </span>
                   </div>
                 </div>
@@ -761,8 +746,8 @@ export const TotemValidator: React.FC<TotemValidatorProps> = ({
             {/* GATE RELAY HARDWARE STATUS & MANUAL OVERRIDE */}
             <div className="pt-4 border-t border-slate-800/80 space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                  Controle de Relés Físicos (Hardware IoT)
+                <span className="text-[10px] font-bold text-amber-300 uppercase tracking-wider">
+                  Simulação de Acionamento de Portões (Sem Hardware IoT)
                 </span>
                 {relayGateStatus.countdown > 0 && (
                   <span className="text-[11px] font-mono text-cyan-400 font-bold animate-pulse">

@@ -13,8 +13,10 @@ import {
   Sparkles,
   ShieldCheck
 } from 'lucide-react';
-import { VERSAO_BUILD_ATUAL, FUSO_HORARIO_OFICIAL_BRASIL, formatarVersaoParaExibicao } from '../services/versaoService';
+import { VERSAO_BUILD_ATUAL, COMMIT_HASH_ATUAL, FUSO_HORARIO_OFICIAL_BRASIL, formatarVersaoParaExibicao } from '../services/versaoService';
 import { forcarAtualizacaoPwa } from '../services/pwaUpdateService';
+
+const OFICIAL_GITHUB_REPO = 'PorttoHub02/PorttoHubPro';
 
 interface ModalInfoVersaoRepositorioProps {
   aberto: boolean;
@@ -55,7 +57,7 @@ export const ModalInfoVersaoRepositorio: React.FC<ModalInfoVersaoRepositorioProp
       }
 
       // 2. Fallback direto para a API pública do GitHub
-      const ghRes = await fetch('https://api.github.com/repos/grupocaetanodigital-creator/PorttoHubPro/commits/main', {
+      const ghRes = await fetch(`https://api.github.com/repos/${OFICIAL_GITHUB_REPO}/commits/main`, {
         headers: {
           'Accept': 'application/vnd.github.v3+json'
         }
@@ -91,7 +93,7 @@ export const ModalInfoVersaoRepositorio: React.FC<ModalInfoVersaoRepositorioProp
 
       setDados({
         sucesso: true,
-        repositorio: 'grupocaetanodigital-creator/PorttoHubPro',
+        repositorio: OFICIAL_GITHUB_REPO,
         branch: 'main',
         sha: commit.sha.slice(0, 7),
         mensagem: commit.commit.message,
@@ -102,15 +104,14 @@ export const ModalInfoVersaoRepositorio: React.FC<ModalInfoVersaoRepositorioProp
       });
     } catch (e: any) {
       console.warn('[ModalInfoVersao] Erro ao puxar dados:', e);
-      // Fallback com dados oficiais garantidos
       setDados({
         sucesso: true,
-        repositorio: 'grupocaetanodigital-creator/PorttoHubPro',
+        repositorio: OFICIAL_GITHUB_REPO,
         branch: 'main',
-        sha: '59d9f79',
-        mensagem: 'fix(ui): corrigir renderizacao do menu modal de versao, responsividade e centralizacao',
+        sha: COMMIT_HASH_ATUAL,
+        mensagem: 'Consulta offline / GitHub API temporariamente indisponível.',
         autor: 'PorttoHub Dev',
-        dataBrasilia: '29/10/2026, 06:32:00 (Horário de Brasília - BRT)',
+        dataBrasilia: formatarVersaoParaExibicao(VERSAO_BUILD_ATUAL),
         versaoCalculada: VERSAO_BUILD_ATUAL,
         horarioConsulta: new Date().toLocaleTimeString('pt-BR', { timeZone: FUSO_HORARIO_OFICIAL_BRASIL })
       });
@@ -266,8 +267,8 @@ export const ModalInfoVersaoRepositorio: React.FC<ModalInfoVersaoRepositorioProp
               <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-1">
                 Repositório Oficial
               </span>
-              <div className="font-mono text-xs font-bold text-slate-200 truncate" title="grupocaetanodigital-creator/PorttoHubPro">
-                grupocaetanodigital-creator/PorttoHubPro
+              <div className="font-mono text-xs font-bold text-slate-200 truncate" title={OFICIAL_GITHUB_REPO}>
+                {OFICIAL_GITHUB_REPO}
               </div>
               <div className="flex items-center gap-2 mt-1">
                 <span className="text-[11px] text-emerald-400 font-semibold inline-flex items-center gap-1">

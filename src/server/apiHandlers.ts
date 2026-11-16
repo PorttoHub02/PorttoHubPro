@@ -12,6 +12,14 @@ import {
   podeGerenciarOperadores
 } from './authMiddleware';
 import { buildTenantCacheKey, createUpstashCache, type RuntimeEnv } from './upstashClient';
+import { validarRegraPasseQR } from '../services/passeQrValidation';
+
+const OFICIAL_GITHUB_REPO = 'PorttoHub02/PorttoHubPro';
+const EMAIL_REGEX = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
+function getFetchFn(env: RuntimeEnv): typeof fetch {
+  return typeof (env as any)?.__fetchImpl === 'function' ? (env as any).__fetchImpl : fetch;
+}
 
 const ALLOWED_OCR_MIME_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
 const MAX_OCR_IMAGE_BYTES = 5 * 1024 * 1024; // 5 MB
@@ -126,7 +134,7 @@ export async function handleGithubVersao(env: RuntimeEnv, localGitInfo?: {
 
       const controller = new AbortController();
       const fetchTimeout = setTimeout(() => controller.abort(), 2500);
-      const ghRes = await fetch('https://api.github.com/repos/grupocaetanodigital-creator/PorttoHubPro/commits/main', {
+      const ghRes = await fetch(`https://api.github.com/repos/${OFICIAL_GITHUB_REPO}/commits/main`, {
         headers,
         signal: controller.signal
       });
@@ -163,7 +171,7 @@ export async function handleGithubVersao(env: RuntimeEnv, localGitInfo?: {
 
     const payload = {
       sucesso: true,
-      repositorio: 'grupocaetanodigital-creator/PorttoHubPro',
+      repositorio: OFICIAL_GITHUB_REPO,
       branch: 'main',
       sha,
       mensagem,
@@ -343,6 +351,7 @@ REGRAS RÍGIDAS:
 
 /**
  * Provisionamento seguro de credenciais de operadores no Supabase Auth (server-only Service Role).
+ * Garante isolamento multi-tenant estrito e impede alteração de contas globais ou de outros condomínios.
  */
 export async function handleAdminProvisionarOperador(request: Request, env: RuntimeEnv): Promise<Response> {
   const auth = await authenticateRequest(request, env);
@@ -359,60 +368,101 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
   }
 
   const body = await readJsonBody(request);
-  if (!body || typeof body !== 'object') {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return jsonResponse({ error: 'Corpo da requisição inválido.' }, 400);
   }
 
   const operadorIdAlvo = body.operador_id ? String(body.operador_id).trim() : '';
   const authUserIdInformado = body.auth_user_id ? String(body.auth_user_id).trim() : '';
   const email = String(body.email || '').trim().toLowerCase();
-  const password = body.password ? String(body.password) : '';
+  const password = body.password !== undefined && body.password !== null ? String(body.password) : '';
   const nome = String(body.nome || '').trim();
   const targetCondominioId = body.condominio_id ? String(body.condominio_id).trim() : '';
 
+  if (operadorIdAlvo && !isValidUuid(operadorIdAlvo)) {
+    return jsonResponse({ error: 'Parâmetro operador_id inválido.' }, 400);
+  }
+  if (authUserIdInformado && !isValidUuid(authUserIdInformado)) {
+    return jsonResponse({ error: 'Parâmetro auth_user_id inválido.' }, 400);
+  }
+  if (email && !EMAIL_REGEX.test(email)) {
+    return jsonResponse({ error: 'Formato de e-mail inválido.' }, 400);
+  }
+  if (password && (password.length < 6 || password.length > 128)) {
+    return jsonResponse({ error: 'A senha deve possuir entre 6 e 128 caracteres.' }, 400);
+  }
+
   if (!auth.context.eAdminGlobal) {
+    if (body.acesso_global_condominios === true || body.global === true) {
+      return jsonResponse({ error: 'Operações globais são restritas ao administrador global autorizado.' }, 403);
+    }
+    if (!isValidUuid(targetCondominioId)) {
+      return jsonResponse({ error: 'Condomínio de destino obrigatório e deve ser um UUID válido.' }, 400);
+    }
     if (!podeGerenciarOperadores(auth.context, targetCondominioId)) {
       return jsonResponse({ error: 'Sem permissão para provisionar operadores neste condomínio.' }, 403);
     }
+    if (authUserIdInformado && !operadorIdAlvo) {
+      return jsonResponse(
+        { error: 'Gestor local não pode alterar usuário diretamente por auth_user_id; informe um operador_id existente do seu condomínio.' },
+        403
+      );
+    }
   }
 
+  const fetchFn = getFetchFn(env);
   const adminHeaders = {
     apikey: cfg.serviceRoleKey,
     Authorization: `Bearer ${cfg.serviceRoleKey}`,
     'Content-Type': 'application/json'
   };
 
-  // Se operador_id foi informado e solicitante não é admin global, garante que o alvo pertence ao condomínio autorizado
-  let authUserIdExistente = authUserIdInformado;
+  let opTarget: any = null;
+  let authUserIdExistente = auth.context.eAdminGlobal ? authUserIdInformado : '';
+
   if (operadorIdAlvo) {
-    const opRes = await fetch(
-      `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios&id=eq.${encodeURIComponent(operadorIdAlvo)}&limit=1`,
+    const opRes = await fetchFn(
+      `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios,email&id=eq.${encodeURIComponent(operadorIdAlvo)}&limit=1`,
       { headers: adminHeaders }
     );
-    if (opRes.ok) {
-      const opRows: any[] = await opRes.json();
-      const opTarget = opRows?.[0];
-      if (opTarget) {
-        if (!auth.context.eAdminGlobal) {
-          if (opTarget.acesso_global_condominios === true || !isCondominioAutorizado(auth.context, opTarget.condominio_id)) {
-            return jsonResponse({ error: 'Não autorizado a alterar credenciais de operador de outro condomínio ou global.' }, 403);
-          }
-        }
-        if (!authUserIdExistente && opTarget.auth_user_id) {
-          authUserIdExistente = String(opTarget.auth_user_id);
-        }
+    if (!opRes.ok) {
+      return jsonResponse({ error: 'Falha ao verificar operador-alvo na base.' }, 502);
+    }
+
+    const opRows: any[] = await opRes.json();
+    opTarget = opRows?.[0] || null;
+
+    if (!opTarget) {
+      return jsonResponse({ error: 'Operador-alvo não encontrado na base.' }, 404);
+    }
+
+    if (!auth.context.eAdminGlobal) {
+      if (opTarget.acesso_global_condominios === true) {
+        return jsonResponse({ error: 'Gestor local não pode alterar contas administrativas globais.' }, 403);
+      }
+      if (!isCondominioAutorizado(auth.context, opTarget.condominio_id)) {
+        return jsonResponse({ error: 'Não autorizado a alterar credenciais de operador de outro condomínio.' }, 403);
+      }
+      if (String(opTarget.condominio_id || '').trim() !== targetCondominioId) {
+        return jsonResponse({ error: 'O condomínio informado diverge do condomínio real do operador-alvo.' }, 403);
       }
     }
+
+    if (opTarget.auth_user_id) {
+      if (auth.context.eAdminGlobal && authUserIdInformado && authUserIdInformado !== String(opTarget.auth_user_id)) {
+        return jsonResponse({ error: 'auth_user_id informado diverge do vínculo real do operador-alvo.' }, 403);
+      }
+      authUserIdExistente = String(opTarget.auth_user_id);
+    } else if (!auth.context.eAdminGlobal) {
+      authUserIdExistente = '';
+    }
+  } else if (authUserIdExistente && auth.context.eAdminGlobal) {
+    // Mesmo para admin global, confirma se auth_user_id é válido antes de atualizar
+    authUserIdExistente = authUserIdInformado;
   }
 
   if (!email && !authUserIdExistente) {
-    return jsonResponse({ error: 'Informe um e-mail válido para criar o acesso Auth.' }, 400);
-  }
-  if (email && !email.includes('@')) {
-    return jsonResponse({ error: 'Formato de e-mail inválido.' }, 400);
-  }
-  if (password && password.length < 6) {
-    return jsonResponse({ error: 'A senha deve possuir ao menos 6 caracteres.' }, 400);
+    return jsonResponse({ error: 'Informe um e-mail válido para criar ou atualizar o acesso Auth.' }, 400);
   }
 
   try {
@@ -423,7 +473,7 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
       if (password) updatePayload.password = password;
       if (nome) updatePayload.user_metadata = { nome };
 
-      const updRes = await fetch(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(authUserIdExistente)}`, {
+      const updRes = await fetchFn(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(authUserIdExistente)}`, {
         method: 'PUT',
         headers: adminHeaders,
         body: JSON.stringify(updatePayload)
@@ -439,12 +489,42 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
       });
     }
 
-    // 2. Criação de novo usuário Auth (com fallback se e-mail já existir)
+    // 2. Criação de novo usuário Auth — antes verifica se e-mail já pertence a operador existente na base
     if (!password) {
       return jsonResponse({ error: 'Informe uma senha inicial de acesso (mínimo 6 caracteres).' }, 400);
     }
 
-    const createRes = await fetch(`${cfg.url}/auth/v1/admin/users`, {
+    if (email) {
+      const existingOpByEmailRes = await fetchFn(
+        `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios&email=ilike.${encodeURIComponent(email)}&limit=5`,
+        { headers: adminHeaders }
+      );
+      if (!existingOpByEmailRes.ok) {
+        return jsonResponse({ error: 'Falha ao validar unicidade de e-mail na tabela de operadores.' }, 502);
+      }
+      const existingRows: any[] = await existingOpByEmailRes.json();
+      if (Array.isArray(existingRows) && existingRows.length > 0) {
+        const conflitoOutro = existingRows.find(r => r.id !== operadorIdAlvo);
+        if (conflitoOutro) {
+          if (!auth.context.eAdminGlobal) {
+            if (conflitoOutro.acesso_global_condominios === true || !isCondominioAutorizado(auth.context, conflitoOutro.condominio_id)) {
+              return jsonResponse(
+                { error: 'Não autorizado: este e-mail já pertence a um operador global ou de outro condomínio.' },
+                403
+              );
+            }
+          }
+          if (!operadorIdAlvo) {
+            return jsonResponse(
+              { error: 'Já existe operador cadastrado com este e-mail; informe operador_id existente para atualizar suas credenciais.' },
+              409
+            );
+          }
+        }
+      }
+    }
+
+    const createRes = await fetchFn(`${cfg.url}/auth/v1/admin/users`, {
       method: 'POST',
       headers: adminHeaders,
       body: JSON.stringify({
@@ -464,8 +544,9 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
       });
     }
 
-    // Se já existe conta com esse e-mail no Auth, localiza e sincroniza senha/confirmação
-    const listRes = await fetch(
+    // 3. Fallback quando o e-mail já existe no Auth: apenas Administrador Global pode sincronizar conta arbitrária,
+    // ou gestor local SOMENTE se a conta Auth já pertencer ao operador_id autorizado em questão.
+    const listRes = await fetchFn(
       `${cfg.url}/auth/v1/admin/users?page=1&per_page=50&filter=${encodeURIComponent(email)}`,
       { headers: adminHeaders }
     );
@@ -474,7 +555,31 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
       const users = Array.isArray(listJson?.users) ? listJson.users : [];
       const found = users.find((u: any) => String(u.email || '').toLowerCase() === email);
       if (found?.id) {
-        const syncRes = await fetch(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(found.id)}`, {
+        const ownerRes = await fetchFn(
+          `${cfg.url}/rest/v1/operadores?select=id,condominio_id,acesso_global_condominios&auth_user_id=eq.${encodeURIComponent(found.id)}&limit=1`,
+          { headers: adminHeaders }
+        );
+        const ownerRows: any[] = ownerRes.ok ? await ownerRes.json() : [];
+        const ownerOp = ownerRows?.[0];
+
+        if (!auth.context.eAdminGlobal) {
+          if (ownerOp) {
+            if (ownerOp.acesso_global_condominios === true || !isCondominioAutorizado(auth.context, ownerOp.condominio_id)) {
+              return jsonResponse(
+                { error: 'Não autorizado a alterar senha de conta Auth vinculada a outro condomínio ou administrador global.' },
+                403
+              );
+            }
+          }
+          if (!operadorIdAlvo || !opTarget || (ownerOp && ownerOp.id !== opTarget.id)) {
+            return jsonResponse(
+              { error: 'E-mail já cadastrado no Supabase Auth. Somente Administrador Global pode vincular conta Auth existente sem vínculo do mesmo operador.' },
+              403
+            );
+          }
+        }
+
+        const syncRes = await fetchFn(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(found.id)}`, {
           method: 'PUT',
           headers: adminHeaders,
           body: JSON.stringify({
@@ -499,6 +604,169 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
     );
   } catch (err: any) {
     return jsonResponse({ error: err?.message || 'Erro interno no provisionamento Auth.' }, 500);
+  }
+}
+
+/**
+ * Validação e consumo atômico de Passe Virtual QR (servidor).
+ * Impede reutilização após max_usos, acesso fora da data/horário ou entre condomínios.
+ */
+export async function handleValidarPasseQR(request: Request, env: RuntimeEnv): Promise<Response> {
+  const auth = await authenticateRequest(request, env);
+  if (!auth.ok) {
+    return jsonResponse({ valido: false, motivo: auth.error }, auth.status);
+  }
+
+  const body = await readJsonBody(request);
+  const condominioId = body?.condominioId ? String(body.condominioId).trim() : '';
+  const token = body?.token ? String(body.token).trim() : '';
+  const consumir = Boolean(body?.consumir);
+  const pontoAcesso = body?.pontoAcesso ? String(body.pontoAcesso).trim() : 'Portaria Principal (Pedestres)';
+
+  if (!isValidUuid(condominioId)) {
+    return jsonResponse({ valido: false, motivo: 'condominioId inválido.' }, 400);
+  }
+  if (!isCondominioAutorizado(auth.context, condominioId)) {
+    return jsonResponse({ valido: false, motivo: 'Acesso negado a este condomínio.' }, 403);
+  }
+  if (!token) {
+    return jsonResponse({ valido: false, motivo: 'Código do Passe Virtual não informado.' }, 400);
+  }
+
+  const cfg = getSupabaseServerConfig(env);
+  const fetchFn = getFetchFn(env);
+  const userHeaders = {
+    apikey: cfg.anonKey,
+    Authorization: `Bearer ${auth.context.jwt}`,
+    'Content-Type': 'application/json'
+  };
+
+  try {
+    // 1. Tenta RPC transacional atômica no PostgreSQL (FOR UPDATE)
+    const rpcRes = await fetchFn(`${cfg.url}/rest/v1/rpc/validar_e_consumir_passe_qr`, {
+      method: 'POST',
+      headers: userHeaders,
+      body: JSON.stringify({
+        p_condominio_id: condominioId,
+        p_token: token,
+        p_consumir: consumir,
+        p_ponto_acesso: pontoAcesso,
+        p_operador_nome: auth.context.operador.nome || auth.context.operador.login || 'Portaria'
+      })
+    });
+
+    if (rpcRes.ok) {
+      const rpcJson: any = await rpcRes.json();
+      return jsonResponse(rpcJson, rpcJson?.valido ? 200 : 400);
+    }
+
+    // 2. Fallback seguro caso RPC ainda não tenha sido aplicada: consulta + CAS condicional
+    const tokenLimpo = token.toUpperCase();
+    const filtroToken = isValidUuid(token)
+      ? `or=(token.ilike.${encodeURIComponent(tokenLimpo)},id.eq.${encodeURIComponent(token)})`
+      : `token=ilike.${encodeURIComponent(tokenLimpo)}`;
+
+    const passRes = await fetchFn(
+      `${cfg.url}/rest/v1/passes_virtuais_qr?select=*&condominio_id=eq.${encodeURIComponent(condominioId)}&${filtroToken}&limit=1`,
+      { headers: userHeaders }
+    );
+    if (!passRes.ok) {
+      return jsonResponse({ valido: false, motivo: 'Falha ao consultar passe no servidor.' }, 502);
+    }
+    const rows: any[] = await passRes.json();
+    const passe = rows?.[0];
+
+    if (!passe) {
+      return jsonResponse({ valido: false, motivo: 'Passe Virtual não encontrado neste condomínio.' }, 404);
+    }
+
+    const check = validarRegraPasseQR(passe);
+    if (!check.valido) {
+      return jsonResponse({ valido: false, passe, motivo: check.motivo }, 400);
+    }
+
+    if (!consumir) {
+      return jsonResponse({ valido: true, passe }, 200);
+    }
+
+    const usosAtuais = Number(passe.usos_realizados || 0);
+    const maxUsos = Math.max(1, Number(passe.max_usos || passe.limite_usos || 1));
+    const novosUsos = usosAtuais + 1;
+    const novoStatus = novosUsos >= maxUsos ? 'utilizado' : 'valido';
+
+    const patchRes = await fetchFn(
+      `${cfg.url}/rest/v1/passes_virtuais_qr?id=eq.${encodeURIComponent(passe.id)}&condominio_id=eq.${encodeURIComponent(condominioId)}&usos_realizados=eq.${usosAtuais}&status=eq.valido`,
+      {
+        method: 'PATCH',
+        headers: {
+          ...userHeaders,
+          Prefer: 'return=representation'
+        },
+        body: JSON.stringify({
+          usos_realizados: novosUsos,
+          status: novoStatus,
+          updated_at: new Date().toISOString()
+        })
+      }
+    );
+
+    if (!patchRes.ok) {
+      return jsonResponse({ valido: false, motivo: 'Erro ao registrar utilização do passe no servidor.' }, 502);
+    }
+
+    const updatedRows: any[] = await patchRes.json();
+    if (!Array.isArray(updatedRows) || updatedRows.length === 0) {
+      return jsonResponse(
+        { valido: false, motivo: 'Passe já foi consumido simultaneamente ou atingiu o limite de utilizações.' },
+        409
+      );
+    }
+
+    const passeAtualizado = updatedRows[0];
+    const regInsertRes = await fetchFn(`${cfg.url}/rest/v1/registros_acesso`, {
+      method: 'POST',
+      headers: {
+        ...userHeaders,
+        Prefer: 'return=representation'
+      },
+      body: JSON.stringify([{
+        condominio_id: condominioId,
+        tipo: passe.tipo === 'festa_convidado' ? 'convidado_evento' : (passe.tipo || 'visitante'),
+        nome: passe.visitante_nome,
+        documento: passe.visitante_documento || '',
+        unidade_bloco: passe.unidade_bloco,
+        morador_responsavel: passe.morador_nome,
+        ponto_acesso_entrada: pontoAcesso,
+        data_hora_entrada: new Date().toISOString(),
+        status: 'presente',
+        operador_entrada_nome: auth.context.operador.nome || auth.context.operador.login || 'Portaria',
+        observacoes: `Liberado via Passe QR (${passe.token}) [Uso ${novosUsos}/${maxUsos}]`,
+        passe_qr_id: passe.id
+      }])
+    });
+
+    if (!regInsertRes.ok) {
+      // Compensa uso se inserção do registro de entrada falhar
+      await fetchFn(
+        `${cfg.url}/rest/v1/passes_virtuais_qr?id=eq.${encodeURIComponent(passe.id)}&condominio_id=eq.${encodeURIComponent(condominioId)}`,
+        {
+          method: 'PATCH',
+          headers: userHeaders,
+          body: JSON.stringify({ usos_realizados: usosAtuais, status: 'valido' })
+        }
+      ).catch(() => {});
+      return jsonResponse({ valido: false, motivo: 'Falha ao gravar registro de acesso do passe.' }, 502);
+    }
+
+    const regRows: any[] = await regInsertRes.json();
+    return jsonResponse({
+      valido: true,
+      consumido: true,
+      passe: passeAtualizado,
+      registro: regRows?.[0] || null
+    }, 200);
+  } catch (err: any) {
+    return jsonResponse({ valido: false, motivo: err?.message || 'Erro interno ao validar Passe QR.' }, 500);
   }
 }
 

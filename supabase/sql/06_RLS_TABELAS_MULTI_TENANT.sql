@@ -93,8 +93,20 @@ BEGIN
 
     CREATE POLICY rls_condominios_update ON public.condominios
       FOR UPDATE TO authenticated
-      USING (public.operador_tem_acesso_global() OR public.operador_pode_acessar_condominio(id::text))
-      WITH CHECK (public.operador_tem_acesso_global() OR public.operador_pode_acessar_condominio(id::text));
+      USING (
+        public.operador_tem_acesso_global()
+        OR (
+          public.operador_pode_gerenciar_operadores()
+          AND public.operador_pode_acessar_condominio(id::text)
+        )
+      )
+      WITH CHECK (
+        public.operador_tem_acesso_global()
+        OR (
+          public.operador_pode_gerenciar_operadores()
+          AND public.operador_pode_acessar_condominio(id::text)
+        )
+      );
 
     CREATE POLICY rls_condominios_delete ON public.condominios
       FOR DELETE TO authenticated

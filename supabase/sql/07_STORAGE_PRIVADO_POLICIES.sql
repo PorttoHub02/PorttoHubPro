@@ -51,17 +51,8 @@ CREATE POLICY "porttohub_storage_select"
   TO authenticated
   USING (
     bucket_id = 'encomendas'
-    AND (
-      (
-        (storage.foldername(name))[1] = 'condominios'
-        AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
-      )
-      OR (
-        -- Compatibilidade transitória apenas para fotos antigas sem prefixo condominios/
-        (storage.foldername(name))[1] IS DISTINCT FROM 'condominios'
-        AND public.operador_atual_id() IS NOT NULL
-      )
-    )
+    AND (storage.foldername(name))[1] = 'condominios'
+    AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
   );
 
 CREATE POLICY "porttohub_storage_insert"

@@ -67,8 +67,8 @@ AS $$
       AND COALESCE(o.ativo, TRUE) = TRUE
       AND (
         COALESCE(o.acesso_global_condominios, FALSE) = TRUE
-        OR COALESCE(o.nivel_acesso, 99) IN (0, 1)
-        OR lower(COALESCE(o.perfil, '')) IN ('admin', 'admin_geral', 'sindico', 'master')
+        OR COALESCE(o.nivel_acesso, 99) <= 2
+        OR lower(COALESCE(o.perfil, '')) IN ('admin', 'admin_geral', 'master', 'supervisor')
       )
   );
 $$;

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase, obterAccessTokenAtual } from '../services/supabase';
-import { isCondominioIdValido, temAcessoGlobalExplicito } from '../services/autorizacaoService';
+import { isCondominioIdValido, temAcessoGlobalExplicito, OPERADOR_SAFE_COLUMNS } from '../services/autorizacaoService';
 import { 
   Building2,
   MapPin,
@@ -1670,7 +1670,6 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           },
           body: JSON.stringify({
             operador_id: idEdicao || undefined,
-            auth_user_id: authUserIdEdicao || undefined,
             email: emailLimpo,
             password: senhaLimpa || undefined,
             nome: nomeOperador.trim(),
@@ -1785,7 +1784,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           ativo: Boolean(ativoOperador)
         };
 
-        let { data: opCriado, error } = await supabase.from('operadores').insert([novoOp]).select().single();
+        let { data: opCriado, error } = await supabase.from('operadores').insert([novoOp]).select(OPERADOR_SAFE_COLUMNS).single();
 
         if (error && (
           error.message?.includes('permissoes') ||
@@ -1809,7 +1808,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
             condominio_id: novoOp.condominio_id,
             ativo: Boolean(ativoOperador)
           };
-          const retry = await supabase.from('operadores').insert([fallbackOp]).select().single();
+          const retry = await supabase.from('operadores').insert([fallbackOp]).select(OPERADOR_SAFE_COLUMNS).single();
           error = retry.error;
           opCriado = retry.data;
         }

@@ -48,6 +48,7 @@ import {
   registrarSaidaAcesso,
   gerarPasseVirtual,
   validarTokenPasse,
+  validarEConsumirPasseQR,
   formatarMensagemWhatsAppPasse,
   carregarMoradoresBase,
   extrairUnidadesBase,
@@ -65,7 +66,6 @@ import { formatarLinkWhatsApp } from '../services/configWhatsappService';
 import { verificarPermissao } from '../services/permissoesService';
 import { supabase } from '../services/supabase';
 import { TotemValidator } from '../components/TotemValidator';
-import { storageService } from '../services/storageService';
 import { Condominium, AccessLog } from '../types';
 
 interface ControleAcessoProps {
@@ -194,46 +194,48 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
   }), [condId, condoConfig]);
 
   const residentsForTotem = useMemo(() => {
-    if (moradoresBase && moradoresBase.length > 0) {
-      return moradoresBase.map((m: MoradorBaseInfo) => ({
-        id: m.id,
-        condoId: m.condominio_id || condId,
-        name: m.nome,
-        unit: m.bloco ? `${m.bloco} - Apto ${m.unidade}` : `Apto ${m.unidade}`,
-        block: m.bloco || '',
-        type: (m.tipo as any) || 'Morador',
-        status: (m.status_acesso === 'bloqueado' ? 'Bloqueado' : 'Ativo') as any,
-        document: m.cpf || m.rg || '000.000.000-00',
-        phone: m.telefone || '',
-        email: m.email || '',
-        vehiclePlate: m.veiculo_placa || undefined,
-        faceEnrolled: !!(m.foto_url || m.foto_base64),
-        avatar: m.foto_url || m.foto_base64 || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=250',
-        accessSchedule: '24h' as const,
-        createdAt: new Date().toISOString()
-      }));
-    }
-    return storageService.getResidentsForCondo(condId);
+    if (!moradoresBase || moradoresBase.length === 0) return [];
+    return moradoresBase.map((m: MoradorBaseInfo) => ({
+      id: m.id,
+      condoId: m.condominio_id || condId,
+      name: m.nome,
+      unit: m.bloco ? `${m.bloco} - Apto ${m.unidade}` : `Apto ${m.unidade}`,
+      block: m.bloco || '',
+      type: (m.tipo as any) || 'Morador',
+      status: (m.status_acesso === 'bloqueado' ? 'Bloqueado' : 'Ativo') as any,
+      document: m.cpf || m.rg || '',
+      phone: m.telefone || '',
+      email: m.email || '',
+      vehiclePlate: m.veiculo_placa || undefined,
+      faceEnrolled: Boolean(m.foto_url || m.foto_base64),
+      avatar: m.foto_url || m.foto_base64 || '',
+      accessSchedule: '24h' as const,
+      createdAt: new Date().toISOString()
+    }));
   }, [moradoresBase, condId]);
 
   const passesForTotem = useMemo(() => {
-    return storageService.getVisitorPassesForCondo(condId);
-  }, [condId]);
+    return passesVirtuais.map(p => ({
+      id: p.id,
+      condoId: p.condominio_id,
+      visitorName: p.visitante_nome,
+      visitorDoc: p.visitante_documento || '',
+      unitDestination: p.unidade_bloco,
+      residentAuthorizer: p.morador_nome,
+      type: p.tipo === 'prestador' ? 'Prestador' : p.tipo === 'entrega' ? 'Entregador' : 'Visitante',
+      validUntil: p.data_validade,
+      qrCodeToken: p.token,
+      status: p.status === 'valido' ? 'Válido' : p.status === 'utilizado' ? 'Utilizado' : 'Expirado',
+      createdAt: p.criado_em
+    })) as any[];
+  }, [passesVirtuais]);
 
+  // Ações disparadas no simulador visual do Totem não gravam registros operacionais reais nem simulam biometria no histórico do condomínio
   const handleNewTotemLog = (log: AccessLog) => {
-    storageService.addLog(log);
-    setRegistros(prev => [{
-      id: log.id,
-      condominio_id: condId,
-      tipo: 'visitante',
-      nome: log.residentName,
-      documento: '',
-      unidade_bloco: log.unit,
-      ponto_acesso_entrada: log.gate,
-      data_hora_entrada: new Date().toISOString(),
-      status: log.status === 'Liberado' ? 'dentro' : 'bloqueado',
-      operador_entrada_nome: 'Totem Facial Biométrico'
-    } as any, ...prev]);
+    setFeedback({
+      tipo: 'alerta',
+      texto: `[Simulação Visual — Sem Persistência Real] Evento "${log.status}" (${log.method}) exibido apenas para demonstração na tela.`
+    });
   };
 
   // Carrega dados iniciais e escuta eventos de atualização
@@ -414,7 +416,12 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
     const resultado = await registrarEntradaAcesso(condId, formEntrada, usuarioLogado);
     if (resultado.sucesso && resultado.registro) {
       setRegistros(prev => [resultado.registro!, ...prev]);
-      setFeedback({ tipo: 'sucesso', texto: `Entrada liberada para ${resultado.registro.nome}!` });
+      setFeedback({
+        tipo: resultado.sincronizado === false ? 'alerta' : 'sucesso',
+        texto: resultado.sincronizado === false
+          ? `Entrada de ${resultado.registro.nome} salva na fila offline (aguardando sincronização).`
+          : `Entrada liberada para ${resultado.registro.nome}!`
+      });
       // Limpa formulário
       setFormEntrada(prev => ({
         ...prev,
@@ -440,20 +447,27 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
 
   // Registrar Saída
   const handleRegistrarSaida = async (registroId: string) => {
-    const ok = await registrarSaidaAcesso(condId, registroId, undefined, undefined, usuarioLogado);
-    if (ok) {
+    const res = await registrarSaidaAcesso(condId, registroId, undefined, undefined, usuarioLogado);
+    if (res.sucesso) {
       setRegistros(prev =>
         prev.map(r =>
           r.id === registroId
-            ? { ...r, status: 'saiu', data_hora_saida: new Date().toISOString() }
+            ? { ...r, status: 'saiu', data_hora_saida: new Date().toISOString(), sincronizado: res.sincronizado }
             : r
         )
       );
-      setFeedback({ tipo: 'sucesso', texto: 'Saída registrada com sucesso!' });
+      setFeedback({
+        tipo: res.sincronizado === false ? 'alerta' : 'sucesso',
+        texto: res.sincronizado === false
+          ? 'Saída registrada offline (será sincronizada ao restabelecer conexão).'
+          : 'Saída registrada com sucesso!'
+      });
+    } else {
+      setFeedback({ tipo: 'erro', texto: res.erro || 'Falha ao registrar saída.' });
     }
   };
 
-  // Validação de Passe QR
+  // Validação de Passe QR (somente consulta segura no servidor)
   const handleValidarPasse = async () => {
     if (!tokenParaValidar.trim()) return;
     const res = await validarTokenPasse(condId, tokenParaValidar);
@@ -466,28 +480,36 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
     }
   };
 
+  // Consumo atômico no servidor (incrementa usos_realizados e registra entrada)
   const handleLiberarPasseValidado = async () => {
     if (!resultadoValidacaoQR?.passe) return;
     const p = resultadoValidacaoQR.passe;
 
-    const entradaDados: Partial<RegistroAcesso> = {
-      tipo: p.tipo === 'festa_convidado' ? 'convidado_evento' : 'visitante',
-      nome: p.visitante_nome,
-      documento: p.visitante_documento || '',
-      unidade_bloco: p.unidade_bloco,
-      morador_responsavel: p.morador_nome,
-      ponto_acesso_entrada: 'Portaria Principal (Pedestres)',
-      observacoes: `Liberado via Passe QR (${p.token}) - ${p.observacoes || ''}`,
-      passe_qr_id: p.id
-    };
+    const res = await validarEConsumirPasseQR(
+      condId,
+      p.token || p.id,
+      pontosAcesso[0]?.nome || 'Portaria Principal (Pedestres)',
+      usuarioLogado
+    );
 
-    const res = await registrarEntradaAcesso(condId, entradaDados, usuarioLogado);
-    if (res.sucesso && res.registro) {
-      setRegistros(prev => [res.registro!, ...prev]);
-      setFeedback({ tipo: 'sucesso', texto: `Entrada liberada para ${p.visitante_nome} via Passe QR!` });
+    if (res.sucesso) {
+      if (res.passe) {
+        setPassesVirtuais(prev => prev.map(item => (item.id === res.passe!.id ? res.passe! : item)));
+      }
+      if (res.registro) {
+        setRegistros(prev => [res.registro!, ...prev]);
+      } else {
+        carregarTudo();
+      }
+      setFeedback({ tipo: 'sucesso', texto: `Entrada liberada e uso debitado para ${p.visitante_nome} via Passe QR!` });
       setResultadoValidacaoQR(null);
       setTokenParaValidar('');
       setAbaAtiva('presentes');
+    } else {
+      setFeedback({ tipo: 'erro', texto: res.motivo || 'Não foi possível validar/consumir este Passe QR.' });
+      if (res.passe) {
+        setResultadoValidacaoQR({ valido: false, passe: res.passe, motivo: res.motivo });
+      }
     }
   };
 
@@ -499,10 +521,19 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
       return;
     }
 
-    const novo = await gerarPasseVirtual(condId, formNovoPasse, usuarioLogado);
-    setPassesVirtuais(prev => [novo, ...prev]);
-    setModalNovoPasse(false);
-    setFeedback({ tipo: 'sucesso', texto: `Passe Virtual gerado! Código: ${novo.token}` });
+    const res = await gerarPasseVirtual(condId, formNovoPasse, usuarioLogado);
+    if (res.sucesso && res.passe) {
+      setPassesVirtuais(prev => [res.passe!, ...prev]);
+      setModalNovoPasse(false);
+      setFeedback({
+        tipo: res.sincronizado === false ? 'alerta' : 'sucesso',
+        texto: res.sincronizado === false
+          ? `Passe salvo offline (${res.passe.token}). Sincronize antes do uso no validador.`
+          : `Passe Virtual gerado! Código: ${res.passe.token}`
+      });
+    } else {
+      setFeedback({ tipo: 'erro', texto: res.erro || 'Falha ao gerar Passe Virtual.' });
+    }
   };
 
   // WhatsApp Share do Passe
@@ -521,11 +552,20 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
       return;
     }
 
-    const item = await salvarItemBlacklist(condId, formBloqueio, usuarioLogado);
-    setBlacklist(prev => [item, ...prev]);
-    setModalNovoBloqueio(false);
-    setFormBloqueio({ tipo: 'pessoa', nome_ou_placa: '', documento: '', motivo: '', gravidade: 'bloqueio_total' });
-    setFeedback({ tipo: 'sucesso', texto: 'Restrição registrada na lista de segurança!' });
+    const res = await salvarItemBlacklist(condId, formBloqueio, usuarioLogado);
+    if (res.sucesso && res.item) {
+      setBlacklist(prev => [res.item!, ...prev]);
+      setModalNovoBloqueio(false);
+      setFormBloqueio({ tipo: 'pessoa', nome_ou_placa: '', documento: '', motivo: '', gravidade: 'bloqueio_total' });
+      setFeedback({
+        tipo: res.sincronizado === false ? 'alerta' : 'sucesso',
+        texto: res.sincronizado === false
+          ? 'Restrição salva na fila offline (aguardando sincronização).'
+          : 'Restrição registrada na lista de segurança!'
+      });
+    } else {
+      setFeedback({ tipo: 'erro', texto: res.erro || 'Falha ao gravar restrição.' });
+    }
   };
 
   // Filtragem dos Presentes
@@ -1309,7 +1349,7 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
             <div className="flex items-center gap-2">
               <input
                 type="text"
-                placeholder="Ex: PASS-CONV-98214"
+                placeholder="Ex: PASS-A7K9-M2X4"
                 value={tokenParaValidar}
                 onChange={e => setTokenParaValidar(e.target.value.toUpperCase())}
                 className="flex-1 px-4 py-3 rounded-2xl bg-slate-50 dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 font-mono text-sm font-black tracking-wider text-center focus:border-purple-500"
@@ -1547,12 +1587,21 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
                       type="button"
                       onClick={async () => {
                         const novoStatus = isBloqueado ? 'liberado' : 'bloqueado';
-                        await alternarStatusAcessoMorador(m.id, novoStatus, condId);
-                        setMoradoresBase(prev => prev.map(item => item.id === m.id ? { ...item, status_acesso: novoStatus } : item));
-                        setFeedback({
-                          tipo: isBloqueado ? 'sucesso' : 'alerta',
-                          texto: `Status de acesso de "${m.nome}" alterado para ${novoStatus.toUpperCase()}!`
-                        });
+                        const res = await alternarStatusAcessoMorador(m.id, novoStatus, condId);
+                        if (res.sucesso) {
+                          setMoradoresBase(prev => prev.map(item => item.id === m.id ? { ...item, status_acesso: novoStatus } : item));
+                          setFeedback({
+                            tipo: res.sincronizado === false ? 'alerta' : (isBloqueado ? 'sucesso' : 'alerta'),
+                            texto: res.sincronizado === false
+                              ? `Alteração de "${m.nome}" salva na fila offline.`
+                              : `Status de acesso de "${m.nome}" alterado para ${novoStatus.toUpperCase()}!`
+                          });
+                        } else {
+                          setFeedback({
+                            tipo: 'erro',
+                            texto: res.erro || 'Não foi possível alterar o status de acesso.'
+                          });
+                        }
                       }}
                       className={`flex-1 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
                         isBloqueado

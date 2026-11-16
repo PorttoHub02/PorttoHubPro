@@ -60,6 +60,10 @@ import {
   EstruturaResumoBancada 
 } from '../services/bancadaService';
 import { checarEDispararAlarmeTrocaPlantao } from '../services/lembretesService';
+import {
+  buscarOperadorParaReautenticacao,
+  verificarCredenciaisOperadorSupabaseAuth
+} from '../services/autorizacaoService';
 
 interface PassagemPostoProps {
   usuarioLogado?: any;
@@ -437,9 +441,10 @@ export default function PassagemPosto({
 
   const carregarOperadores = async () => {
     try {
+      const condId = usuarioLogado?.condominio_id;
       const { data, error } = await supabase
         .from('operadores')
-        .select('id, nome, login, perfil, foto_url, nivel_acesso, condominio_id, ativo')
+        .select('id, nome, login, email, auth_user_id, perfil, foto_url, nivel_acesso, condominio_id, acesso_global_condominios, ativo')
         .eq('ativo', true)
         .order('nome', { ascending: true });
 
@@ -449,13 +454,12 @@ export default function PassagemPosto({
       }
 
       if (data) {
-        const condId = usuarioLogado?.condominio_id;
         const opsDoPosto = data.filter(op => {
           if (op.id === usuarioLogado?.id) return false;
-          if (!condId) return true;
-          return op.condominio_id === condId || !op.condominio_id || op.condominio_id === '00000000-0000-0000-0000-000000000001' || op.perfil === 'admin' || op.nivel_acesso === 0;
+          if (!condId) return false;
+          return op.condominio_id === condId || op.acesso_global_condominios === true;
         });
-        setListaOperadores(opsDoPosto.length > 0 ? opsDoPosto : data.filter(op => op.id !== usuarioLogado?.id));
+        setListaOperadores(opsDoPosto);
       }
     } catch (err) {
       console.error('Erro ao carregar lista de operadores:', err);
@@ -1165,54 +1169,68 @@ export default function PassagemPosto({
     setMensagem({ tipo: '', texto: '' });
 
     try {
-      const loginLimpo = loginEntrante.trim();
-      const senhaLimpa = senhaEntrante.trim();
+      const identificadorLimpo = loginEntrante.trim();
+      const senhaLimpa = senhaEntrante;
 
-      if (!loginLimpo || !senhaLimpa) {
-        setMensagem({ tipo: 'erro', texto: 'Informe o login e a senha do operador entrante que está assumindo o posto.' });
+      if (!identificadorLimpo || !senhaLimpa) {
+        setMensagem({ tipo: 'erro', texto: 'Informe o e-mail/login e a senha Supabase Auth do operador entrante.' });
         setLoading(false);
         return;
       }
 
-      // Busca operador entrante por login (case-insensitive com ilike)
-      let { data: opCandidatos, error: opError } = await supabase
-        .from('operadores')
-        .select('*')
-        .ilike('login', loginLimpo)
-        .eq('senha', senhaLimpa)
-        .eq('ativo', true);
-
-      if (opError) throw opError;
-
-      // Fallback: se não encontrou pelo login exato, tenta pelo nome completo ou primeiro nome
-      if (!opCandidatos || opCandidatos.length === 0) {
-        const { data: opPorNome } = await supabase
-          .from('operadores')
-          .select('*')
-          .ilike('nome', `%${loginLimpo}%`)
-          .eq('senha', senhaLimpa)
-          .eq('ativo', true);
-        if (opPorNome && opPorNome.length > 0) {
-          opCandidatos = opPorNome;
-        }
+      if (!usuarioLogado?.condominio_id) {
+        setMensagem({ tipo: 'erro', texto: 'Condomínio ativo não identificado para passagem de posto.' });
+        setLoading(false);
+        return;
       }
 
-      if (!opCandidatos || opCandidatos.length === 0) {
-        setMensagem({ 
-          tipo: 'erro', 
-          texto: 'Credenciais incorretas ou operador inativo. Verifique se o login e a senha digitados estão corretos.' 
+      // 1. Localiza operador entrante dentro do mesmo condomínio (nunca usa select('*') nem coluna senha)
+      const buscaOp = await buscarOperadorParaReautenticacao({
+        condominioId: usuarioLogado.condominio_id,
+        operadorId: operadorSelecionadoEntrante?.id,
+        identificador: identificadorLimpo
+      });
+
+      if (buscaOp.error) {
+        setMensagem({ tipo: 'erro', texto: buscaOp.error });
+        setLoading(false);
+        return;
+      }
+
+      const opEntrante = buscaOp.operador;
+      if (!opEntrante) {
+        setMensagem({
+          tipo: 'erro',
+          texto: 'Operador entrante não encontrado ou não autorizado para este condomínio.'
         });
         setLoading(false);
         return;
       }
 
-      // Se houver mais de um, prioriza o do condomínio do posto
-      let opEntrante = opCandidatos.find(
-        op => op.condominio_id === usuarioLogado.condominio_id
-      ) || opCandidatos[0];
-
       if (opEntrante.id === usuarioLogado.id) {
         setMensagem({ tipo: 'erro', texto: 'Atenção: O operador entrante deve ser uma pessoa diferente do operador sainte atual.' });
+        setLoading(false);
+        return;
+      }
+
+      const emailAuthEntrante = (
+        opEntrante.email ||
+        (identificadorLimpo.includes('@') ? identificadorLimpo : '')
+      ).trim().toLowerCase();
+
+      // 2. Reautenticação real no Supabase Auth usando cliente efêmero (persistSession: false),
+      // sem substituir nem sobrescrever a sessão ativa do operador sainte no navegador.
+      const reauthRes = await verificarCredenciaisOperadorSupabaseAuth({
+        email: emailAuthEntrante,
+        password: senhaLimpa,
+        expectedAuthUserId: opEntrante.auth_user_id || null
+      });
+
+      if (!reauthRes.ok) {
+        setMensagem({
+          tipo: 'erro',
+          texto: reauthRes.error || 'Credenciais rejeitadas pelo Supabase Auth para o operador entrante.'
+        });
         setLoading(false);
         return;
       }
@@ -1223,7 +1241,7 @@ export default function PassagemPosto({
       const ano = String(agora.getFullYear()).slice(-2);
       const codigoPas = `PAS:${dia}${mes}${ano}OPER${String(agora.getMinutes()).padStart(2, '0')}`;
 
-      const nomeCondominioFinal = condominioConfig?.nome || usuarioLogado?.condominio_nome || usuarioLogado?.condominio?.nome || 'Village Di Padova';
+      const nomeCondominioFinal = condominioConfig?.nome || usuarioLogado?.condominio_nome || usuarioLogado?.condominio?.nome || 'Condomínio Ativo';
 
       // Snapshot consolidado completo do plantão (8 módulos)
       const snapshotConsolidado = {
@@ -1265,17 +1283,9 @@ export default function PassagemPosto({
 
       if (insertError) throw insertError;
 
-      // 1. EFETIVAÇÃO IMEDIATA NO DISPOSITIVO (PERSISTÊNCIA LOCALSTORAGE)
-      // Gravamos a sessão do operador entrante antes de qualquer ação externa!
-      localStorage.setItem('infport_sessao_ativa_v1', JSON.stringify({
-        operadorId: opEntrante.id,
-        login: opEntrante.login,
-        condominioId: opEntrante.condominio_id || usuarioLogado.condominio_id,
-        salvoEm: new Date().toISOString()
-      }));
-      if (opEntrante.condominio_id || usuarioLogado.condominio_id) {
-        localStorage.setItem('infport_condominio_ativo_id', opEntrante.condominio_id || usuarioLogado.condominio_id);
-      }
+      // Não altera a sessão Auth nem armazena credenciais em localStorage durante a assinatura;
+      // a troca de login ocorre explicitamente pelo fluxo seguro de logout/novo login (onTrocarOperador).
+      localStorage.removeItem('infport_sessao_ativa_v1');
 
       // 1.1 Dispara verificação do alarme sonoro contínuo de troca de plantão caso haja lembretes
       const targetCondoId = opEntrante.condominio_id || usuarioLogado.condominio_id;
@@ -3236,7 +3246,7 @@ export default function PassagemPosto({
                     <div className="space-y-3 pt-1">
                       <div>
                         <label className="block text-xs font-black text-slate-900 uppercase mb-1.5 tracking-wide">
-                          Login do Operador Entrante:
+                          E-mail ou Login do Operador Entrante:
                         </label>
                         <div className="relative">
                           <User className="w-4 h-4 text-slate-600 absolute left-3 top-3.5 z-10" />
@@ -3246,10 +3256,13 @@ export default function PassagemPosto({
                             value={loginEntrante}
                             onChange={(e) => {
                               setLoginEntrante(e.target.value);
-                              const match = listaOperadores.find(op => op.login.toLowerCase() === e.target.value.toLowerCase().trim());
+                              const val = e.target.value.toLowerCase().trim();
+                              const match = listaOperadores.find(
+                                op => (op.login || '').toLowerCase() === val || (op.email || '').toLowerCase() === val
+                              );
                               setOperadorSelecionadoEntrante(match || null);
                             }}
-                            placeholder="Ex: hugo"
+                            placeholder="Ex: operador@condominio.com ou login"
                             style={{ color: '#000000', backgroundColor: '#ffffff', WebkitTextFillColor: '#000000' }}
                             className="w-full pl-9 pr-3 py-3 bg-white text-black text-slate-950 font-bold text-sm placeholder:text-slate-400 placeholder:font-normal border-2 border-slate-300 focus:border-emerald-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 shadow-sm"
                           />
@@ -3258,7 +3271,7 @@ export default function PassagemPosto({
 
                       <div>
                         <label className="block text-xs font-black text-slate-900 uppercase mb-1.5 tracking-wide">
-                          Senha Pessoal do Operador Entrante:
+                          Senha Supabase Auth do Operador Entrante:
                         </label>
                         <div className="relative">
                           <Lock className="w-4 h-4 text-slate-600 absolute left-3 top-3.5 z-10" />
@@ -3267,7 +3280,7 @@ export default function PassagemPosto({
                             required
                             value={senhaEntrante}
                             onChange={(e) => setSenhaEntrante(e.target.value)}
-                            placeholder="Digite sua senha de acesso ao Infport"
+                            placeholder="Digite sua senha autenticada no Supabase Auth"
                             style={{ color: '#000000', backgroundColor: '#ffffff', WebkitTextFillColor: '#000000' }}
                             className="w-full pl-9 pr-10 py-3 bg-white text-black text-slate-950 font-bold text-sm placeholder:text-slate-400 placeholder:font-normal border-2 border-slate-300 focus:border-emerald-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500 shadow-sm"
                           />
@@ -3286,7 +3299,7 @@ export default function PassagemPosto({
                     <div className="p-2.5 bg-white/80 rounded-xl border border-emerald-200 text-[11px] text-emerald-950 flex items-start gap-2">
                       <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
                       <span>
-                        <strong>Efetivação de Login Permanente:</strong> Ao autenticar, o operador entrante assumirá imediatamente o comando da guarita neste dispositivo.
+                        <strong>Reautenticação Segura Supabase Auth:</strong> A senha é validada em sessão efêmera sem sobrescrever a sessão atual nem gravar senhas localmente.
                       </span>
                     </div>
                   </div>

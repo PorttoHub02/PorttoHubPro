@@ -4,7 +4,8 @@
 -- O QUE ESTE ARQUIVO FAZ:
 --   Prepara a tabela public.operadores para autenticação real com Supabase Auth
 --   e controle explícito de acesso global a condomínios, SEM apagar dados,
---   SEM remover colunas antigas e SEM quebrar registros já existentes.
+--   SEM remover colunas antigas de instalações legadas e SEM utilizar ou
+--   consultar qualquer coluna de senha em plaintext (autenticação 100% Auth).
 --
 -- PRE-REQUISITO OBRIGATORIO:
 --   Execute primeiro 01_CRIAR_TABELAS_DO_ZERO.sql (em banco novo/vazio) ou

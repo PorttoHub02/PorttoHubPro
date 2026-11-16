@@ -51,6 +51,22 @@ BEGIN
     CREATE INDEX IF NOT EXISTS idx_prest_acessos_condo_entrada
       ON public.prestadores_acessos(condominio_id, data_hora_entrada DESC);
   END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'passes_virtuais_qr') THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_passes_qr_condo_token
+      ON public.passes_virtuais_qr(condominio_id, upper(token));
+
+    CREATE INDEX IF NOT EXISTS idx_passes_qr_condo_status_data
+      ON public.passes_virtuais_qr(condominio_id, status, data_validade);
+
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint WHERE conname = 'chk_passes_qr_usos_limite'
+    ) THEN
+      ALTER TABLE public.passes_virtuais_qr
+        ADD CONSTRAINT chk_passes_qr_usos_limite
+        CHECK (usos_realizados >= 0 AND usos_realizados <= GREATEST(1, COALESCE(max_usos, limite_usos, 1))) NOT VALID;
+    END IF;
+  END IF;
 END $$;
 
 COMMIT;

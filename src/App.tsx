@@ -98,6 +98,7 @@ import {
   temAcessoGlobalExplicito,
   ehPerfilSindico,
   isCondominioIdValido,
+  OPERADOR_SAFE_COLUMNS,
   ContextoCondominiosResolvido
 } from './services/autorizacaoService';
 import { 
@@ -355,7 +356,7 @@ export default function App() {
 
         let { data: opData, error: opErr } = await supabase
           .from('operadores')
-          .select('*')
+          .select(OPERADOR_SAFE_COLUMNS)
           .eq('auth_user_id', authUser.id)
           .eq('ativo', true)
           .maybeSingle();
@@ -374,7 +375,7 @@ export default function App() {
         if (!opData && authUser.email) {
           const fallbackEmail = await supabase
             .from('operadores')
-            .select('*')
+            .select(OPERADOR_SAFE_COLUMNS)
             .ilike('email', authUser.email.trim().toLowerCase())
             .eq('ativo', true)
             .maybeSingle();
@@ -879,7 +880,7 @@ export default function App() {
 
       let { data: opData, error: opErr } = await supabase
         .from('operadores')
-        .select('*')
+        .select(OPERADOR_SAFE_COLUMNS)
         .eq('auth_user_id', authUser.id)
         .maybeSingle();
 
@@ -894,7 +895,7 @@ export default function App() {
       if (!opData && authUser.email) {
         const fallbackEmail = await supabase
           .from('operadores')
-          .select('*')
+          .select(OPERADOR_SAFE_COLUMNS)
           .ilike('email', authUser.email.trim().toLowerCase())
           .maybeSingle();
 

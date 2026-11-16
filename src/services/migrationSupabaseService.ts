@@ -153,9 +153,9 @@ export const TARGET_TABLE_COLUMNS: Record<string, string[]> = {
     'zeros_esquerda', 'ativo'
   ],
   operadores: [
-    'id', 'condominio_id', 'nome', 'login', 'senha', 'funcao', 'cargo', 'telefone',
+    'id', 'condominio_id', 'auth_user_id', 'nome', 'login', 'funcao', 'cargo', 'telefone',
     'turno_padrao', 'turno', 'email', 'nivel_acesso', 'nivel_acesso_custom_id',
-    'perfil', 'permissoes', 'foto_url', 'ativo', 'created_at', 'updated_at'
+    'perfil', 'permissoes', 'foto_url', 'acesso_global_condominios', 'ativo', 'created_at', 'updated_at'
   ],
   moradores: [
     'id', 'condominio_id', 'nome', 'bloco', 'unidade', 'telefone', 'email',

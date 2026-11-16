@@ -1,6 +1,8 @@
-import { supabase } from './supabase';
+import { supabase, obterAccessTokenAtual, formatarErroDetalhadoSupabase } from './supabase';
 import { isUUID } from './condominioService';
 import { registrarAtividade } from './auditoriaService';
+import { enfileirarAcaoOffline } from './offlineSyncEngine';
+import { gerarTokenPasseSeguro, validarRegraPasseQR } from './passeQrValidation';
 
 export interface PontoAcesso {
   id: string;
@@ -38,6 +40,7 @@ export interface RegistroAcesso {
   reserva_area_id?: string;
   passe_qr_id?: string;
   motivo_bloqueio?: string;
+  sincronizado?: boolean;
 }
 
 export interface PasseVirtualQR {
@@ -58,6 +61,7 @@ export interface PasseVirtualQR {
   status: 'valido' | 'utilizado' | 'expirado' | 'cancelado';
   observacoes?: string;
   criado_em: string;
+  sincronizado?: boolean;
 }
 
 export interface BloqueioSeguranca {
@@ -71,6 +75,7 @@ export interface BloqueioSeguranca {
   registrado_por: string;
   ativo: boolean;
   criado_em: string;
+  sincronizado?: boolean;
 }
 
 const CHAVE_STORAGE_PONTOS = 'porttohub_pontos_acesso_';
@@ -85,6 +90,18 @@ export const PONTOS_PADRAO: Omit<PontoAcesso, 'id' | 'condominio_id'>[] = [
   { nome: 'Portão de Serviço & Prestadores', tipo: 'pedestre', localizacao: 'Docas / Carga', ativo: true },
   { nome: 'Portão Lateral Pedestres', tipo: 'pedestre', localizacao: 'Acesso Área de Lazer', ativo: true }
 ];
+
+function ehErroDeRedeOuOffline(err: any): boolean {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return true;
+  const msg = String(err?.message || err || '').toLowerCase();
+  return (
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('load failed') ||
+    msg.includes('network request failed') ||
+    msg.includes('timeout')
+  );
+}
 
 export async function carregarPontosAcesso(condominioId: string): Promise<PontoAcesso[]> {
   if (!condominioId) return [];
@@ -112,14 +129,11 @@ export async function carregarPontosAcesso(condominioId: string): Promise<PontoA
     } catch {}
   }
 
-  const seeds: PontoAcesso[] = PONTOS_PADRAO.map((p, i) => ({
+  return PONTOS_PADRAO.map((p, i) => ({
     ...p,
     id: `ponto-${condominioId.slice(0, 8)}-${i + 1}`,
     condominio_id: condominioId
   }));
-
-  localStorage.setItem(`${CHAVE_STORAGE_PONTOS}${condominioId}`, JSON.stringify(seeds));
-  return seeds;
 }
 
 export async function carregarRegistrosAcesso(condominioId: string): Promise<RegistroAcesso[]> {
@@ -134,9 +148,10 @@ export async function carregarRegistrosAcesso(condominioId: string): Promise<Reg
         .order('data_hora_entrada', { ascending: false })
         .limit(300);
 
-      if (!error && data) {
-        localStorage.setItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`, JSON.stringify(data));
-        return data as RegistroAcesso[];
+      if (!error && Array.isArray(data)) {
+        const normalizados = data.map((r: any) => ({ ...r, sincronizado: true })) as RegistroAcesso[];
+        localStorage.setItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`, JSON.stringify(normalizados));
+        return normalizados;
       }
     } catch {}
   }
@@ -144,67 +159,12 @@ export async function carregarRegistrosAcesso(condominioId: string): Promise<Reg
   const cached = localStorage.getItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`);
   if (cached) {
     try {
-      return JSON.parse(cached);
+      const parsed = JSON.parse(cached);
+      return Array.isArray(parsed) ? parsed : [];
     } catch {}
   }
 
-  // Registros de exemplo realistas
-  const agora = Date.now();
-  const exemplos: RegistroAcesso[] = [
-    {
-      id: `acesso-${agora}-1`,
-      condominio_id: condominioId,
-      tipo: 'visitante',
-      nome: 'Juliana Costa Ferreira',
-      documento: '42.981.332-9',
-      telefone: '(11) 98771-4433',
-      unidade_bloco: 'Torre A - Apto 304',
-      morador_responsavel: 'Felipe Costa',
-      ponto_acesso_entrada: 'Portaria Principal (Pedestres)',
-      data_hora_entrada: new Date(agora - 1000 * 60 * 45).toISOString(),
-      status: 'presente',
-      operador_entrada_nome: 'Marcos Silva (Portaria)',
-      cracha_ou_tag: 'CR-042',
-      observacoes: 'Visita autorizada pelo interfone'
-    },
-    {
-      id: `acesso-${agora}-2`,
-      condominio_id: condominioId,
-      tipo: 'prestador',
-      nome: 'Ricardo Almeida (Eletricista)',
-      documento: '28.114.776-5',
-      empresa: 'Volt Engenharia & Serviços',
-      unidade_bloco: 'Torre B - Apto 701',
-      morador_responsavel: 'Patrícia Prado',
-      ponto_acesso_entrada: 'Portão de Serviço & Prestadores',
-      veiculo_placa: 'BRA2E19',
-      veiculo_modelo: 'Fiorino Branca',
-      data_hora_entrada: new Date(agora - 1000 * 60 * 120).toISOString(),
-      status: 'presente',
-      operador_entrada_nome: 'Marcos Silva (Portaria)',
-      cracha_ou_tag: 'PR-15',
-      observacoes: 'Manutenção de disjuntor interno autorizada'
-    },
-    {
-      id: `acesso-${agora}-3`,
-      condominio_id: condominioId,
-      tipo: 'entrega',
-      nome: 'Lucas Gabriel (iFood)',
-      documento: '50.334.887-2',
-      unidade_bloco: 'Torre A - Apto 102',
-      ponto_acesso_entrada: 'Portaria Principal (Pedestres)',
-      ponto_acesso_saida: 'Portaria Principal (Pedestres)',
-      data_hora_entrada: new Date(agora - 1000 * 60 * 180).toISOString(),
-      data_hora_saida: new Date(agora - 1000 * 60 * 168).toISOString(),
-      status: 'saiu',
-      operador_entrada_nome: 'João Santos',
-      operador_saida_nome: 'João Santos',
-      observacoes: 'Morador desceu na eclusa para retirar refeição'
-    }
-  ];
-
-  localStorage.setItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`, JSON.stringify(exemplos));
-  return exemplos;
+  return [];
 }
 
 export async function carregarBlacklist(condominioId: string): Promise<BloqueioSeguranca[]> {
@@ -218,9 +178,10 @@ export async function carregarBlacklist(condominioId: string): Promise<BloqueioS
         .eq('condominio_id', condominioId)
         .order('criado_em', { ascending: false });
 
-      if (!error && data) {
-        localStorage.setItem(`${CHAVE_STORAGE_BLACKLIST}${condominioId}`, JSON.stringify(data));
-        return data as BloqueioSeguranca[];
+      if (!error && Array.isArray(data)) {
+        const normalizados = data.map((b: any) => ({ ...b, sincronizado: true })) as BloqueioSeguranca[];
+        localStorage.setItem(`${CHAVE_STORAGE_BLACKLIST}${condominioId}`, JSON.stringify(normalizados));
+        return normalizados;
       }
     } catch {}
   }
@@ -228,38 +189,12 @@ export async function carregarBlacklist(condominioId: string): Promise<BloqueioS
   const cached = localStorage.getItem(`${CHAVE_STORAGE_BLACKLIST}${condominioId}`);
   if (cached) {
     try {
-      return JSON.parse(cached);
+      const parsed = JSON.parse(cached);
+      return Array.isArray(parsed) ? parsed : [];
     } catch {}
   }
 
-  const inicial: BloqueioSeguranca[] = [
-    {
-      id: 'blk-1',
-      condominio_id: condominioId,
-      tipo: 'pessoa',
-      nome_ou_placa: 'Antônio Carlos Bezerra',
-      documento: '19.882.331-0',
-      motivo: 'Decisão judicial com ordem de afastamento e restrição de entrada.',
-      gravidade: 'bloqueio_total',
-      registrado_por: 'Administração Predial',
-      ativo: true,
-      criado_em: new Date(Date.now() - 86400000 * 10).toISOString()
-    },
-    {
-      id: 'blk-2',
-      condominio_id: condominioId,
-      tipo: 'veiculo',
-      nome_ou_placa: 'ABC-1234',
-      motivo: 'Veículo com histórico de evasão sem cadastro de motorista.',
-      gravidade: 'alerta',
-      registrado_por: 'Supervisor de Segurança',
-      ativo: true,
-      criado_em: new Date(Date.now() - 86400000 * 20).toISOString()
-    }
-  ];
-
-  localStorage.setItem(`${CHAVE_STORAGE_BLACKLIST}${condominioId}`, JSON.stringify(inicial));
-  return inicial;
+  return [];
 }
 
 export async function verificarBloqueio(
@@ -305,17 +240,25 @@ export async function salvarItemBlacklist(
   condominioId: string,
   item: Partial<BloqueioSeguranca>,
   operadorLogado?: any
-): Promise<BloqueioSeguranca> {
-  const lista = await carregarBlacklist(condominioId);
-  const id = (item.id && isUUID(item.id)) 
-    ? item.id 
-    : ((typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `blk-${Date.now()}`);
+): Promise<{ sucesso: boolean; item?: BloqueioSeguranca; sincronizado?: boolean; erro?: string }> {
+  if (!isUUID(condominioId)) {
+    return { sucesso: false, erro: 'Condomínio inválido para salvar restrição de segurança.' };
+  }
 
-  const novo: BloqueioSeguranca = {
+  const lista = await carregarBlacklist(condominioId);
+  const id = (item.id && isUUID(item.id))
+    ? item.id
+    : (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : '');
+
+  if (!id) {
+    return { sucesso: false, erro: 'Não foi possível gerar UUID seguro para o bloqueio.' };
+  }
+
+  const payloadBanco = {
     id,
     condominio_id: condominioId,
     tipo: item.tipo || 'pessoa',
-    nome_ou_placa: item.nome_ou_placa || '',
+    nome_ou_placa: String(item.nome_ou_placa || '').trim(),
     documento: item.documento || '',
     motivo: item.motivo || 'Sem motivo especificado',
     gravidade: item.gravidade || 'bloqueio_total',
@@ -324,17 +267,41 @@ export async function salvarItemBlacklist(
     criado_em: item.criado_em || new Date().toISOString()
   };
 
+  let sincronizado = false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    enfileirarAcaoOffline('blacklist_bloqueios', 'INSERT', payloadBanco, `Bloqueio: ${payloadBanco.nome_ou_placa}`);
+  } else {
+    try {
+      const { error } = await supabase.from('blacklist_bloqueios').upsert([payloadBanco]);
+      if (error) {
+        if (ehErroDeRedeOuOffline(error)) {
+          enfileirarAcaoOffline('blacklist_bloqueios', 'INSERT', payloadBanco, `Bloqueio: ${payloadBanco.nome_ou_placa}`);
+        } else {
+          return {
+            sucesso: false,
+            erro: formatarErroDetalhadoSupabase(error, 'Erro ao gravar bloqueio no servidor')
+          };
+        }
+      } else {
+        sincronizado = true;
+      }
+    } catch (err: any) {
+      if (ehErroDeRedeOuOffline(err)) {
+        enfileirarAcaoOffline('blacklist_bloqueios', 'INSERT', payloadBanco, `Bloqueio: ${payloadBanco.nome_ou_placa}`);
+      } else {
+        return {
+          sucesso: false,
+          erro: formatarErroDetalhadoSupabase(err, 'Erro inesperado ao gravar bloqueio')
+        };
+      }
+    }
+  }
+
+  const novo: BloqueioSeguranca = { ...payloadBanco, sincronizado };
   const idx = lista.findIndex(b => b.id === id);
   if (idx >= 0) lista[idx] = novo;
   else lista.unshift(novo);
-
   localStorage.setItem(`${CHAVE_STORAGE_BLACKLIST}${condominioId}`, JSON.stringify(lista));
-
-  if (isUUID(condominioId)) {
-    try {
-      await supabase.from('blacklist_bloqueios').upsert([novo]);
-    } catch {}
-  }
 
   registrarAtividade({
     modulo: 'Controle de Acesso',
@@ -346,16 +313,16 @@ export async function salvarItemBlacklist(
     condominio_id: condominioId
   });
 
-  return novo;
+  return { sucesso: true, item: novo, sincronizado };
 }
 
 export async function registrarEntradaAcesso(
   condominioId: string,
   dados: Partial<RegistroAcesso>,
   operadorLogado?: any
-): Promise<{ sucesso: boolean; registro?: RegistroAcesso; erro?: string; alertaBloqueio?: BloqueioSeguranca }> {
-  if (!condominioId || !dados.nome || !dados.unidade_bloco) {
-    return { sucesso: false, erro: 'Informe o nome completo e a unidade de destino.' };
+): Promise<{ sucesso: boolean; registro?: RegistroAcesso; sincronizado?: boolean; erro?: string; alertaBloqueio?: BloqueioSeguranca }> {
+  if (!isUUID(condominioId) || !dados.nome || !dados.unidade_bloco) {
+    return { sucesso: false, erro: 'Informe o condomínio válido, nome completo e unidade de destino.' };
   }
 
   // Checagem de segurança
@@ -368,10 +335,12 @@ export async function registrarEntradaAcesso(
     };
   }
 
-  const registros = await carregarRegistrosAcesso(condominioId);
-  const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `acesso-${Date.now()}`;
+  const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : '';
+  if (!id) {
+    return { sucesso: false, erro: 'Não foi possível gerar UUID para registro de acesso.' };
+  }
 
-  const novo: RegistroAcesso = {
+  const payloadBanco = {
     id,
     condominio_id: condominioId,
     tipo: dados.tipo || 'visitante',
@@ -386,7 +355,7 @@ export async function registrarEntradaAcesso(
     veiculo_modelo: dados.veiculo_modelo || undefined,
     veiculo_cor: dados.veiculo_cor || undefined,
     data_hora_entrada: dados.data_hora_entrada || new Date().toISOString(),
-    status: 'presente',
+    status: 'presente' as const,
     foto_entrada_url: dados.foto_entrada_url,
     operador_entrada_nome: operadorLogado?.nome || 'Portaria',
     observacoes: dados.observacoes || '',
@@ -395,14 +364,42 @@ export async function registrarEntradaAcesso(
     passe_qr_id: (dados.passe_qr_id && isUUID(dados.passe_qr_id)) ? dados.passe_qr_id : undefined
   };
 
+  let sincronizado = false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    enfileirarAcaoOffline('registros_acesso', 'INSERT', payloadBanco, `Entrada: ${payloadBanco.nome}`);
+  } else {
+    try {
+      const { error } = await supabase.from('registros_acesso').insert([payloadBanco]);
+      if (error) {
+        if (ehErroDeRedeOuOffline(error)) {
+          enfileirarAcaoOffline('registros_acesso', 'INSERT', payloadBanco, `Entrada: ${payloadBanco.nome}`);
+        } else {
+          return {
+            sucesso: false,
+            erro: formatarErroDetalhadoSupabase(error, 'Falha ao persistir entrada no servidor'),
+            alertaBloqueio: checagem.item
+          };
+        }
+      } else {
+        sincronizado = true;
+      }
+    } catch (err: any) {
+      if (ehErroDeRedeOuOffline(err)) {
+        enfileirarAcaoOffline('registros_acesso', 'INSERT', payloadBanco, `Entrada: ${payloadBanco.nome}`);
+      } else {
+        return {
+          sucesso: false,
+          erro: formatarErroDetalhadoSupabase(err, 'Erro inesperado ao registrar entrada'),
+          alertaBloqueio: checagem.item
+        };
+      }
+    }
+  }
+
+  const novo: RegistroAcesso = { ...payloadBanco, sincronizado };
+  const registros = await carregarRegistrosAcesso(condominioId);
   registros.unshift(novo);
   localStorage.setItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`, JSON.stringify(registros));
-
-  if (isUUID(condominioId)) {
-    try {
-      await supabase.from('registros_acesso').insert([novo]);
-    } catch {}
-  }
 
   registrarAtividade({
     modulo: 'Controle de Acesso',
@@ -414,7 +411,7 @@ export async function registrarEntradaAcesso(
     condominio_id: condominioId
   });
 
-  return { sucesso: true, registro: novo, alertaBloqueio: checagem.item };
+  return { sucesso: true, registro: novo, sincronizado, alertaBloqueio: checagem.item };
 }
 
 export async function registrarSaidaAcesso(
@@ -423,35 +420,90 @@ export async function registrarSaidaAcesso(
   pontoSaida?: string,
   observacao?: string,
   operadorLogado?: any
-): Promise<boolean> {
+): Promise<{ sucesso: boolean; sincronizado?: boolean; erro?: string }> {
+  if (!isUUID(condominioId) || !isUUID(registroId)) {
+    return { sucesso: false, erro: 'Identificador inválido para registrar saída.' };
+  }
+
   const registros = await carregarRegistrosAcesso(condominioId);
   const reg = registros.find(r => r.id === registroId);
-  if (!reg) return false;
+  if (!reg) {
+    return { sucesso: false, erro: 'Registro de entrada não encontrado neste condomínio.' };
+  }
+
+  const dataHoraSaida = new Date().toISOString();
+  const pontoSaidaFinal = pontoSaida || reg.ponto_acesso_entrada || 'Portaria Principal';
+  const operadorSaida = operadorLogado?.nome || 'Portaria';
+  const obsFinal = observacao
+    ? (reg.observacoes ? `${reg.observacoes} | Saída: ${observacao}` : `Saída: ${observacao}`)
+    : reg.observacoes;
+
+  const updateFields = {
+    status: 'saiu' as const,
+    data_hora_saida: dataHoraSaida,
+    ponto_acesso_saida: pontoSaidaFinal,
+    operador_saida_nome: operadorSaida,
+    observacoes: obsFinal
+  };
+
+  let sincronizado = false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    enfileirarAcaoOffline(
+      'registros_acesso',
+      'UPDATE',
+      { id: registroId, condominio_id: condominioId, ...updateFields },
+      `Saída: ${reg.nome}`
+    );
+  } else {
+    try {
+      const { error } = await supabase
+        .from('registros_acesso')
+        .update(updateFields)
+        .eq('id', registroId)
+        .eq('condominio_id', condominioId);
+
+      if (error) {
+        if (ehErroDeRedeOuOffline(error)) {
+          enfileirarAcaoOffline(
+            'registros_acesso',
+            'UPDATE',
+            { id: registroId, condominio_id: condominioId, ...updateFields },
+            `Saída: ${reg.nome}`
+          );
+        } else {
+          return {
+            sucesso: false,
+            erro: formatarErroDetalhadoSupabase(error, 'Erro ao registrar saída no servidor')
+          };
+        }
+      } else {
+        sincronizado = true;
+      }
+    } catch (err: any) {
+      if (ehErroDeRedeOuOffline(err)) {
+        enfileirarAcaoOffline(
+          'registros_acesso',
+          'UPDATE',
+          { id: registroId, condominio_id: condominioId, ...updateFields },
+          `Saída: ${reg.nome}`
+        );
+      } else {
+        return {
+          sucesso: false,
+          erro: formatarErroDetalhadoSupabase(err, 'Erro inesperado ao registrar saída')
+        };
+      }
+    }
+  }
 
   reg.status = 'saiu';
-  reg.data_hora_saida = new Date().toISOString();
-  reg.ponto_acesso_saida = pontoSaida || reg.ponto_acesso_entrada || 'Portaria Principal';
-  reg.operador_saida_nome = operadorLogado?.nome || 'Portaria';
-  if (observacao) {
-    reg.observacoes = reg.observacoes ? `${reg.observacoes} | Saída: ${observacao}` : `Saída: ${observacao}`;
-  }
+  reg.data_hora_saida = dataHoraSaida;
+  reg.ponto_acesso_saida = pontoSaidaFinal;
+  reg.operador_saida_nome = operadorSaida;
+  reg.observacoes = obsFinal;
+  reg.sincronizado = sincronizado;
 
   localStorage.setItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`, JSON.stringify(registros));
-
-  if (isUUID(condominioId)) {
-    try {
-      await supabase
-        .from('registros_acesso')
-        .update({
-          status: 'saiu',
-          data_hora_saida: reg.data_hora_saida,
-          ponto_acesso_saida: reg.ponto_acesso_saida,
-          operador_saida_nome: reg.operador_saida_nome,
-          observacoes: reg.observacoes
-        })
-        .eq('id', registroId);
-    } catch {}
-  }
 
   registrarAtividade({
     modulo: 'Controle de Acesso',
@@ -463,7 +515,7 @@ export async function registrarSaidaAcesso(
     condominio_id: condominioId
   });
 
-  return true;
+  return { sucesso: true, sincronizado };
 }
 
 export async function carregarPassesVirtuais(condominioId: string): Promise<PasseVirtualQR[]> {
@@ -477,9 +529,10 @@ export async function carregarPassesVirtuais(condominioId: string): Promise<Pass
         .eq('condominio_id', condominioId)
         .order('criado_em', { ascending: false });
 
-      if (!error && data) {
-        localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(data));
-        return data as PasseVirtualQR[];
+      if (!error && Array.isArray(data)) {
+        const normalizados = data.map((p: any) => ({ ...p, sincronizado: true })) as PasseVirtualQR[];
+        localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(normalizados));
+        return normalizados;
       }
     } catch {}
   }
@@ -487,46 +540,30 @@ export async function carregarPassesVirtuais(condominioId: string): Promise<Pass
   const cached = localStorage.getItem(`${CHAVE_STORAGE_PASSES}${condominioId}`);
   if (cached) {
     try {
-      return JSON.parse(cached);
+      const parsed = JSON.parse(cached);
+      return Array.isArray(parsed) ? parsed : [];
     } catch {}
   }
 
-  const hoje = new Date().toISOString().split('T')[0];
-  const exemplos: PasseVirtualQR[] = [
-    {
-      id: 'qr-passe-1',
-      token: 'PASS-CONV-98214',
-      condominio_id: condominioId,
-      morador_nome: 'Carlos Eduardo Mendes',
-      morador_telefone: '(11) 98844-2211',
-      unidade_bloco: 'Torre A - Apto 502',
-      visitante_nome: 'Mariana Lima Silveira',
-      tipo: 'festa_convidado',
-      data_validade: hoje,
-      hora_inicio: '18:00',
-      hora_fim: '23:30',
-      max_usos: 2,
-      usos_realizados: 0,
-      status: 'valido',
-      observacoes: 'Aniversário no Salão de Festas Nobre',
-      criado_em: new Date().toISOString()
-    }
-  ];
-
-  localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(exemplos));
-  return exemplos;
+  return [];
 }
 
 export async function gerarPasseVirtual(
   condominioId: string,
   dados: Partial<PasseVirtualQR>,
   operadorLogado?: any
-): Promise<PasseVirtualQR> {
-  const passes = await carregarPassesVirtuais(condominioId);
-  const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `passe-${Date.now()}`;
-  const token = `PASS-${Math.random().toString(36).substring(2, 6).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
+): Promise<{ sucesso: boolean; passe?: PasseVirtualQR; sincronizado?: boolean; erro?: string }> {
+  if (!isUUID(condominioId)) {
+    return { sucesso: false, erro: 'Condomínio inválido para emissão de Passe Virtual.' };
+  }
 
-  const novo: PasseVirtualQR = {
+  const id = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : '';
+  if (!id) {
+    return { sucesso: false, erro: 'Não foi possível gerar UUID para o Passe Virtual.' };
+  }
+
+  const token = gerarTokenPasseSeguro();
+  const payloadBanco = {
     id,
     token,
     condominio_id: condominioId,
@@ -539,21 +576,47 @@ export async function gerarPasseVirtual(
     data_validade: dados.data_validade || new Date().toISOString().split('T')[0],
     hora_inicio: dados.hora_inicio || '08:00',
     hora_fim: dados.hora_fim || '22:00',
-    max_usos: Number(dados.max_usos) || 1,
+    max_usos: Math.max(1, Number(dados.max_usos) || 1),
     usos_realizados: 0,
-    status: 'valido',
+    status: 'valido' as const,
     observacoes: dados.observacoes || '',
     criado_em: new Date().toISOString()
   };
 
+  let sincronizado = false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    enfileirarAcaoOffline('passes_virtuais_qr', 'INSERT', payloadBanco, `Passe QR: ${payloadBanco.token}`);
+  } else {
+    try {
+      const { error } = await supabase.from('passes_virtuais_qr').insert([payloadBanco]);
+      if (error) {
+        if (ehErroDeRedeOuOffline(error)) {
+          enfileirarAcaoOffline('passes_virtuais_qr', 'INSERT', payloadBanco, `Passe QR: ${payloadBanco.token}`);
+        } else {
+          return {
+            sucesso: false,
+            erro: formatarErroDetalhadoSupabase(error, 'Erro ao emitir Passe Virtual no servidor')
+          };
+        }
+      } else {
+        sincronizado = true;
+      }
+    } catch (err: any) {
+      if (ehErroDeRedeOuOffline(err)) {
+        enfileirarAcaoOffline('passes_virtuais_qr', 'INSERT', payloadBanco, `Passe QR: ${payloadBanco.token}`);
+      } else {
+        return {
+          sucesso: false,
+          erro: formatarErroDetalhadoSupabase(err, 'Erro inesperado ao emitir Passe Virtual')
+        };
+      }
+    }
+  }
+
+  const novo: PasseVirtualQR = { ...payloadBanco, sincronizado };
+  const passes = await carregarPassesVirtuais(condominioId);
   passes.unshift(novo);
   localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(passes));
-
-  if (isUUID(condominioId)) {
-    try {
-      await supabase.from('passes_virtuais_qr').insert([novo]);
-    } catch {}
-  }
 
   registrarAtividade({
     modulo: 'Controle de Acesso',
@@ -565,39 +628,195 @@ export async function gerarPasseVirtual(
     condominio_id: condominioId
   });
 
-  return novo;
+  return { sucesso: true, passe: novo, sincronizado };
 }
 
 export async function validarTokenPasse(
   condominioId: string,
   codigoOuToken: string
-): Promise<{ valido: boolean; passe?: PasseVirtualQR; motivo?: string }> {
-  const passes = await carregarPassesVirtuais(condominioId);
+): Promise<{ valido: boolean; passe?: PasseVirtualQR; motivo?: string; alertaBloqueio?: BloqueioSeguranca }> {
+  if (!isUUID(condominioId)) {
+    return { valido: false, motivo: 'Condomínio inválido para validar Passe Virtual.' };
+  }
+
   const tokenLimpo = (codigoOuToken || '').trim().toUpperCase();
-
-  const passe = passes.find(p => p.token.toUpperCase() === tokenLimpo || p.id === codigoOuToken);
-  if (!passe) {
-    return { valido: false, motivo: 'Passe Virtual não encontrado ou token inválido.' };
+  if (!tokenLimpo) {
+    return { valido: false, motivo: 'Informe o código ou leia o QR Code do Passe Virtual.' };
   }
 
-  if (passe.status !== 'valido') {
-    return { valido: false, passe, motivo: `Passe está marcado como ${passe.status.toUpperCase()}.` };
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return {
+      valido: false,
+      motivo: 'Validação de Passe QR bloqueada sem conexão com o servidor para evitar reutilização indevida.'
+    };
   }
 
-  const hoje = new Date().toISOString().split('T')[0];
-  if (passe.data_validade < hoje) {
-    passe.status = 'expirado';
-    localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(passes));
-    return { valido: false, passe, motivo: `Passe expirou na data ${passe.data_validade}.` };
+  try {
+    let query = supabase
+      .from('passes_virtuais_qr')
+      .select('*')
+      .eq('condominio_id', condominioId);
+
+    if (isUUID(codigoOuToken.trim())) {
+      query = query.eq('id', codigoOuToken.trim());
+    } else {
+      query = query.ilike('token', tokenLimpo);
+    }
+
+    const { data, error } = await query.maybeSingle();
+
+    if (error) {
+      return { valido: false, motivo: formatarErroDetalhadoSupabase(error, 'Erro ao validar Passe QR no servidor') };
+    }
+
+    const passe = data as PasseVirtualQR | null;
+    if (!passe) {
+      return { valido: false, motivo: 'Passe Virtual não encontrado neste condomínio.' };
+    }
+
+    const regra = validarRegraPasseQR(passe, condominioId);
+    if (!regra.valido) {
+      return { valido: false, passe, motivo: regra.motivo };
+    }
+
+    const checagem = await verificarBloqueio(condominioId, passe.visitante_documento, passe.visitante_nome);
+    if (checagem.bloqueado && checagem.item?.gravidade === 'bloqueio_total') {
+      return {
+        valido: false,
+        passe,
+        motivo: `ACESSO BARRADO: Visitante consta na Lista de Bloqueios (${checagem.item.motivo}).`,
+        alertaBloqueio: checagem.item
+      };
+    }
+
+    return { valido: true, passe, alertaBloqueio: checagem.item };
+  } catch (err: any) {
+    return {
+      valido: false,
+      motivo: formatarErroDetalhadoSupabase(err, 'Falha de comunicação ao validar Passe QR')
+    };
+  }
+}
+
+/**
+ * Valida e consome atomicamente 1 uso de Passe Virtual QR via backend seguro (/api/controle-acesso/validar-passe)
+ * ou RPC transacional no Supabase PostgreSQL (`validar_e_consumir_passe_qr`), com registro imediato de entrada.
+ */
+export async function validarEConsumirPasseQR(
+  condominioId: string,
+  codigoOuToken: string,
+  pontoAcesso: string = 'Portaria Principal (Pedestres)',
+  operadorLogado?: any
+): Promise<{
+  sucesso: boolean;
+  passe?: PasseVirtualQR;
+  registro?: RegistroAcesso;
+  motivo?: string;
+}> {
+  if (!isUUID(condominioId)) {
+    return { sucesso: false, motivo: 'Condomínio inválido.' };
   }
 
-  if (passe.usos_realizados >= passe.max_usos) {
-    passe.status = 'utilizado';
-    localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(passes));
-    return { valido: false, passe, motivo: 'Limite de utilizações deste passe já foi atingido.' };
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return {
+      sucesso: false,
+      motivo: 'Consumo de Passe QR bloqueado offline. Conecte-se para validar e debitar o uso no servidor.'
+    };
   }
 
-  return { valido: true, passe };
+  // Verifica lista de bloqueio antes do consumo atômico no servidor
+  const preCheck = await validarTokenPasse(condominioId, codigoOuToken);
+  if (!preCheck.valido) {
+    return { sucesso: false, passe: preCheck.passe, motivo: preCheck.motivo };
+  }
+
+  const jwt = await obterAccessTokenAtual();
+  if (!jwt) {
+    return { sucesso: false, motivo: 'Sessão Supabase Auth ausente. Faça login novamente.' };
+  }
+
+  try {
+    const resp = await fetch('/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${jwt}`
+      },
+      body: JSON.stringify({
+        condominioId,
+        token: codigoOuToken.trim(),
+        consumir: true,
+        pontoAcesso
+      })
+    });
+
+    const json: any = await resp.json().catch(() => null);
+
+    if (resp.ok && json?.valido) {
+      const passeAtualizado = json.passe as PasseVirtualQR | undefined;
+      const registroCriado = json.registro as RegistroAcesso | undefined;
+
+      // Atualiza caches locais com o estado canônico do servidor
+      if (passeAtualizado) {
+        const passes = await carregarPassesVirtuais(condominioId);
+        const atualizados = passes.some(p => p.id === passeAtualizado.id)
+          ? passes.map(p => (p.id === passeAtualizado.id ? passeAtualizado : p))
+          : [passeAtualizado, ...passes];
+        localStorage.setItem(`${CHAVE_STORAGE_PASSES}${condominioId}`, JSON.stringify(atualizados));
+      }
+      if (registroCriado) {
+        const regs = await carregarRegistrosAcesso(condominioId);
+        if (!regs.some(r => r.id === registroCriado.id)) {
+          regs.unshift({ ...registroCriado, sincronizado: true });
+          localStorage.setItem(`${CHAVE_STORAGE_REGISTROS}${condominioId}`, JSON.stringify(regs));
+        }
+      }
+
+      registrarAtividade({
+        modulo: 'Controle de Acesso',
+        acao: 'PASSE_QR_CONSUMIDO',
+        descricao: `Passe QR ${passeAtualizado?.token || codigoOuToken} validado e consumido para ${passeAtualizado?.visitante_nome || 'Visitante'} via ${pontoAcesso}.`,
+        detalhes: { passeId: passeAtualizado?.id, usos: passeAtualizado?.usos_realizados },
+        operador_nome: operadorLogado?.nome || 'Operador',
+        operador_id: operadorLogado?.id,
+        condominio_id: condominioId
+      });
+
+      return { sucesso: true, passe: passeAtualizado, registro: registroCriado };
+    }
+
+    if (resp.status !== 404 && resp.status !== 405 && json?.motivo) {
+      return { sucesso: false, passe: json?.passe, motivo: json.motivo };
+    }
+
+    // Fallback direto para RPC transacional no Supabase caso rota /api não esteja montada no ambiente estático
+    const { data: rpcData, error: rpcErr } = await supabase.rpc('validar_e_consumir_passe_qr', {
+      p_condominio_id: condominioId,
+      p_token: codigoOuToken.trim(),
+      p_consumir: true,
+      p_ponto_acesso: pontoAcesso,
+      p_operador_nome: operadorLogado?.nome || operadorLogado?.login || 'Portaria'
+    });
+
+    if (rpcErr) {
+      return { sucesso: false, motivo: formatarErroDetalhadoSupabase(rpcErr, 'Erro na validação atômica do Passe QR') };
+    }
+
+    if (!rpcData?.valido) {
+      return { sucesso: false, passe: rpcData?.passe, motivo: rpcData?.motivo || 'Passe QR inválido.' };
+    }
+
+    return {
+      sucesso: true,
+      passe: rpcData.passe as PasseVirtualQR,
+      registro: rpcData.registro as RegistroAcesso
+    };
+  } catch (err: any) {
+    return {
+      sucesso: false,
+      motivo: formatarErroDetalhadoSupabase(err, 'Falha ao consumir Passe QR no servidor')
+    };
+  }
 }
 
 export function formatarMensagemWhatsAppPasse(passe: PasseVirtualQR, condominioNome: string): string {
@@ -666,40 +885,12 @@ export async function carregarMoradoresBase(condominioId: string): Promise<Morad
     console.warn('[ControleAcesso] Erro ao buscar moradores base do Supabase:', err);
   }
 
-  // Fallback 1: cache local de moradores
   try {
     const cached = localStorage.getItem(`porttohub_cache_moradores_${condominioId}`);
     if (cached) {
       const parsed = JSON.parse(cached);
       if (Array.isArray(parsed) && parsed.length > 0) {
         return parsed as MoradorBaseInfo[];
-      }
-    }
-  } catch {}
-
-  // Fallback 2: cache global de moradores
-  try {
-    const cachedGlobal = localStorage.getItem('porttohub_moradores_v1');
-    if (cachedGlobal) {
-      const parsed = JSON.parse(cachedGlobal);
-      if (Array.isArray(parsed)) {
-        const filtrados = parsed.filter((m: any) => m.condominio_id === condominioId || m.condoId === condominioId);
-        if (filtrados.length > 0) {
-          return filtrados.map((m: any) => ({
-            id: m.id,
-            nome: m.name || m.nome,
-            bloco: m.block || m.bloco,
-            unidade: m.unitNumber || m.unit || m.unidade,
-            telefone: m.phone || m.telefone,
-            email: m.email,
-            cpf: m.document || m.cpf,
-            tipo: m.type || m.tipo,
-            condominio_id: condominioId,
-            status_acesso: m.status === 'Bloqueado' ? 'bloqueado' : 'liberado',
-            veiculo_placa: m.vehiclePlate || m.veiculo_placa,
-            foto_url: m.avatar || m.foto_url
-          }));
-        }
       }
     }
   } catch {}
@@ -713,7 +904,6 @@ export function extrairUnidadesBase(
 ): string[] {
   const setUnidades = new Set<string>();
 
-  // 1. Unidades cadastradas nos moradores
   if (moradores && Array.isArray(moradores)) {
     moradores.forEach(m => {
       if (m.unidade) {
@@ -724,7 +914,6 @@ export function extrairUnidadesBase(
     });
   }
 
-  // 2. Unidades da estrutura do condomínio
   if (condoConfig?.blocos_detalhes && Array.isArray(condoConfig.blocos_detalhes)) {
     condoConfig.blocos_detalhes.forEach((bloco: any) => {
       const nomeBloco = bloco.nome || 'Bloco A';
@@ -742,7 +931,6 @@ export function extrairUnidadesBase(
     });
   }
 
-  // 3. Unidades customizadas avulsas
   if (condoConfig?.unidades_customizadas && Array.isArray(condoConfig.unidades_customizadas)) {
     condoConfig.unidades_customizadas.forEach((u: string) => setUnidades.add(u));
   }
@@ -778,19 +966,61 @@ export async function alternarStatusAcessoMorador(
   moradorId: string,
   novoStatus: 'liberado' | 'bloqueado',
   condominioId: string
-): Promise<boolean> {
-  try {
-    const { error } = await supabase
-      .from('moradores')
-      .update({ status_acesso: novoStatus })
-      .eq('id', moradorId);
+): Promise<{ sucesso: boolean; sincronizado?: boolean; erro?: string }> {
+  if (!isUUID(condominioId) || !isUUID(moradorId)) {
+    return { sucesso: false, erro: 'Identificador de morador ou condomínio inválido.' };
+  }
 
-    if (error) {
-      console.warn('Erro ao atualizar status_acesso no Supabase:', error);
+  let sincronizado = false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    enfileirarAcaoOffline(
+      'moradores',
+      'UPDATE',
+      { id: moradorId, condominio_id: condominioId, status_acesso: novoStatus },
+      `Status acesso morador (${novoStatus})`
+    );
+  } else {
+    try {
+      const { error } = await supabase
+        .from('moradores')
+        .update({ status_acesso: novoStatus })
+        .eq('id', moradorId)
+        .eq('condominio_id', condominioId);
+
+      if (error) {
+        if (ehErroDeRedeOuOffline(error)) {
+          enfileirarAcaoOffline(
+            'moradores',
+            'UPDATE',
+            { id: moradorId, condominio_id: condominioId, status_acesso: novoStatus },
+            `Status acesso morador (${novoStatus})`
+          );
+        } else {
+          return {
+            sucesso: false,
+            erro: formatarErroDetalhadoSupabase(error, 'Erro ao atualizar status do morador')
+          };
+        }
+      } else {
+        sincronizado = true;
+      }
+    } catch (err: any) {
+      if (ehErroDeRedeOuOffline(err)) {
+        enfileirarAcaoOffline(
+          'moradores',
+          'UPDATE',
+          { id: moradorId, condominio_id: condominioId, status_acesso: novoStatus },
+          `Status acesso morador (${novoStatus})`
+        );
+      } else {
+        return {
+          sucesso: false,
+          erro: formatarErroDetalhadoSupabase(err, 'Erro inesperado ao atualizar status do morador')
+        };
+      }
     }
-  } catch {}
+  }
 
-  // Atualiza cache local
   try {
     const cached = localStorage.getItem(`porttohub_cache_moradores_${condominioId}`);
     if (cached) {
@@ -800,5 +1030,5 @@ export async function alternarStatusAcessoMorador(
     }
   } catch {}
 
-  return true;
+  return { sucesso: true, sincronizado };
 }

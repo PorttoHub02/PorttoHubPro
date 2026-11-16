@@ -13,6 +13,7 @@ import {
   handleGithubVersao,
   handleOcrEtiqueta,
   handleAdminProvisionarOperador,
+  handleValidarPasseQR,
   handleCacheQuery,
   handleCacheInvalidate,
   handleCacheStats,
@@ -107,6 +108,11 @@ app.post('/api/ocr-etiqueta', async (req, res) => {
 
 app.post('/api/admin/operadores/provisionar', async (req, res) => {
   const webRes = await handleAdminProvisionarOperador(toWebRequest(req), process.env as any);
+  await sendWebResponse(res, webRes);
+});
+
+app.post('/api/controle-acesso/validar-passe', async (req, res) => {
+  const webRes = await handleValidarPasseQR(toWebRequest(req), process.env as any);
   await sendWebResponse(res, webRes);
 });
 

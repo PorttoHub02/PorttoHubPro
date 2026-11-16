@@ -9,6 +9,7 @@ import {
   handleGithubVersao,
   handleOcrEtiqueta,
   handleAdminProvisionarOperador,
+  handleValidarPasseQR,
   handleCacheQuery,
   handleCacheInvalidate,
   handleCacheStats,
@@ -53,6 +54,9 @@ export default {
       }
       if (pathname === '/api/admin/operadores/provisionar' && method === 'POST') {
         return handleAdminProvisionarOperador(request, env);
+      }
+      if (pathname === '/api/controle-acesso/validar-passe' && method === 'POST') {
+        return handleValidarPasseQR(request, env);
       }
       if (pathname === '/api/cache/query' && method === 'POST') {
         return handleCacheQuery(request, env);
