@@ -1,5 +1,6 @@
 import { supabase } from './supabase';
 import { isUUID } from './condominioService';
+import { normalizarPerfilOperador, temAcessoGlobalExplicito } from './autorizacaoService';
 
 export interface PermissaoModuloPadrao {
   visualizar?: boolean;
@@ -352,8 +353,8 @@ export const NIVEIS_PADRAO: NivelAcessoItem[] = [
   },
   {
     id: 'nivel_1',
-    nome: 'Nível 1 — Master (Síndico / Auditoria)',
-    descricao: 'Visualização completa de relatórios, auditoria de dados, métricas executivas e cadastros.',
+    nome: 'Nível 1 — Administrador de Condomínio',
+    descricao: 'Gestão completa do próprio condomínio, moradores, cadastros e equipe local (sem acesso global).',
     condominio_id: null,
     padrao_sistema: true,
     permissoes: {
@@ -378,7 +379,7 @@ export const NIVEIS_PADRAO: NivelAcessoItem[] = [
   {
     id: 'nivel_2',
     nome: 'Nível 2 — Supervisor de Segurança',
-    descricao: 'Gestão operacional de equipes, controle de rondas, ocorrências, materiais e supervisão de portaria.',
+    descricao: 'Supervisão operacional de equipes nos condomínios vinculados, rondas, ocorrências e portaria (sem poderes administrativos de usuários).',
     condominio_id: null,
     padrao_sistema: true,
     permissoes: {
@@ -391,7 +392,7 @@ export const NIVEIS_PADRAO: NivelAcessoItem[] = [
       manutencao: { visualizar: true, criar: true, editar: true, excluir: false, abrir_os: true, concluir: true },
       ocorrencias: { visualizar: true, criar: true, editar: true, excluir: false, resolver: true },
       passagem_posto: { visualizar: true, criar: true, editar: true, excluir: false, assumir_posto: true, relatorio: true },
-      cadastros: { visualizar: true, criar: true, editar: true, excluir: false, moradores: true, visualizar_moradores: true, cadastrar_morador: true, editar_morador: true, excluir_morador: false, gerenciar_veiculos: true, vincular_tags: true, status_acesso_morador: true, exportar_moradores: true, visualizar_operadores: true, operadores: true, editar_operadores: true, alterar_senha_operador: false, excluir_operadores: false, configurar_condominio: true, condominios: false, gerenciar_niveis: false },
+      cadastros: { visualizar: true, criar: true, editar: true, excluir: false, moradores: true, visualizar_moradores: true, cadastrar_morador: true, editar_morador: true, excluir_morador: false, gerenciar_veiculos: true, vincular_tags: true, status_acesso_morador: true, exportar_moradores: true, visualizar_operadores: true, operadores: false, editar_operadores: false, alterar_senha_operador: false, excluir_operadores: false, configurar_condominio: false, condominios: false, gerenciar_niveis: false },
       moradores: { visualizar: true, criar: true, editar: true, excluir: false, adicionar: true },
       historico_absoluto: { visualizar: true, criar: false, editar: false, excluir: false, ver_feed: true, ver_metricas: true, exportar_csv: false, limpar_dados: false },
       configuracoes: { visualizar: false, criar: false, editar: false, excluir: false, gerenciar_niveis: false, feature_flags: false },
@@ -677,11 +678,14 @@ export function obterNomeNivel(nivelIdentificador: string | number | undefined, 
   // Fallbacks conhecidos
   switch (idStr) {
     case '0':
-    case 'admin':
+    case 'admin_geral':
       return 'Nível 0 — Administrador Geral';
     case '1':
+    case 'admin':
+    case 'admin_condominio':
+    case 'admin_local':
     case 'master':
-      return 'Nível 1 — Master (Síndico / Auditoria)';
+      return 'Nível 1 — Administrador de Condomínio';
     case '2':
     case 'supervisor':
       return 'Nível 2 — Supervisor de Segurança';
@@ -870,12 +874,15 @@ export function extrairIdNivel(operador: any): string {
     const s = String(rawNivel).trim();
     if (s.startsWith('nivel_')) return s;
     if (s.startsWith('custom_')) return s;
+    if (s === '0' && !temAcessoGlobalExplicito(operador)) {
+      return 'nivel_1';
+    }
     return `nivel_${s}`;
   }
   const rawPerfil = operador.perfil ? String(operador.perfil).trim().toLowerCase() : '';
   if (rawPerfil) {
-    if (rawPerfil === 'admin' || rawPerfil === 'admin_geral') return 'nivel_0';
-    if (rawPerfil === 'master') return 'nivel_1';
+    if (rawPerfil === 'admin_geral' && temAcessoGlobalExplicito(operador)) return 'nivel_0';
+    if (rawPerfil === 'admin_condominio' || rawPerfil === 'admin_local' || rawPerfil === 'admin' || rawPerfil === 'master') return 'nivel_1';
     if (rawPerfil === 'supervisor') return 'nivel_2';
     if (rawPerfil === 'operador' || rawPerfil === 'porteiro') return 'nivel_3';
     if (rawPerfil === 'sindico') return 'nivel_4';
@@ -1043,29 +1050,41 @@ export function verificarPermissao(
     }
   }
 
-  const ehAdminGeral = (perfilStr === 'admin' || perfilStr === 'admin_geral' || perfilStr === 'master' || nivelNum === 0 || nivelNum === 1 || Boolean(operador.eSuperAdminGlobal));
+  const ehAdminGeral = Boolean(operador.eSuperAdminGlobal || temAcessoGlobalExplicito(operador));
+  const perfilPadrao = normalizarPerfilOperador(operador);
+  const ehAdminCondominioLocal = !ehAdminGeral && perfilPadrao === 'admin_condominio';
 
   // Normalização de sinônimos de módulos
   let modKey = String(modulo).toLowerCase();
   if (modKey === 'prestadores') modKey = 'autorizados';
   if (modKey === 'passagem') modKey = 'passagem_posto';
 
-  // REGRA ESTRITA DE SEGURANÇA: Módulo de Configurações é EXCLUSIVO para o Nível 0 de acesso (ADM Geral)
+  // REGRA ESTRITA DE SEGURANÇA: Módulo de Configurações é EXCLUSIVO para Administrador Geral com acesso_global_condominios = true
   if (modKey === 'configuracoes') {
-    const ehNivel0 = Boolean(
-      operador.eSuperAdminGlobal ||
-      operador.login === 'admin' ||
-      perfilStr === 'admin' ||
-      perfilStr === 'admin_geral' ||
-      nivelNum === 0 ||
-      idNivel === 'nivel_0'
-    );
-    return ehNivel0;
+    return ehAdminGeral;
+  }
+
+  // REGRA ESTRITA DE SEGURANÇA: Operações administrativas globais e gestão de operadores seguem estritamente o banco
+  if (modKey === 'cadastros') {
+    if (acao === 'condominios' || acao === 'gerenciar_niveis') {
+      return ehAdminGeral;
+    }
+    if (
+      acao === 'operadores' ||
+      acao === 'cadastrar_operadores' ||
+      acao === 'editar_operadores' ||
+      acao === 'alterar_senha_operador' ||
+      acao === 'excluir_operadores'
+    ) {
+      if (!ehAdminGeral && !ehAdminCondominioLocal) {
+        return false;
+      }
+    }
   }
 
   // REGRA ESTRITA RBAC: Perfil de Síndico (Nível 4)
   // Síndico visualiza e acessa os módulos ativos em seu login; não edita nem lança nada, EXCETO em ocorrências (onde pode criar e resolver)
-  const ehSindico = !ehAdminGeral && (idNivel === 'nivel_4' || perfilStr.includes('sind') || nivelNum === 4 || Boolean(operador.eSindico));
+  const ehSindico = !ehAdminGeral && !ehAdminCondominioLocal && (idNivel === 'nivel_4' || perfilStr.includes('sind') || nivelNum === 4 || Boolean(operador.eSindico));
   if (ehSindico) {
     const permDiretas = obterPermissoesOperador(operador);
     const modCfg: any = permDiretas ? ((permDiretas as any)[modKey] || (permDiretas as any)[modulo]) : null;
@@ -1125,9 +1144,9 @@ export function verificarPermissao(
   }
 
   if (!nivelObj) {
-    if (perfilStr.includes('admin') || nivelNum === 0) nivelObj = todos.find(n => n.id === 'nivel_0') || NIVEIS_PADRAO[0];
-    else if (perfilStr.includes('master') || nivelNum === 1) nivelObj = todos.find(n => n.id === 'nivel_1') || NIVEIS_PADRAO[1];
-    else if (perfilStr.includes('superv') || nivelNum === 2) nivelObj = todos.find(n => n.id === 'nivel_2') || NIVEIS_PADRAO[2];
+    if (ehAdminGeral) nivelObj = todos.find(n => n.id === 'nivel_0') || NIVEIS_PADRAO[0];
+    else if (ehAdminCondominioLocal) nivelObj = todos.find(n => n.id === 'nivel_1') || NIVEIS_PADRAO[1];
+    else if (perfilPadrao === 'supervisor') nivelObj = todos.find(n => n.id === 'nivel_2') || NIVEIS_PADRAO[2];
     else if (perfilStr.includes('sind') || nivelNum === 4) nivelObj = todos.find(n => n.id === 'nivel_4') || NIVEIS_PADRAO[4];
     else nivelObj = todos.find(n => n.id === 'nivel_3') || NIVEIS_PADRAO[3];
   }
@@ -1164,14 +1183,14 @@ export function verificarPermissao(
           return true;
         }
         if (acao === 'zerar' || acao === 'excluir') {
-          return ehAdminGeral || nivelNum <= 1;
+          return ehAdminGeral || ehAdminCondominioLocal;
         }
       }
     }
   }
 
-  // 3. Fallbacks para Administrador Geral / Master
-  if (ehAdminGeral || nivelNum === 0 || perfilStr === 'admin') {
+  // 3. Fallback exclusivo para Administrador Geral com acesso global explícito
+  if (ehAdminGeral) {
     return true;
   }
 

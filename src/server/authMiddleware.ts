@@ -34,6 +34,26 @@ export function getSupabaseServerConfig(env: RuntimeEnv): {
   };
 }
 
+export type PerfilPadrao = 'admin_geral' | 'admin_condominio' | 'supervisor' | 'operador';
+
+export function normalizarPerfilOperador(operador?: {
+  perfil?: string | null;
+  nivel_acesso?: number | null;
+  acesso_global_condominios?: boolean | null;
+} | null): PerfilPadrao {
+  if (!operador) return 'operador';
+  if (operador.acesso_global_condominios === true) return 'admin_geral';
+
+  const perfil = String(operador.perfil || '').trim().toLowerCase();
+  if (perfil === 'admin_condominio' || perfil === 'admin_local' || perfil === 'admin' || perfil === 'master') {
+    return 'admin_condominio';
+  }
+  if (perfil === 'supervisor' || Number(operador.nivel_acesso) === 2) {
+    return 'supervisor';
+  }
+  return 'operador';
+}
+
 export interface AuthContext {
   jwt: string;
   authUser: {
@@ -51,6 +71,7 @@ export interface AuthContext {
     acesso_global_condominios?: boolean;
     ativo?: boolean;
   };
+  perfilNormalizado: PerfilPadrao;
   eAdminGlobal: boolean;
   allowedCondominioIds: Set<string>;
 }
@@ -150,8 +171,9 @@ export async function authenticateRequest(
     return { ok: false, status: 403, error: 'Operador desativado.' };
   }
 
-  // Regra C estrita: flag booleana explícita apenas
+  // Regra estrita: acesso global SOMENTE quando acesso_global_condominios === true
   const eAdminGlobal = operador.acesso_global_condominios === true;
+  const perfilNormalizado = normalizarPerfilOperador(operador);
   const allowedCondominioIds = new Set<string>();
 
   if (isValidUuid(operador.condominio_id)) {
@@ -184,6 +206,7 @@ export async function authenticateRequest(
       jwt,
       authUser: { id: String(authUser.id), email: authUser.email },
       operador,
+      perfilNormalizado,
       eAdminGlobal,
       allowedCondominioIds
     }
@@ -198,12 +221,20 @@ export function isCondominioAutorizado(ctx: AuthContext, condominioId?: string |
   return ctx.allowedCondominioIds.has(clean);
 }
 
+/**
+ * Sincronizado com public.operador_pode_gerenciar_operadores() e operador_pode_gerenciar_operadores(p_condominio_id):
+ * - Sem parâmetro: exclusivo de administrador global (acesso_global_condominios === true).
+ * - Com parâmetro: global OU admin_condominio do próprio condomínio principal.
+ * - Supervisor e operador NUNCA recebem poder administrativo de gestão de operadores automaticamente.
+ */
 export function podeGerenciarOperadores(ctx: AuthContext, targetCondominioId?: string | null): boolean {
   if (ctx.eAdminGlobal) return true;
-  const perfil = String(ctx.operador.perfil || '').toLowerCase();
-  const nivel = Number(ctx.operador.nivel_acesso ?? 99);
-  const cargoGestor = perfil === 'admin' || perfil === 'admin_geral' || perfil === 'master' || perfil === 'supervisor' || nivel <= 2;
-  if (!cargoGestor) return false;
-  if (!targetCondominioId) return false;
-  return isCondominioAutorizado(ctx, targetCondominioId);
+  if (!targetCondominioId || !isValidUuid(targetCondominioId)) return false;
+
+  if (ctx.perfilNormalizado !== 'admin_condominio') {
+    return false;
+  }
+
+  const primaryCondo = String(ctx.operador.condominio_id || '').trim();
+  return isValidUuid(primaryCondo) && primaryCondo === targetCondominioId.trim();
 }

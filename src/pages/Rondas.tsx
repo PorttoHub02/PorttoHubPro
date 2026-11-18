@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import jsQR from 'jsqr';
 import { supabase } from '../services/supabase';
-import { uploadFotoComprimidaStorage } from '../services/imageUtils';
+import { uploadFotoComprimidaStorage, normalizarCaminhoStorageParaBanco } from '../services/imageUtils';
 import { EVENTO_SINCRONIZAR_DADOS } from '../services/offlineStorageService';
 import { formatarLinkWhatsApp } from '../services/configWhatsappService';
 import LeitorNFC from '../components/LeitorNFC';
@@ -39,8 +39,11 @@ import ModalGerenciarSetores from '../components/ModalGerenciarSetores';
 import { SetorRonda, SETORES_RONDA_PADRAO, carregarSetoresRonda } from '../services/setoresRonda';
 import {
   buscarOperadorParaReautenticacao,
-  verificarCredenciaisOperadorSupabaseAuth
+  verificarCredenciaisOperadorSupabaseAuth,
+  temAcessoGlobalExplicito,
+  ehAdminCondominio
 } from '../services/autorizacaoService';
+import { verificarPermissao } from '../services/permissoesService';
 
 interface RondasProps {
   usuarioLogado?: any;
@@ -54,41 +57,10 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
   const inputFotoRef = useRef<HTMLInputElement | null>(null);
   const inputPlacaFotoRef = useRef<HTMLInputElement | null>(null);
 
-  const nivelNum = Number(usuarioLogado?.nivel ?? usuarioLogado?.nivel_acesso);
-  const perfilTexto = String(
-    usuarioLogado?.perfil || 
-    usuarioLogado?.tipo || 
-    usuarioLogado?.role || 
-    usuarioLogado?.funcao || 
-    usuarioLogado?.login || 
-    ''
-  ).toLowerCase();
-
-  const isOperadorNivel3 = 
-    usuarioLogado?.nivel === 3 || 
-    usuarioLogado?.nivel === '3' || 
-    usuarioLogado?.nivel_acesso === 3 ||
-    nivelNum === 3 ||
-    (perfilTexto.includes('operador') && 
-     !perfilTexto.includes('admin') && 
-     !perfilTexto.includes('master') && 
-     !perfilTexto.includes('sindico') && 
-     !perfilTexto.includes('dev'));
-
-  const podeGerenciarPontos = !isOperadorNivel3 && (
-    usuarioLogado?.nivel === 0 || 
-    usuarioLogado?.nivel === 1 || 
-    usuarioLogado?.nivel === 2 || 
-    usuarioLogado?.nivel_acesso === 0 ||
-    usuarioLogado?.nivel_acesso === 1 ||
-    usuarioLogado?.nivel_acesso === 2 ||
-    (!isNaN(nivelNum) && nivelNum < 3) ||
-    perfilTexto.includes('admin') ||
-    perfilTexto.includes('adm') ||
-    perfilTexto.includes('master') ||
-    perfilTexto.includes('dev') ||
-    perfilTexto.includes('sindico') ||
-    perfilTexto.includes('supervisor')
+  const podeGerenciarPontos = Boolean(
+    temAcessoGlobalExplicito(usuarioLogado) ||
+    ehAdminCondominio(usuarioLogado) ||
+    verificarPermissao(usuarioLogado, 'rondas', 'cadastrar_pontos')
   );
 
   const [operadorRondaAtual, setOperadorRondaAtual] = useState(
@@ -350,7 +322,7 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
     setUploadingFoto(true);
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta: 'rondas_evidencias',
         condominioId: usuarioLogado?.condominio_id,
@@ -359,7 +331,7 @@ export default function Rondas({ usuarioLogado }: RondasProps) {
         qualidade: 0.75
       });
 
-      setFotoPontoUrl(publicUrl);
+      setFotoPontoUrl(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto capturada, comprimida e enviada com sucesso!${detalheEconomia}` });
     } catch (err: any) {

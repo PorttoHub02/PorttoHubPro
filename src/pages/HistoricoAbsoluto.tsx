@@ -10,6 +10,7 @@ import {
   RegistroAuditoria 
 } from '../services/auditoriaService';
 import { verificarPermissao } from '../services/permissoesService';
+import { temAcessoGlobalExplicito, ehAdminCondominio } from '../services/autorizacaoService';
 import { purgarCachesLocaisInfport } from '../services/cacheLimpezaService';
 import { 
   History, 
@@ -46,18 +47,14 @@ interface HistoricoAbsolutoProps {
 }
 
 export default function HistoricoAbsoluto({ operadorLogado, condominioAtivo, listaCondominios = [] }: HistoricoAbsolutoProps) {
-  // PRIVACIDADE ESTRITA: Apenas o Super Administrador Geral da Plataforma (sem condomínio fixo vinculado) tem visão multi-condomínio
-  // Qualquer operador, síndico ou administrador vinculado a um condomínio específico FICA RIGIDAMENTE BLOQUEADO no seu condomínio
-  const eAdminGlobal = Boolean(
-    operadorLogado?.eSuperAdminGlobal ||
-    ((operadorLogado?.login === 'admin' || operadorLogado?.perfil === 'admin_geral') && 
-     (!operadorLogado?.condominio_id || operadorLogado?.condominio_id === 'global'))
-  );
+  // PRIVACIDADE ESTRITA: Apenas o Administrador Geral com acesso_global_condominios = TRUE tem visão multi-condomínio
+  const eAdminGlobal = temAcessoGlobalExplicito(operadorLogado);
 
-  // Administrador ou Síndico dentro do seu escopo
-  const eAdmin = operadorLogado?.perfil === 'admin' || operadorLogado?.nivel_acesso === 0 || operadorLogado?.perfil === 'master' || operadorLogado?.nivel_acesso === 1;
+  // Administrador Geral ou Administrador de Condomínio dentro do seu escopo
+  const eAdminCondominio = ehAdminCondominio(operadorLogado);
+  const eAdmin = eAdminGlobal || eAdminCondominio;
 
-  // Condomínio obrigatório para operadores, porteiros, supervisores e síndicos
+  // Condomínio obrigatório para operadores, porteiros, supervisores, síndicos e admin_condominio
   const idCondominioRestrito = operadorLogado?.condominio_id || condominioAtivo?.id || '';
 
   // Permissões granulares do módulo Histórico Absoluto
@@ -67,27 +64,15 @@ export default function HistoricoAbsoluto({ operadorLogado, condominioAtivo, lis
 
   const podeExcluirDados = Boolean(
     eAdminGlobal || 
-    eAdmin || 
-    operadorLogado?.login === 'admin' || 
-    operadorLogado?.perfil === 'admin' || 
-    operadorLogado?.perfil === 'master' ||
-    operadorLogado?.nivel_acesso === 0 ||
-    operadorLogado?.nivel_acesso === 1 ||
+    eAdminCondominio || 
     verificarPermissao(operadorLogado, 'historico_absoluto', 'limpar_dados') || 
     verificarPermissao(operadorLogado, 'historico_absoluto', 'excluir')
   );
 
-  // Permite selecionar condomínio ou visão geral de todos quando for Administrador
+  // Permite selecionar condomínio ou visão geral apenas quando for Admin Geral ou possuir múltiplos vínculos explícitos
   const podeFiltrarCondominios = Boolean(
     eAdminGlobal || 
-    eAdmin || 
-    operadorLogado?.login === 'admin' || 
-    operadorLogado?.perfil === 'admin' || 
-    operadorLogado?.perfil === 'admin_geral' ||
-    operadorLogado?.perfil === 'master' ||
-    operadorLogado?.nivel_acesso === 0 ||
-    operadorLogado?.nivel_acesso === 1 ||
-    (listaCondominios && listaCondominios.length > 0)
+    (listaCondominios && listaCondominios.length > 1)
   );
 
   const [abaAtiva, setAbaAtiva] = useState<'feed' | 'limpeza' | 'sql' | 'metricas'>('feed');
@@ -95,9 +80,9 @@ export default function HistoricoAbsoluto({ operadorLogado, condominioAtivo, lis
   const [loading, setLoading] = useState(false);
   const [fonteDados, setFonteDados] = useState<'supabase' | 'cache_local'>('supabase');
 
-  // Filtros do Feed - se for ADM, permite 'todos' ou selecionar qualquer condomínio
+  // Filtros do Feed - apenas Admin Geral inicia em 'todos'; perfis vinculados iniciam no condomínio ativo
   const [filtroCondominio, setFiltroCondominio] = useState<string>(
-    podeFiltrarCondominios ? 'todos' : (idCondominioRestrito || 'todos')
+    eAdminGlobal ? 'todos' : (idCondominioRestrito || 'todos')
   );
   const [filtroModulo, setFiltroModulo] = useState('todos');
   const [filtroAcao, setFiltroAcao] = useState('todas');

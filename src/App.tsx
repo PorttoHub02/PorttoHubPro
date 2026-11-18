@@ -92,10 +92,12 @@ import { registrarAtividade } from './services/auditoriaService';
 import { carregarNiveisAcesso, verificarPermissao, obterPermissoesOperador } from './services/permissoesService';
 import { isUUID } from './services/condominioService';
 import { aquecerCacheCondominio, invalidarCacheCondominio, limparTodoCache } from './services/redisCacheService';
+import { ImagemOtimizada } from './components/ImagemOtimizada';
 import {
   buscarVinculosCondominiosOperador,
   resolverContextoCondominiosOperador,
   temAcessoGlobalExplicito,
+  ehAdminCondominio,
   ehPerfilSindico,
   isCondominioIdValido,
   OPERADOR_SAFE_COLUMNS,
@@ -248,16 +250,9 @@ export default function App() {
   // Acesso global SOMENTE quando acesso_global_condominios === true no banco.
   // NUNCA inferido por login === 'admin', 'master', nivel_acesso <= 1 ou condominio_id = 'todos'.
   const eSuperAdminGlobal = temAcessoGlobalExplicito(operador);
+  const eAdminCondominio = ehAdminCondominio(operador);
   const eSindico = ehPerfilSindico(operador);
-  const eAdmin = Boolean(
-    !eSindico && (
-      eSuperAdminGlobal ||
-      operador?.perfil === 'admin' ||
-      operador?.perfil === 'admin_geral' ||
-      operador?.nivel_acesso === 0 ||
-      operador?.nivel_acesso === 1
-    )
-  );
+  const eAdmin = Boolean(!eSindico && (eSuperAdminGlobal || eAdminCondominio));
   const eAcessoMultiCondominio = Boolean(contextoCondos?.mostrarSeletor && !eSindico);
 
   const resolverEAplicarContextoOperador = async (
@@ -1080,20 +1075,14 @@ export default function App() {
     listaCondominios: listaCondominios
   } : null;
 
-  // Regra de segurança: Configurações restrito ao Nível 0 ou Admin Geral explícito
-  const ehNivel0Adm = Boolean(
-    eSuperAdminGlobal ||
-    operador?.perfil?.toLowerCase() === 'admin' ||
-    operador?.perfil?.toLowerCase() === 'admin_geral' ||
-    Number(operador?.nivel_acesso) === 0 ||
-    (operador as any)?.nivel_acesso_custom_id === 'nivel_0'
-  );
+  // Regra de segurança: Configurações restrito ao Administrador Geral explícito (acesso_global_condominios = true)
+  const ehNivel0Adm = Boolean(eSuperAdminGlobal);
 
   const podeAcessarConfiguracoes = Boolean(
     !eSindico && ehNivel0Adm
   );
   const podeAcessarCadastros = Boolean(
-    eAdmin || operador?.perfil === 'master' || operador?.nivel_acesso === 1 || verificarPermissao(operadorContextoGlobal, 'cadastros', 'visualizar')
+    eAdmin || verificarPermissao(operadorContextoGlobal, 'cadastros', 'visualizar')
   );
 
   const modulosDisponiveis = [
@@ -1356,12 +1345,12 @@ export default function App() {
                 title="Meu Perfil & Alterar Senha"
               >
                 {operador.foto_url ? (
-                  <img 
-                    src={operador.foto_url} 
-                    alt={operador.nome} 
-                    loading="lazy"
-                    decoding="async"
-                    className="w-8 h-8 rounded-full object-cover border-2 border-emerald-400 shrink-0" 
+                  <ImagemOtimizada
+                    src={operador.foto_url}
+                    alt={operador.nome}
+                    permitirAmpliar={false}
+                    containerClassName="w-8 h-8 rounded-full overflow-hidden border-2 border-emerald-400 shrink-0"
+                    className="w-full h-full object-cover"
                   />
                 ) : (
                   <div className="w-8 h-8 rounded-full bg-slate-800 text-emerald-400 flex items-center justify-center font-bold text-xs shrink-0 group-hover:bg-emerald-600 group-hover:text-white transition">
@@ -1374,7 +1363,13 @@ export default function App() {
                     <KeyRound className="w-3 h-3 text-slate-500 group-hover:text-emerald-400" />
                   </p>
                   <p className="text-[10px] text-slate-400 uppercase font-mono">
-                    {eAdmin ? 'DEV ADMIN' : (eSindico ? '🛡️ SÍNDICO (CONSULTA)' : `NÍVEL ${operador.nivel_acesso ?? 3}`)}
+                    {eSuperAdminGlobal
+                      ? 'ADMIN GERAL'
+                      : eAdminCondominio
+                        ? 'ADMIN CONDOMÍNIO'
+                        : eSindico
+                          ? '🛡️ SÍNDICO (CONSULTA)'
+                          : `NÍVEL ${operador.nivel_acesso ?? 3}`}
                   </p>
                 </div>
               </div>
@@ -1605,6 +1600,7 @@ export default function App() {
               condominioId={condominioAtivoId || operador?.condominio_id || ''}
               operador={operadorContextoGlobal}
               eAdmin={eAdmin}
+              eSuperAdminGlobal={eSuperAdminGlobal}
               eSindico={eSindico}
               onAbrirDoctor={() => setModalSupabaseDoctorAberto(true)}
               onAbrirNotificacoes={() => setModalLembretesAberto(true)}
@@ -2001,7 +1997,8 @@ export default function App() {
                 nivel: operador?.nivel,
                 nivel_acesso: operador?.nivel_acesso,
                 nivel_acesso_custom_id: (operador as any)?.nivel_acesso_custom_id,
-                eSuperAdminGlobal: eAdmin
+                acesso_global_condominios: operador?.acesso_global_condominios === true,
+                eSuperAdminGlobal: eSuperAdminGlobal
               }}
             />
           </Suspense>

@@ -6,9 +6,16 @@ import path from 'node:path';
 import {
   resolverContextoCondominiosOperador,
   temAcessoGlobalExplicito,
+  normalizarPerfilOperador,
+  ehAdminCondominio,
+  ehPerfilSupervisor,
+  podeGerenciarOperadoresNoCondominio,
   isCondominioIdValido,
   verificarCredenciaisOperadorSupabaseAuth
 } from '../src/services/autorizacaoService.ts';
+import {
+  podeGerenciarOperadores as podeGerenciarOperadoresServidor
+} from '../src/server/authMiddleware.ts';
 import {
   buscarMoradoresDaUnidadeExata,
   validarDestinatarioAntesGravacao,
@@ -16,6 +23,8 @@ import {
 } from '../src/services/encomendasService.ts';
 import {
   extrairCaminhoStorageSupabase,
+  ehCaminhoPrivadoStorage,
+  normalizarCaminhoStorageParaBanco,
   formatarUrlFoto
 } from '../src/services/imageUtils.ts';
 import {
@@ -749,4 +758,232 @@ test('Infraestrutura oficial: diagnóstico seguro em banco vazio, Worker porttoh
 
   // README explicitamente proíbe rodar script 10 na instalação normal
   assert.ok(readmeCode.includes('NÃO execute `10_ROLLBACK_OU_RECUPERACAO.sql` durante a instalação normal'));
+});
+
+test('[Mock/Unit] 4 perfis oficiais, regra estrita de condomínio principal e bloqueio de auto-escalação', async () => {
+  const opGlobal = {
+    id: OP_GLOBAL,
+    perfil: 'admin_geral',
+    nivel_acesso: 0,
+    condominio_id: null,
+    acesso_global_condominios: true
+  };
+  const opAdminLocal = {
+    id: OP_GESTOR_A,
+    perfil: 'admin_condominio',
+    nivel_acesso: 1,
+    condominio_id: CONDO_A,
+    acesso_global_condominios: false
+  };
+  const opSupervisor = {
+    id: 'sup-oficial',
+    perfil: 'supervisor',
+    nivel_acesso: 2,
+    condominio_id: CONDO_A,
+    acesso_global_condominios: false
+  };
+  const opComum = {
+    id: OP_ALVO_A,
+    perfil: 'operador',
+    nivel_acesso: 3,
+    condominio_id: CONDO_A,
+    acesso_global_condominios: false
+  };
+  const opFalsoAdminGlobal = {
+    id: 'falso-global',
+    login: 'admin',
+    perfil: 'admin_geral',
+    nivel_acesso: 0,
+    condominio_id: CONDO_A,
+    acesso_global_condominios: false
+  };
+
+  assert.equal(normalizarPerfilOperador(opGlobal), 'admin_geral');
+  assert.equal(normalizarPerfilOperador(opAdminLocal), 'admin_condominio');
+  assert.equal(normalizarPerfilOperador(opSupervisor), 'supervisor');
+  assert.equal(normalizarPerfilOperador(opComum), 'operador');
+  // Sem acesso_global_condominios = true, mesmo perfil='admin_geral' / nivel=0 / login='admin' NÃO vira admin_geral
+  assert.notEqual(normalizarPerfilOperador(opFalsoAdminGlobal), 'admin_geral');
+  assert.equal(temAcessoGlobalExplicito(opFalsoAdminGlobal), false);
+
+  // Regra estrita: admin_condominio gerencia APENAS seu condomínio principal, nunca secundários nem globalmente
+  assert.equal(ehAdminCondominio(opAdminLocal), true);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opAdminLocal, CONDO_A), true);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opAdminLocal, CONDO_B), false);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opAdminLocal, null), false);
+
+  // Supervisor e operador NUNCA recebem poder administrativo de gestão de operadores
+  assert.equal(ehPerfilSupervisor(opSupervisor), true);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opSupervisor, CONDO_A), false);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opComum, CONDO_A), false);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opGlobal, CONDO_B), true);
+  assert.equal(podeGerenciarOperadoresNoCondominio(opGlobal, null), true);
+
+  // Espelho exato no servidor (authMiddleware)
+  const serverCtxLocal: any = {
+    eAdminGlobal: false,
+    perfilNormalizado: 'admin_condominio',
+    operador: opAdminLocal,
+    allowedCondominioIds: new Set([CONDO_A, CONDO_B]) // Mesmo com vínculo secundário em CONDO_B
+  };
+  assert.equal(podeGerenciarOperadoresServidor(serverCtxLocal, CONDO_A), true);
+  assert.equal(podeGerenciarOperadoresServidor(serverCtxLocal, CONDO_B), false); // Bloqueado em secundário!
+  assert.equal(podeGerenciarOperadoresServidor(serverCtxLocal, null), false);
+
+  const serverCtxSup: any = {
+    eAdminGlobal: false,
+    perfilNormalizado: 'supervisor',
+    operador: opSupervisor,
+    allowedCondominioIds: new Set([CONDO_A, CONDO_B])
+  };
+  assert.equal(podeGerenciarOperadoresServidor(serverCtxSup, CONDO_A), false);
+
+  // Endpoint administrativo bloqueia auto-edição e criação de admin_geral por admin_condominio
+  const { env, authUpdates } = createProvisioningMockEnv();
+  const makeReq = (body: any) =>
+    new Request('http://localhost/api/admin/operadores/provisionar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-gestor-a' },
+      body: JSON.stringify(body)
+    });
+
+  const resSelf = await handleAdminProvisionarOperador(
+    makeReq({ operador_id: OP_GESTOR_A, condominio_id: CONDO_A, email: 'gestor.a@condo.test', password: 'NovaSenha123!' }),
+    env
+  );
+  assert.equal(resSelf.status, 403);
+
+  const resEscalar = await handleAdminProvisionarOperador(
+    makeReq({ condominio_id: CONDO_A, email: 'novo@condo.test', password: 'NovaSenha123!', perfil: 'admin_geral', acesso_global_condominios: true }),
+    env
+  );
+  assert.equal(resEscalar.status, 403);
+  assert.equal(authUpdates.length, 0);
+});
+
+test('[Mock/Unit] Storage privado: normalização de caminhos condominios/ e operadores/ e prevenção de vazamento em telas', () => {
+  const pathCondo = `condominios/${CONDO_A}/ocorrencias/evidencia.jpg`;
+  const pathAvatar = `operadores/${AUTH_GLOBAL}/avatar.jpg`;
+  const signedAvatar = `https://abc.supabase.co/storage/v1/object/sign/encomendas/operadores/${AUTH_GLOBAL}/avatar.jpg?token=expira123`;
+
+  assert.equal(ehCaminhoPrivadoStorage(pathCondo), true);
+  assert.equal(ehCaminhoPrivadoStorage(pathAvatar), true);
+  assert.equal(ehCaminhoPrivadoStorage('https://exemplo.com/publica.jpg'), false);
+  assert.deepEqual(extrairCaminhoStorageSupabase(pathAvatar), { bucket: 'encomendas', path: pathAvatar });
+  assert.equal(normalizarCaminhoStorageParaBanco(signedAvatar), pathAvatar);
+  assert.equal(normalizarCaminhoStorageParaBanco(pathCondo), pathCondo);
+
+  const modalPerfilCode = fs.readFileSync(path.resolve('src/components/ModalMeuPerfil.tsx'), 'utf8');
+  assert.equal(modalPerfilCode.includes('comprimirImagemBase64'), false);
+  assert.ok(modalPerfilCode.includes('escopoUsuarioAuthId'));
+  assert.ok(modalPerfilCode.includes("fotoNormalizada.startsWith('data:')"));
+
+  const custodiaCode = fs.readFileSync(path.resolve('src/pages/Custodia.tsx'), 'utf8');
+  assert.equal(custodiaCode.includes('href={fotoAmpliadaModal.url}'), false);
+  assert.ok(custodiaCode.includes('resolverUrlFotoPrivada'));
+
+  const encomendasCode = fs.readFileSync(path.resolve('src/pages/Encomendas.tsx'), 'utf8');
+  assert.equal(encomendasCode.includes('href={modalFotoAmpliada}'), false);
+
+  const ocorrenciasCode = fs.readFileSync(path.resolve('src/pages/Ocorrencias.tsx'), 'utf8');
+  assert.equal(ocorrenciasCode.includes('${item.foto_url}'), false);
+  assert.ok(ocorrenciasCode.includes('resolverUrlFotoPrivada'));
+
+  const controleAcessoCode = fs.readFileSync(path.resolve('src/pages/ControleAcesso.tsx'), 'utf8');
+  assert.equal(controleAcessoCode.includes('reg.nome_pessoa'), false);
+
+  const configCode = fs.readFileSync(path.resolve('src/pages/Configuracoes.tsx'), 'utf8');
+  assert.equal(configCode.includes("login?.toLowerCase() === 'admin'"), false);
+  assert.ok(configCode.includes('temAcessoGlobalExplicito(usuarioLogado)'));
+
+  const lembretesCode = fs.readFileSync(path.resolve('src/components/ModalLembretesPortaria.tsx'), 'utf8');
+  assert.equal(lembretesCode.includes('operadorAtual?.nivel_acesso === 0'), false);
+
+  const appCode = fs.readFileSync(path.resolve('src/App.tsx'), 'utf8');
+  assert.equal(appCode.includes('eSuperAdminGlobal: eAdmin'), false);
+});
+
+test('[Mock/Unit] Passe QR RPC retorna registro + registro_id e scripts SQL 05/05B/06/07 consolidam regras oficiais', async () => {
+  const mockRegistro = {
+    id: 'eeee1111-1111-4111-8111-111111111111',
+    condominio_id: CONDO_A,
+    nome: 'Visitante QR',
+    status: 'presente'
+  };
+
+  const mockFetchRpc: typeof fetch = async (input: any) => {
+    const urlStr = typeof input === 'string' ? input : input.url;
+    const url = new URL(urlStr);
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      return new Response(JSON.stringify([{
+        id: OP_ALVO_A,
+        nome: 'Porteiro Alpha',
+        perfil: 'operador',
+        nivel_acesso: 3,
+        condominio_id: CONDO_A,
+        acesso_global_condominios: false,
+        ativo: true,
+        auth_user_id: AUTH_ALVO_A
+      }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operador_condominios') {
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/rpc/validar_e_consumir_passe_qr') {
+      return new Response(JSON.stringify({
+        valido: true,
+        consumido: true,
+        registro_id: mockRegistro.id,
+        registro: mockRegistro,
+        passe: { id: 'p-1', token: 'PASS-OK12-3456', status: 'utilizado', usos_realizados: 1, max_usos: 1 }
+      }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const res = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-OK12-3456', consumir: true })
+    }),
+    {
+      SUPABASE_URL: 'https://mock.supabase.co',
+      SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+      __fetchImpl: mockFetchRpc
+    } as any
+  );
+
+  assert.equal(res.status, 200);
+  const body: any = await res.json();
+  assert.equal(body.registro_id, mockRegistro.id);
+  assert.deepEqual(body.registro, mockRegistro);
+
+  const sql05 = fs.readFileSync(path.resolve('supabase/sql/05_FUNCOES_AUTORIZACAO.sql'), 'utf8');
+  const sql05b = fs.readFileSync(path.resolve('supabase/sql/05B_FUNCOES_PASSE_QR.sql'), 'utf8');
+  const sql06 = fs.readFileSync(path.resolve('supabase/sql/06_RLS_TABELAS_MULTI_TENANT.sql'), 'utf8');
+  const sql07 = fs.readFileSync(path.resolve('supabase/sql/07_STORAGE_PRIVADO_POLICIES.sql'), 'utf8');
+
+  // 05: admin_condominio gerencia SOMENTE próprio condomínio principal (sem operador_condominios)
+  const trechoFnGerenciar = sql05.split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id TEXT)')[1]
+    .split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id UUID)')[0];
+  assert.equal(trechoFnGerenciar.includes('operador_condominios'), false);
+  assert.ok(trechoFnGerenciar.includes("lower(COALESCE(o.perfil, '')) = 'admin_condominio'"));
+
+  // 05B: retorna ambos registro_id e registro completo
+  assert.ok(sql05b.includes("'registro_id', v_registro_id"));
+  assert.ok(sql05b.includes("'registro', (SELECT to_jsonb(r) FROM public.registros_acesso r WHERE r.id = v_registro_id)"));
+
+  // 06: trigger + políticas RLS reconciliadas
+  assert.ok(sql06.includes('trg_proteger_campos_operador'));
+  assert.ok(sql06.includes('operador_preserva_proprio_perfil'));
+  assert.ok(sql06.includes('operador_pode_editar_alvo_local'));
+  assert.ok(sql06.includes('operador_id IS DISTINCT FROM public.operador_atual_id()'));
+
+  // 07: políticas privadas para condominios/ e operadores/{auth.uid()}/
+  assert.ok(sql07.includes('porttohub_storage_operadores_select'));
+  assert.ok(sql07.includes("(storage.foldername(name))[2] = auth.uid()::text"));
 });

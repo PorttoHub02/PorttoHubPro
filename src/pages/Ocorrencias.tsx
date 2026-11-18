@@ -1,6 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../services/supabase';
-import { uploadFotoComprimidaStorage } from '../services/imageUtils';
+import {
+  uploadFotoComprimidaStorage,
+  normalizarCaminhoStorageParaBanco,
+  resolverUrlFotoPrivada,
+  ehCaminhoPrivadoStorage
+} from '../services/imageUtils';
+import { temAcessoGlobalExplicito, ehAdminCondominio } from '../services/autorizacaoService';
 import { 
   BookOpen, 
   Plus, 
@@ -30,16 +36,9 @@ interface OcorrenciasProps {
 }
 
 export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
-  const nivelNum = usuarioLogado?.nivel_acesso !== undefined && usuarioLogado?.nivel_acesso !== null 
-    ? Number(usuarioLogado.nivel_acesso) 
-    : 3;
-  const perfilStr = (usuarioLogado?.perfil || '').toLowerCase();
   const eAdmin = Boolean(
-    usuarioLogado?.eSuperAdminGlobal ||
-    perfilStr === 'admin' ||
-    perfilStr === 'master' ||
-    nivelNum === 0 ||
-    nivelNum === 1
+    temAcessoGlobalExplicito(usuarioLogado) ||
+    ehAdminCondominio(usuarioLogado)
   );
 
   const podeCriarOcorrencia = eAdmin || verificarPermissao(usuarioLogado, 'ocorrencias', 'criar');
@@ -60,8 +59,43 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
   const [unidadeBloco, setUnidadeBloco] = useState('');
   const [fotoUrl, setFotoUrl] = useState('');
   const [ocorrenciaRecente, setOcorrenciaRecente] = useState<any | null>(null);
+  const [linksFotosAssinadas, setLinksFotosAssinadas] = useState<Record<string, string>>({});
 
   const [condId, setCondId] = useState(() => getCondominioAtivoId(usuarioLogado));
+
+  useEffect(() => {
+    let ativo = true;
+    const urlsBrutas = Array.from(
+      new Set(
+        [ocorrenciaRecente?.foto_url, ...ocorrencias.map(o => o?.foto_url)]
+          .filter((u): u is string => Boolean(u && typeof u === 'string'))
+      )
+    );
+    const pendentes = urlsBrutas.filter(u => ehCaminhoPrivadoStorage(u) && !linksFotosAssinadas[u]);
+    if (pendentes.length === 0) return;
+
+    Promise.all(
+      pendentes.map(async (u) => {
+        const resolvida = await resolverUrlFotoPrivada(u);
+        return [u, resolvida] as const;
+      })
+    ).then((pares) => {
+      if (!ativo) return;
+      const updates: Record<string, string> = {};
+      for (const [orig, res] of pares) {
+        if (res && /^https?:\/\//i.test(res)) {
+          updates[orig] = res;
+        }
+      }
+      if (Object.keys(updates).length > 0) {
+        setLinksFotosAssinadas(prev => ({ ...prev, ...updates }));
+      }
+    }).catch(() => {});
+
+    return () => {
+      ativo = false;
+    };
+  }, [ocorrencias, ocorrenciaRecente, linksFotosAssinadas]);
 
   useEffect(() => {
     const handleCondoChange = (e: any) => {
@@ -168,7 +202,7 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
     setUploadingFoto(true);
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta: 'ocorrencias',
         condominioId: condId,
@@ -177,7 +211,7 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
         qualidade: 0.75
       });
 
-      setFotoUrl(publicUrl);
+      setFotoUrl(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto da ocorrência comprimida e anexada com sucesso!${detalheEconomia}` });
     } catch (err: any) {
@@ -311,7 +345,7 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
     }
   };
 
-  const gerarLinkWhatsApp = (item: any) => {
+  const gerarLinkWhatsApp = (item: any, urlFotoAssinada?: string) => {
     try {
       if (!item) return '#';
       const nomeOperador = item.operador_nome || usuarioLogado?.nome || usuarioLogado?.login || 'Portaria';
@@ -321,6 +355,13 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
       const tituloStr = String(item.titulo || 'Ocorrência');
       const descStr = String(item.descricao || '');
       const unid = item.unidade_bloco || (item.unidade ? `${item.unidade}${item.bloco ? ` - Bloco ${item.bloco}` : ''}` : '');
+
+      const candidatoFoto = String(
+        urlFotoAssinada ||
+        (item.foto_url ? linksFotosAssinadas[item.foto_url] : '') ||
+        (item.foto_url && !ehCaminhoPrivadoStorage(item.foto_url) ? item.foto_url : '')
+      ).trim();
+      const urlFotoCompartilhavel = /^https?:\/\//i.test(candidatoFoto) ? candidatoFoto : '';
 
       const texto = `🚨 *REGISTRO DE OCORRÊNCIA - INFPORT*\n` +
         `----------------------------------------\n` +
@@ -333,12 +374,41 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
         `📊 *Status:* ${statusStr}\n` +
         `----------------------------------------\n` +
         `📝 *Descrição:* \n${descStr}\n` +
-        (item.foto_url ? `\n📸 *Foto da Evidência:* ${item.foto_url}` : '');
+        (urlFotoCompartilhavel ? `\n📸 *Foto da Evidência (link temporário):* ${urlFotoCompartilhavel}` : '');
 
       return formatarLinkWhatsApp('', texto, nomeOperador, dataHora);
     } catch (e) {
       console.warn('Erro ao formatar WhatsApp da ocorrência:', e);
       return '#';
+    }
+  };
+
+  const handleCompartilharWhatsAppOcorrencia = async (
+    item: any,
+    e: React.MouseEvent<HTMLAnchorElement>,
+    aoConcluir?: () => void
+  ) => {
+    if (!item?.foto_url || !ehCaminhoPrivadoStorage(item.foto_url) || linksFotosAssinadas[item.foto_url]) {
+      aoConcluir?.();
+      return;
+    }
+    e.preventDefault();
+    let urlAssinada = '';
+    try {
+      const resolvida = await resolverUrlFotoPrivada(item.foto_url, true);
+      if (resolvida && /^https?:\/\//i.test(resolvida)) {
+        urlAssinada = resolvida;
+        setLinksFotosAssinadas(prev => ({ ...prev, [item.foto_url]: resolvida }));
+      }
+    } catch {}
+    const hrefFinal = gerarLinkWhatsApp(item, urlAssinada);
+    aoConcluir?.();
+    if (hrefFinal && hrefFinal !== '#') {
+      const anchor = document.createElement('a');
+      anchor.href = hrefFinal;
+      anchor.target = '_blank';
+      anchor.rel = 'noreferrer';
+      anchor.click();
     }
   };
 
@@ -402,7 +472,7 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
             href={gerarLinkWhatsApp(ocorrenciaRecente)}
             target="_blank"
             rel="noreferrer"
-            onClick={() => setOcorrenciaRecente(null)}
+            onClick={(e) => handleCompartilharWhatsAppOcorrencia(ocorrenciaRecente, e, () => setOcorrenciaRecente(null))}
             className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1 transition shadow-2xs w-full sm:w-auto justify-center"
           >
             <MessageCircle className="w-3.5 h-3.5" /> Enviar para WhatsApp Grupo
@@ -508,6 +578,7 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
                   href={gerarLinkWhatsApp(item)}
                   target="_blank"
                   rel="noreferrer"
+                  onClick={(e) => handleCompartilharWhatsAppOcorrencia(item, e)}
                   className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-2.5 py-1.5 rounded-lg text-xs flex items-center gap-1 transition"
                   title="Compartilhar no WhatsApp"
                 >
@@ -634,7 +705,7 @@ export default function Ocorrencias({ usuarioLogado }: OcorrenciasProps) {
 
                 {fotoUrl && (
                   <div className="mt-1.5 w-16 h-16 rounded-lg overflow-hidden border-2 border-amber-500">
-                    <img src={fotoUrl} alt="Foto Ocorrência" loading="lazy" decoding="async" className="w-full h-full object-cover" />
+                    <ImagemOtimizada src={fotoUrl} alt="Foto Ocorrência" permitirAmpliar={true} className="w-full h-full object-cover" />
                   </div>
                 )}
               </div>

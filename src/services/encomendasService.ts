@@ -444,37 +444,128 @@ export async function inserirEncomendasValidadas(
 
   if (estaOnline) {
     try {
-      let { data: itensInseridos, error: itemErr } = await supabase
-        .from('encomendas_itens')
-        .upsert(payloadsValidados, { onConflict: 'operation_id', ignoreDuplicates: true })
-        .select();
+      const opIds = Array.from(
+        new Set(
+          payloadsValidados
+            .map((p) => String(p.operation_id || '').trim())
+            .filter(Boolean)
+        )
+      );
 
-      if (
-        itemErr &&
-        (itemErr.message?.includes('operation_id') ||
-          itemErr.message?.includes('on conflict') ||
-          itemErr.message?.includes('local_armazenamento') ||
-          itemErr.message?.includes('destinatario') ||
-          (itemErr as any).code === '42703' ||
-          (itemErr as any).code === '42P10' ||
-          itemErr.message?.includes('schema cache'))
-      ) {
-        const msgErr = itemErr.message || '';
-        const faltaOpId = msgErr.includes('operation_id') || msgErr.includes('on conflict') || (itemErr as any).code === '42P10';
+      const existentesPorOpId = new Map<string, any>();
+      if (opIds.length > 0) {
+        const { data: existentes } = await supabase
+          .from('encomendas_itens')
+          .select('*')
+          .eq('condominio_id', condominioId)
+          .in('operation_id', opIds);
+
+        if (Array.isArray(existentes)) {
+          for (const row of existentes) {
+            if (row?.operation_id) {
+              existentesPorOpId.set(String(row.operation_id).trim(), row);
+            }
+          }
+        }
+      }
+
+      const pendentesInsercao = payloadsValidados.filter(
+        (p) => !existentesPorOpId.has(String(p.operation_id || '').trim())
+      );
+
+      const sanitizarColunasOpcionais = (lista: any[], errObj: any) => {
+        const msgErr = String(errObj?.message || '').toLowerCase();
         const faltaLocal = msgErr.includes('local_armazenamento');
         const faltaDest = msgErr.includes('destinatario');
+        if (!faltaLocal && !faltaDest) return lista;
 
-        const compatPayloads = payloadsValidados.map(({ local_armazenamento, destinatario, operation_id, ...rest }) => {
+        return lista.map(({ local_armazenamento, destinatario, ...rest }) => {
           const obj: any = { ...rest };
-          if (!faltaOpId && operation_id) obj.operation_id = operation_id;
           if (!faltaLocal && local_armazenamento !== undefined) obj.local_armazenamento = local_armazenamento;
           if (!faltaDest && destinatario !== undefined) obj.destinatario = destinatario;
           return obj;
         });
+      };
 
-        const retry = await supabase.from('encomendas_itens').insert(compatPayloads).select();
-        itemErr = retry.error;
-        itensInseridos = retry.data;
+      const novosPorOpId = new Map<string, any>();
+      let itemErr: any = null;
+
+      if (pendentesInsercao.length > 0) {
+        let resInsert = await supabase
+          .from('encomendas_itens')
+          .insert(pendentesInsercao)
+          .select();
+
+        if (
+          resInsert.error &&
+          ((resInsert.error as any).code === '42703' ||
+            resInsert.error.message?.includes('local_armazenamento') ||
+            resInsert.error.message?.includes('destinatario') ||
+            resInsert.error.message?.includes('schema cache'))
+        ) {
+          const compatPayloads = sanitizarColunasOpcionais(pendentesInsercao, resInsert.error);
+          resInsert = await supabase.from('encomendas_itens').insert(compatPayloads).select();
+        }
+
+        if (resInsert.error && (resInsert.error as any).code === '23505') {
+          // Concorrência no índice parcial (condominio_id, operation_id): resolve item a item idempotentemente
+          for (const pkt of pendentesInsercao) {
+            let indRes = await supabase
+              .from('encomendas_itens')
+              .insert([pkt])
+              .select()
+              .maybeSingle();
+
+            if (
+              indRes.error &&
+              ((indRes.error as any).code === '42703' ||
+                indRes.error.message?.includes('local_armazenamento') ||
+                indRes.error.message?.includes('destinatario'))
+            ) {
+              const [compatItem] = sanitizarColunasOpcionais([pkt], indRes.error);
+              indRes = await supabase
+                .from('encomendas_itens')
+                .insert([compatItem])
+                .select()
+                .maybeSingle();
+            }
+
+            if (indRes.error && (indRes.error as any).code === '23505' && pkt.operation_id) {
+              const { data: existente } = await supabase
+                .from('encomendas_itens')
+                .select('*')
+                .eq('condominio_id', condominioId)
+                .eq('operation_id', pkt.operation_id)
+                .maybeSingle();
+              if (existente) {
+                novosPorOpId.set(String(pkt.operation_id).trim(), existente);
+                continue;
+              }
+            }
+
+            if (indRes.error) {
+              itemErr = indRes.error;
+              break;
+            }
+            if (indRes.data) {
+              novosPorOpId.set(String(pkt.operation_id || indRes.data.id).trim(), indRes.data);
+            }
+          }
+        } else {
+          itemErr = resInsert.error;
+          if (Array.isArray(resInsert.data)) {
+            for (const row of resInsert.data) {
+              novosPorOpId.set(String(row.operation_id || row.id).trim(), row);
+            }
+          }
+        }
+      }
+
+      const itensInseridos: any[] = [];
+      for (const pkt of payloadsValidados) {
+        const key = String(pkt.operation_id || '').trim();
+        const row = existentesPorOpId.get(key) || novosPorOpId.get(key);
+        if (row) itensInseridos.push(row);
       }
 
       if (itemErr) {

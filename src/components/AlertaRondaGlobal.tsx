@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { supabase } from '../services/supabase';
 import { registrarAtividade } from '../services/auditoriaService';
 import { isUUID } from '../services/condominioService';
+import { temAcessoGlobalExplicito, ehAdminCondominio } from '../services/autorizacaoService';
 import { 
   Timer, 
   ShieldAlert, 
@@ -41,7 +42,7 @@ export default function AlertaRondaGlobal({
   moduloRondaHabilitado
 }: AlertaRondaGlobalProps) {
   const idCondominioAtivo = condominioId || condominioAtivo?.id || usuarioLogado?.condominio_id || usuarioLogado?.condominio?.id;
-  const eAdmin = usuarioLogado?.perfil === 'admin' || usuarioLogado?.nivel_acesso === 0 || usuarioLogado?.perfil === 'master' || usuarioLogado?.nivel_acesso === 1;
+  const eAdmin = temAcessoGlobalExplicito(usuarioLogado) || ehAdminCondominio(usuarioLogado);
 
   const [moduloRondaAtivo, setModuloRondaAtivo] = useState(
     moduloRondaHabilitado !== undefined ? moduloRondaHabilitado : false

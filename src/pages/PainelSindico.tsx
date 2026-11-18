@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { supabase } from '../services/supabase';
 import { registrarAtividade } from '../services/auditoriaService';
 import { carregarModulosCondominio, isModuloAtivo } from '../services/modulosService';
+import { ImagemOtimizada } from '../components/ImagemOtimizada';
 import { 
   ShieldCheck, 
   Package, 
@@ -2886,11 +2887,10 @@ export default function PainelSindico({
             </div>
 
             <div className="flex justify-center bg-black rounded-xl overflow-hidden max-h-[70vh]">
-              <img 
+              <ImagemOtimizada 
                 src={itemVisualizando.dados.foto_etiqueta_url || itemVisualizando.dados.foto_url || itemVisualizando.dados.foto_rosto} 
                 alt="Evidência" 
-                loading="lazy"
-                decoding="async"
+                permitirAmpliar={false}
                 className="max-h-[65vh] object-contain"
               />
             </div>

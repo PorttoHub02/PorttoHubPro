@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../services/supabase';
-import { uploadFotoComprimidaStorage } from '../services/imageUtils';
+import { uploadFotoComprimidaStorage, normalizarCaminhoStorageParaBanco } from '../services/imageUtils';
+import { ImagemOtimizada } from '../components/ImagemOtimizada';
 import { 
   Key, 
   AlertTriangle, 
@@ -303,7 +304,7 @@ export default function Chaves({ usuarioLogado }: ChavesProps) {
     setMensagem({ tipo: '', texto: '' });
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta,
         condominioId: condId,
@@ -312,7 +313,7 @@ export default function Chaves({ usuarioLogado }: ChavesProps) {
         qualidade: 0.75
       });
 
-      setUrlCallback(publicUrl);
+      setUrlCallback(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto capturada e comprimida com sucesso!${detalheEconomia}` });
     } catch (err: any) {
@@ -1314,7 +1315,7 @@ export default function Chaves({ usuarioLogado }: ChavesProps) {
 
                       {fotoDocTerceiroUrl && (
                         <div className="mt-1 w-16 h-16 rounded-lg overflow-hidden border border-amber-400 relative">
-                          <img src={fotoDocTerceiroUrl} alt="Doc Terceiro" loading="lazy" decoding="async" className="w-full h-full object-cover" />
+                          <ImagemOtimizada src={fotoDocTerceiroUrl} alt="Doc Terceiro" permitirAmpliar={true} className="w-full h-full object-cover" />
                         </div>
                       )}
                     </div>
@@ -1426,7 +1427,7 @@ export default function Chaves({ usuarioLogado }: ChavesProps) {
 
                 {fotoDevolucaoUrl && (
                   <div className="mt-1.5 w-16 h-16 rounded-lg overflow-hidden border border-emerald-500">
-                    <img src={fotoDevolucaoUrl} alt="Foto Devolução" loading="lazy" decoding="async" className="w-full h-full object-cover" />
+                    <ImagemOtimizada src={fotoDevolucaoUrl} alt="Foto Devolução" permitirAmpliar={true} className="w-full h-full object-cover" />
                   </div>
                 )}
               </div>

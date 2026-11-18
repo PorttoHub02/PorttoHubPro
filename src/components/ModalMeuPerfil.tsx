@@ -16,7 +16,17 @@ import {
   Trash2,
   Briefcase
 } from 'lucide-react';
-import { comprimirImagemBase64 } from '../services/imageUtils';
+import {
+  uploadFotoComprimidaStorage,
+  normalizarCaminhoStorageParaBanco
+} from '../services/imageUtils';
+import { ImagemOtimizada } from './ImagemOtimizada';
+import {
+  normalizarPerfilOperador,
+  temAcessoGlobalExplicito,
+  ehAdminCondominio
+} from '../services/autorizacaoService';
+import { isUUID } from '../services/condominioService';
 
 interface ModalMeuPerfilProps {
   isOpen: boolean;
@@ -42,27 +52,81 @@ export default function ModalMeuPerfil({
   const [loading, setLoading] = useState(false);
   const [mensagem, setMensagem] = useState<{ tipo: 'sucesso' | 'erro'; texto: string } | null>(null);
 
+  const [enviandoFoto, setEnviandoFoto] = useState(false);
+
   if (!isOpen || !operador) return null;
 
   const handleFotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setMensagem(null);
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setMensagem({
+        tipo: 'erro',
+        texto: 'Conecte-se à internet para enviar a foto de perfil ao Storage privado.'
+      });
+      return;
+    }
+
+    setEnviandoFoto(true);
     try {
-      const base64 = await comprimirImagemBase64(file, 400, 400, 0.82);
-      setFotoUrl(base64);
-    } catch (err) {
-      console.error('Erro ao processar imagem:', err);
+      const condIdUpload = String(condominio?.id || operador?.condominio_id || '').trim();
+      const authRes = await supabase.auth.getUser().catch(() => ({ data: { user: null } } as any));
+      const authUid = String(authRes?.data?.user?.id || operador?.auth_user_id || '').trim();
+
+      // Estratégia segura para foto de perfil:
+      // - Se o usuário possui auth.uid(), grava na pasta privada pessoal operadores/{auth_uid}/...
+      //   (funciona mesmo para admin_geral sem condomínio ativo e não concede acesso a outros condomínios).
+      // - Caso contrário, utiliza o condomínio ativo validado como UUID.
+      if (isUUID(authUid)) {
+        const res = await uploadFotoComprimidaStorage({
+          file,
+          pasta: 'operadores',
+          escopoUsuarioAuthId: authUid,
+          maxWidth: 400,
+          maxHeight: 400,
+          qualidade: 0.82
+        });
+        setFotoUrl(normalizarCaminhoStorageParaBanco(res.storagePath));
+      } else if (isUUID(condIdUpload)) {
+        const res = await uploadFotoComprimidaStorage({
+          file,
+          pasta: 'operadores',
+          condominioId: condIdUpload,
+          maxWidth: 400,
+          maxHeight: 400,
+          qualidade: 0.82
+        });
+        setFotoUrl(normalizarCaminhoStorageParaBanco(res.storagePath));
+      } else {
+        throw new Error('Identidade Supabase Auth ou condomínio ativo necessário para armazenar a foto com segurança.');
+      }
+    } catch (err: any) {
+      console.error('Erro ao enviar foto de perfil ao Storage privado:', err);
+      setMensagem({
+        tipo: 'erro',
+        texto: `Não foi possível enviar a foto para o Storage privado: ${err?.message || 'verifique as políticas do bucket.'}`
+      });
+    } finally {
+      setEnviandoFoto(false);
     }
   };
 
-  const getNivelNome = (nivel?: number) => {
-    switch (nivel) {
-      case 0: return 'Dev / Administrador Geral (Total)';
-      case 1: return 'Master / Síndico do Condomínio';
-      case 2: return 'Supervisor Operacional';
-      case 3:
-      default: return 'Operador / Porteiro';
+  const getNivelNome = () => {
+    if (temAcessoGlobalExplicito(operador) || normalizarPerfilOperador(operador) === 'admin_geral') {
+      return 'Administrador Geral (Global)';
     }
+    if (ehAdminCondominio(operador)) {
+      return 'Administrador de Condomínio';
+    }
+    if (normalizarPerfilOperador(operador) === 'supervisor') {
+      return 'Supervisor Operacional';
+    }
+    if (operador?.nivel_acesso === 4 || String(operador?.funcao || '').toLowerCase().includes('síndico') || String(operador?.funcao || '').toLowerCase().includes('sindico')) {
+      return 'Síndico (Somente Leitura)';
+    }
+    return 'Operador / Porteiro';
   };
 
   const handleSalvarPerfil = async (e: React.FormEvent) => {
@@ -94,9 +158,19 @@ export default function ModalMeuPerfil({
         if (authErr) throw authErr;
       }
 
+      const fotoNormalizada = fotoUrl ? normalizarCaminhoStorageParaBanco(fotoUrl) : null;
+      if (fotoNormalizada && fotoNormalizada.startsWith('data:')) {
+        setMensagem({
+          tipo: 'erro',
+          texto: 'Selecione ou reenvie a foto para o Storage privado antes de salvar (base64 não é aceito no banco).'
+        });
+        setLoading(false);
+        return;
+      }
+
       const payload: { nome: string; foto_url?: string | null } = {
         nome: nome.trim(),
-        foto_url: fotoUrl || null
+        foto_url: fotoNormalizada
       };
 
       const { error } = await supabase
@@ -181,12 +255,11 @@ export default function ModalMeuPerfil({
           <div className="flex items-center gap-4 bg-slate-50 dark:bg-slate-800/60 p-3.5 rounded-2xl border border-slate-200 dark:border-slate-700/80">
             <div className="relative group shrink-0">
               {fotoUrl ? (
-                <img 
-                  src={fotoUrl} 
-                  alt={nome} 
-                  loading="lazy"
-                  decoding="async"
-                  className="w-16 h-16 rounded-2xl object-cover border-2 border-emerald-500 shadow-sm" 
+                <ImagemOtimizada
+                  src={fotoUrl}
+                  alt={nome}
+                  permitirAmpliar={true}
+                  className="w-16 h-16 rounded-2xl object-cover border-2 border-emerald-500 shadow-sm"
                 />
               ) : (
                 <div className="w-16 h-16 rounded-2xl bg-slate-800 text-emerald-400 font-black text-xl flex items-center justify-center border-2 border-slate-700 shadow-sm">
@@ -199,13 +272,14 @@ export default function ModalMeuPerfil({
               <span className="text-xs font-bold text-slate-800 dark:text-slate-200 block">Foto de Perfil</span>
               <p className="text-[11px] text-slate-500 dark:text-slate-400">Aparecerá no cabeçalho e nos relatórios de portaria.</p>
               <div className="flex items-center gap-2 pt-0.5">
-                <label className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition shadow-2xs">
+                <label className={`px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition shadow-2xs ${enviandoFoto ? 'opacity-60 cursor-wait' : 'cursor-pointer'}`}>
                   <Camera className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>{fotoUrl ? 'Trocar Foto' : 'Tirar / Carregar Foto'}</span>
+                  <span>{enviandoFoto ? 'Enviando...' : (fotoUrl ? 'Trocar Foto' : 'Tirar / Carregar Foto')}</span>
                   <input
                     type="file"
                     accept="image/*"
                     capture="user"
+                    disabled={enviandoFoto}
                     onChange={handleFotoUpload}
                     className="hidden"
                   />
@@ -231,7 +305,7 @@ export default function ModalMeuPerfil({
                 <Briefcase className="w-3 h-3 text-blue-600 dark:text-blue-400" /> Função no App
               </span>
               <p className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate">
-                {operador?.funcao || operador?.cargo || (operador?.perfil === 'admin' ? 'Administrador Master' : 'Porteiro')}
+                {operador?.funcao || operador?.cargo || getNivelNome()}
               </p>
             </div>
 
@@ -240,7 +314,7 @@ export default function ModalMeuPerfil({
                 <ShieldCheck className="w-3 h-3 text-emerald-600 dark:text-emerald-400" /> Nível de Acesso
               </span>
               <p className="text-xs font-bold text-slate-800 dark:text-slate-100">
-                {getNivelNome(operador.nivel_acesso)}
+                {getNivelNome()}
               </p>
             </div>
 

@@ -652,24 +652,66 @@ export async function validarTokenPasse(
   }
 
   try {
-    let query = supabase
-      .from('passes_virtuais_qr')
-      .select('*')
-      .eq('condominio_id', condominioId);
+    let passe: PasseVirtualQR | null = null;
+    const tokenConsulta = codigoOuToken.trim();
+    const jwt = await obterAccessTokenAtual();
 
-    if (isUUID(codigoOuToken.trim())) {
-      query = query.eq('id', codigoOuToken.trim());
-    } else {
-      query = query.ilike('token', tokenLimpo);
+    if (jwt) {
+      try {
+        const resp = await fetch('/api/controle-acesso/validar-passe', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${jwt}`
+          },
+          body: JSON.stringify({
+            condominioId,
+            token: tokenConsulta,
+            consumir: false
+          })
+        });
+        const json: any = await resp.json().catch(() => null);
+        if (resp.status !== 404 && resp.status !== 405 && json) {
+          if (!resp.ok || !json.valido) {
+            return {
+              valido: false,
+              passe: json.passe as PasseVirtualQR | undefined,
+              motivo: json.motivo || 'Passe Virtual inválido ou não encontrado neste condomínio.'
+            };
+          }
+          passe = json.passe as PasseVirtualQR;
+        }
+      } catch {
+        // Prossegue para validação via RPC do Supabase caso rota /api esteja indisponível
+      }
     }
 
-    const { data, error } = await query.maybeSingle();
+    if (!passe) {
+      const { data: rpcData, error: rpcErr } = await supabase.rpc('validar_e_consumir_passe_qr', {
+        p_condominio_id: condominioId,
+        p_token: tokenConsulta,
+        p_consumir: false,
+        p_ponto_acesso: 'Consulta Portaria',
+        p_operador_nome: 'Portaria'
+      });
 
-    if (error) {
-      return { valido: false, motivo: formatarErroDetalhadoSupabase(error, 'Erro ao validar Passe QR no servidor') };
+      if (!rpcErr && rpcData) {
+        if (!rpcData.valido) {
+          return {
+            valido: false,
+            passe: rpcData.passe as PasseVirtualQR | undefined,
+            motivo: rpcData.motivo || 'Passe Virtual inválido ou não encontrado neste condomínio.'
+          };
+        }
+        passe = rpcData.passe as PasseVirtualQR;
+      } else if (rpcErr && (rpcErr as any).code !== 'PGRST202') {
+        return {
+          valido: false,
+          motivo: formatarErroDetalhadoSupabase(rpcErr, 'Erro ao validar Passe QR no servidor')
+        };
+      }
     }
 
-    const passe = data as PasseVirtualQR | null;
     if (!passe) {
       return { valido: false, motivo: 'Passe Virtual não encontrado neste condomínio.' };
     }

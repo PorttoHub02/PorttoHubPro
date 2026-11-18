@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../services/supabase';
 import { verificarPermissao } from '../services/permissoesService';
-import { uploadFotoComprimidaStorage } from '../services/imageUtils';
+import { uploadFotoComprimidaStorage, normalizarCaminhoStorageParaBanco } from '../services/imageUtils';
 import { EVENTO_SINCRONIZAR_DADOS } from '../services/offlineStorageService';
 import { getCondominioAtivoId } from '../services/condominioService';
+import { ImagemOtimizada } from '../components/ImagemOtimizada';
 import { 
   Radio, 
   AlertTriangle, 
@@ -120,7 +121,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
     setMensagem({ tipo: '', texto: '' });
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta: 'materiais_equipamentos',
         condominioId: condId,
@@ -129,7 +130,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
         qualidade: 0.8
       });
 
-      setFotoUrl(publicUrl);
+      setFotoUrl(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto do equipamento anexada com sucesso!${detalheEconomia}` });
     } catch (err: any) {
@@ -145,7 +146,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
     setMensagem({ tipo: '', texto: '' });
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta: 'avarias_materiais',
         condominioId: condId,
@@ -154,7 +155,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
         qualidade: 0.75
       });
 
-      setFotoAvariaUrl(publicUrl);
+      setFotoAvariaUrl(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto da avaria comprimida e registrada com sucesso!${detalheEconomia}` });
     } catch (err: any) {
@@ -181,7 +182,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
     setMensagem({ tipo: '', texto: '' });
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta: 'materiais_status',
         condominioId: condId,
@@ -190,7 +191,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
         qualidade: 0.8
       });
 
-      setNovaFotoAvariaUrl(publicUrl);
+      setNovaFotoAvariaUrl(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto comprobatória registrada com sucesso!${detalheEconomia}` });
     } catch (err: any) {
@@ -467,9 +468,10 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
               <div className="flex justify-between items-start gap-2">
                 <div className="flex items-start gap-2.5 min-w-0 flex-1">
                   {m.foto_url && (
-                    <img
+                    <ImagemOtimizada
                       src={m.foto_url}
                       alt={m.nome}
+                      permitirAmpliar={true}
                       className="w-12 h-12 rounded-lg object-cover border border-slate-200 shrink-0 shadow-2xs"
                     />
                   )}
@@ -500,11 +502,10 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
                   <p className="text-slate-600 text-[10px]">{m.observacao_avaria || 'Sem detalhes informados'}</p>
                   
                   {m.foto_avaria_url && (
-                    <img
+                    <ImagemOtimizada
                       src={m.foto_avaria_url}
                       alt="Foto da Avaria"
-                      loading="lazy"
-                      decoding="async"
+                      permitirAmpliar={true}
                       className="w-full h-20 object-cover rounded-md mt-1 border"
                     />
                   )}
@@ -608,9 +609,10 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
               {fotoUrl && (
                 <div className="p-2 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    <img
+                    <ImagemOtimizada
                       src={fotoUrl}
                       alt="Equipamento"
+                      permitirAmpliar={true}
                       className="w-12 h-12 rounded-lg object-cover border border-slate-300 shrink-0"
                     />
                     <div className="min-w-0">
@@ -672,7 +674,7 @@ export default function Materiais({ usuarioLogado }: MateriaisProps) {
 
                     {fotoAvariaUrl && (
                       <div className="mt-1.5 w-16 h-16 rounded-lg overflow-hidden border border-red-400">
-                        <img src={fotoAvariaUrl} alt="Foto Defeito" loading="lazy" decoding="async" className="w-full h-full object-cover" />
+                        <ImagemOtimizada src={fotoAvariaUrl} alt="Foto Defeito" permitirAmpliar={true} className="w-full h-full object-cover" />
                       </div>
                     )}
                   </div>

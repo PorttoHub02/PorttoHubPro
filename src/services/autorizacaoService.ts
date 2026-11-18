@@ -15,10 +15,13 @@ export interface CondominioResumo {
   [key: string]: any;
 }
 
+export type PerfilPadrao = 'admin_geral' | 'admin_condominio' | 'supervisor' | 'operador';
+
 export interface ContextoCondominiosResolvido {
   bloqueado: boolean;
   motivoBloqueio?: string;
   eAdminGeral: boolean;
+  eAdminCondominio: boolean;
   eSupervisor: boolean;
   eSindico: boolean;
   ePorteiro: boolean;
@@ -48,8 +51,72 @@ export function temAcessoGlobalExplicito(operador?: any | null): boolean {
   return Boolean(operador && operador.acesso_global_condominios === true);
 }
 
+/**
+ * Normaliza perfis legados para o padrão oficial do banco:
+ * admin_geral | admin_condominio | supervisor | operador
+ * Regra estrita: sem `acesso_global_condominios = true`, NENHUM perfil vira `admin_geral`.
+ */
+export function normalizarPerfilOperador(operador?: any | null): PerfilPadrao {
+  if (temAcessoGlobalExplicito(operador)) {
+    return 'admin_geral';
+  }
+  if (!operador) return 'operador';
+
+  const perfil = String(operador.perfil || '').trim().toLowerCase();
+  const nivel =
+    operador.nivel_acesso !== undefined && operador.nivel_acesso !== null
+      ? Number(operador.nivel_acesso)
+      : NaN;
+
+  if (
+    perfil === 'admin_condominio' ||
+    perfil === 'admin_local' ||
+    perfil === 'admin' ||
+    perfil === 'master' ||
+    nivel === 1
+  ) {
+    return 'admin_condominio';
+  }
+  if (perfil === 'supervisor' || nivel === 2) {
+    return 'supervisor';
+  }
+  return 'operador';
+}
+
+export function ehAdminCondominio(operador?: any | null): boolean {
+  return !temAcessoGlobalExplicito(operador) && normalizarPerfilOperador(operador) === 'admin_condominio';
+}
+
+/**
+ * Espelha exatamente `operador_pode_gerenciar_operadores()` (0 args = global only)
+ * e `operador_pode_gerenciar_operadores(condominio_id)` (global ou `admin_condominio` no seu condomínio principal).
+ * Supervisor NÃO possui poder administrativo sobre operadores.
+ */
+export function podeGerenciarOperadoresNoCondominio(
+  operador?: any | null,
+  condominioAlvoId?: string | null
+): boolean {
+  if (!operador) return false;
+  if (temAcessoGlobalExplicito(operador)) return true;
+
+  if (!condominioAlvoId) {
+    return false;
+  }
+
+  if (!ehAdminCondominio(operador)) {
+    return false;
+  }
+
+  const principalOp = isCondominioIdValido(operador.condominio_id)
+    ? String(operador.condominio_id).trim()
+    : '';
+  const alvo = isCondominioIdValido(condominioAlvoId) ? String(condominioAlvoId).trim() : '';
+
+  return Boolean(principalOp && alvo && principalOp === alvo);
+}
+
 export function ehPerfilSupervisor(operador?: any | null): boolean {
-  if (!operador || temAcessoGlobalExplicito(operador)) return false;
+  if (!operador || temAcessoGlobalExplicito(operador) || ehAdminCondominio(operador)) return false;
   const perfil = String(operador.perfil || '').toLowerCase();
   const funcao = String(operador.funcao || operador.cargo || '').toLowerCase();
   return (
@@ -63,8 +130,10 @@ export function ehPerfilSindico(operador?: any | null): boolean {
   if (!operador) return false;
   const perfil = String(operador.perfil || '').toLowerCase();
   const funcao = String(operador.funcao || operador.cargo || '').toLowerCase();
+  const nivelCustom = String(operador.nivel_acesso_custom_id || '').toLowerCase();
   return (
     Number(operador.nivel_acesso) === 4 ||
+    nivelCustom === 'nivel_4' ||
     perfil === 'sindico' ||
     perfil === 'síndico' ||
     funcao.includes('síndic') ||
@@ -73,7 +142,13 @@ export function ehPerfilSindico(operador?: any | null): boolean {
 }
 
 export function ehPerfilPorteiroOuComum(operador?: any | null): boolean {
-  if (!operador || temAcessoGlobalExplicito(operador) || ehPerfilSupervisor(operador) || ehPerfilSindico(operador)) {
+  if (
+    !operador ||
+    temAcessoGlobalExplicito(operador) ||
+    ehAdminCondominio(operador) ||
+    ehPerfilSupervisor(operador) ||
+    ehPerfilSindico(operador)
+  ) {
     return false;
   }
   const perfil = String(operador.perfil || '').toLowerCase();
@@ -153,6 +228,7 @@ export function resolverContextoCondominiosOperador(params: {
 
   const todosValidos = (condominiosDisponiveis || []).filter(c => isCondominioIdValido(c?.id));
   const eAdminGeral = temAcessoGlobalExplicito(operador);
+  const eAdminCondominio = ehAdminCondominio(operador);
   const eSupervisor = ehPerfilSupervisor(operador);
   const eSindico = ehPerfilSindico(operador);
   const ePorteiro = ehPerfilPorteiroOuComum(operador);
@@ -170,6 +246,7 @@ export function resolverContextoCondominiosOperador(params: {
     return {
       bloqueado: false,
       eAdminGeral: true,
+      eAdminCondominio: false,
       eSupervisor: false,
       eSindico: false,
       ePorteiro: false,
@@ -199,6 +276,7 @@ export function resolverContextoCondominiosOperador(params: {
         bloqueado: true,
         motivoBloqueio: 'Sua conta de supervisão não possui nenhum condomínio autorizado vinculado. Solicite ao administrador geral o vínculo em Cadastros.',
         eAdminGeral: false,
+        eAdminCondominio: false,
         eSupervisor: true,
         eSindico: false,
         ePorteiro: false,
@@ -213,6 +291,7 @@ export function resolverContextoCondominiosOperador(params: {
       return {
         bloqueado: false,
         eAdminGeral: false,
+        eAdminCondominio: false,
         eSupervisor: true,
         eSindico: false,
         ePorteiro: false,
@@ -233,6 +312,7 @@ export function resolverContextoCondominiosOperador(params: {
     return {
       bloqueado: false,
       eAdminGeral: false,
+      eAdminCondominio: false,
       eSupervisor: true,
       eSindico: false,
       ePorteiro: false,
@@ -243,7 +323,7 @@ export function resolverContextoCondominiosOperador(params: {
     };
   }
 
-  // REGRAS A e D: Porteiro, Síndico, Admin Local, Master, Custom RBAC (sem acesso_global_condominios)
+  // REGRAS A e D: Porteiro, Síndico, Admin de Condomínio, Custom RBAC (sem acesso_global_condominios)
   const idPrincipal = isCondominioIdValido(operador?.condominio_id) ? String(operador.condominio_id).trim() : '';
   const idsLinksValidos = (vinculosExplicitosIds || []).filter(id => isCondominioIdValido(id));
 
@@ -261,7 +341,7 @@ export function resolverContextoCondominiosOperador(params: {
       permitidos = linksPermitidos;
     }
   } else {
-    // Master / Admin Local / Custom RBAC sem acesso global explícito:
+    // admin_condominio / Custom RBAC sem acesso global explícito:
     // Usa o seu condomínio principal ou os vínculos explícitos (nunca todos os condomínios)
     const mapa = new Map<string, CondominioResumo>();
     if (idPrincipalMatch) mapa.set(idPrincipalMatch.id, idPrincipalMatch);
@@ -276,6 +356,7 @@ export function resolverContextoCondominiosOperador(params: {
       bloqueado: true,
       motivoBloqueio: 'Sua conta não possui nenhum condomínio válido vinculado. Solicite ao administrador do sistema.',
       eAdminGeral: false,
+      eAdminCondominio,
       eSupervisor: false,
       eSindico,
       ePorteiro,
@@ -286,7 +367,7 @@ export function resolverContextoCondominiosOperador(params: {
     };
   }
 
-  const podeAlternarEntreVinculados = !ePorteiro && !eSindico && permitidos.length >= 2;
+  const podeAlternarEntreVinculados = !ePorteiro && !eSindico && !eAdminCondominio && permitidos.length >= 2;
   const preferido = podeAlternarEntreVinculados && isCondominioIdValido(condominioPreferidoId) && permitidos.some(c => c.id === condominioPreferidoId)
     ? String(condominioPreferidoId)
     : '';
@@ -294,6 +375,7 @@ export function resolverContextoCondominiosOperador(params: {
   return {
     bloqueado: false,
     eAdminGeral: false,
+    eAdminCondominio,
     eSupervisor: false,
     eSindico,
     ePorteiro,

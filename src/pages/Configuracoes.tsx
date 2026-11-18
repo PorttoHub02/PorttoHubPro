@@ -56,6 +56,7 @@ import ModalMigracaoSupabase from '../components/ModalMigracaoSupabase';
 import ModalCustomizacaoVisual from '../components/ModalCustomizacaoVisual';
 import GerenciamentoPermissoes from '../components/GerenciamentoPermissoes';
 import { generateMigrationSql } from '../services/databaseDoctor';
+import { temAcessoGlobalExplicito } from '../services/autorizacaoService';
 import { SetorRonda, carregarSetoresRonda } from '../services/setoresRonda';
 import { 
   carregarConfigWhatsApp, 
@@ -1055,17 +1056,8 @@ export default function Configuracoes({ usuarioLogado, onConfigSalva }: Configur
     setTimeout(() => setCopiadoSql(false), 3000);
   };
 
-  const nivelNum = Number(usuarioLogado?.nivel_acesso ?? usuarioLogado?.nivel ?? 3);
-  const ehNivel0 = Boolean(
-    usuarioLogado?.eSuperAdminGlobal ||
-    usuarioLogado?.login?.toLowerCase() === 'admin' ||
-    usuarioLogado?.perfil?.toLowerCase() === 'admin' ||
-    usuarioLogado?.perfil?.toLowerCase() === 'admin_geral' ||
-    nivelNum === 0 ||
-    usuarioLogado?.nivel_acesso === 0 ||
-    usuarioLogado?.nivel_acesso === '0' ||
-    usuarioLogado?.nivel_acesso_custom_id === 'nivel_0'
-  );
+  // Regra oficial: acesso exclusivo ao Administrador Geral com acesso_global_condominios = TRUE
+  const ehNivel0 = Boolean(temAcessoGlobalExplicito(usuarioLogado));
 
   if (!ehNivel0) {
     return (

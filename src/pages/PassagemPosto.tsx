@@ -50,6 +50,7 @@ import {
   CondominioConfig 
 } from '../services/condominioService';
 import TabelasResumoPosto from '../components/TabelasResumoPosto';
+import { ImagemOtimizada } from '../components/ImagemOtimizada';
 import { dispararNotificacaoModuloWhatsApp, carregarConfigWhatsApp, formatarLinkWhatsApp } from '../services/configWhatsappService';
 import { registrarAtividade } from '../services/auditoriaService';
 import { 
@@ -3217,9 +3218,10 @@ export default function PassagemPosto({
                                 }`}
                               >
                                 {op.foto_url ? (
-                                  <img 
+                                  <ImagemOtimizada 
                                     src={op.foto_url} 
                                     alt={op.nome} 
+                                    permitirAmpliar={false}
                                     className="w-6 h-6 rounded-full object-cover shrink-0 border border-white" 
                                   />
                                 ) : (

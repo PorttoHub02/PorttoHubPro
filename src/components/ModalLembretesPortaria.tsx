@@ -104,13 +104,11 @@ export default function ModalLembretesPortaria({
   const [salvandoNovo, setSalvandoNovo] = useState<boolean>(false);
   const [listaUnidadesSugeridas, setListaUnidadesSugeridas] = useState<string[]>([]);
 
-  // Identifica se o usuário logado possui Nível 0 (Administrador Geral com acesso global explícito)
+  // Identifica se o usuário logado possui Administrador Geral com acesso global explícito
   const ehNivel0 = useMemo(() => {
     return Boolean(
       operadorAtual?.acesso_global_condominios === true ||
-      operadorAtual?.nivel_acesso === 0 ||
-      operadorAtual?.nivel === 0 ||
-      (operadorAtual as any)?.nivel_acesso_custom_id === 'nivel_0'
+      operadorAtual?.eSuperAdminGlobal === true
     );
   }, [operadorAtual]);
 

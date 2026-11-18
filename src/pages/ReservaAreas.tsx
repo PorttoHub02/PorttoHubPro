@@ -76,6 +76,11 @@ import {
 } from '../services/condominioService';
 import { formatarLinkWhatsApp } from '../services/configWhatsappService';
 import { verificarPermissao } from '../services/permissoesService';
+import {
+  temAcessoGlobalExplicito,
+  ehAdminCondominio,
+  normalizarPerfilOperador
+} from '../services/autorizacaoService';
 import { supabase } from '../services/supabase';
 import { GradeHorariosLimpaReserva } from '../components/GradeHorariosLimpaReserva';
 
@@ -135,23 +140,23 @@ export default function ReservaAreas({ usuarioLogado }: ReservaAreasProps) {
   // Permissões
   const eSindico = Boolean(
     usuarioLogado?.nivel_acesso === 4 ||
-    usuarioLogado?.perfil === 'sindico' ||
+    String(usuarioLogado?.funcao || '').toLowerCase().includes('síndico') ||
+    String(usuarioLogado?.funcao || '').toLowerCase().includes('sindico') ||
     usuarioLogado?.eSindico
   );
+  const temPoderGestaoReserva = Boolean(
+    temAcessoGlobalExplicito(usuarioLogado) ||
+    ehAdminCondominio(usuarioLogado) ||
+    normalizarPerfilOperador(usuarioLogado) === 'supervisor' ||
+    eSindico
+  );
   const podeAprovar = Boolean(
-    usuarioLogado?.login === 'admin' ||
-    usuarioLogado?.perfil === 'admin' ||
-    usuarioLogado?.nivel_acesso <= 2 ||
-    eSindico ||
+    temPoderGestaoReserva ||
     verificarPermissao(usuarioLogado, 'reservas', 'aprovar')
   );
   const podeGerenciarAreas = Boolean(
-    usuarioLogado?.login === 'admin' ||
-    usuarioLogado?.perfil === 'admin' ||
-    usuarioLogado?.nivel_acesso <= 2 ||
-    eSindico ||
-    verificarPermissao(usuarioLogado, 'reservas', 'gerenciar_areas') ||
-    !usuarioLogado
+    temPoderGestaoReserva ||
+    verificarPermissao(usuarioLogado, 'reservas', 'gerenciar_areas')
   );
 
   // Áreas ativas para os seletores de reservas e agendamentos

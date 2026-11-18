@@ -420,21 +420,37 @@ export async function sincronizarFilaComSupabase(): Promise<{
           }
           payload = validacao.payloadSaneado || payload;
 
-          let { error } = await supabase
-            .from('encomendas_itens')
-            .upsert([payload], { onConflict: 'operation_id', ignoreDuplicates: true });
+          const opIdLimpo = String(payload.operation_id || '').trim();
+          let error: any = null;
 
-          if (
-            error &&
-            (error.message?.includes('operation_id') ||
-              error.message?.includes('on conflict') ||
-              (error as any).code === '42703' ||
-              (error as any).code === '42P10')
-          ) {
-            const { operation_id, ...semOpId } = payload;
-            const retry = await supabase.from('encomendas_itens').insert([semOpId]);
-            error = retry.error;
+          if (opIdLimpo) {
+            const { data: jaExiste } = await supabase
+              .from('encomendas_itens')
+              .select('id')
+              .eq('condominio_id', condoAcao)
+              .eq('operation_id', opIdLimpo)
+              .maybeSingle();
+
+            if (!jaExiste) {
+              const insRes = await supabase.from('encomendas_itens').insert([payload]);
+              error = insRes.error;
+              if (error && (error as any).code === '23505') {
+                const { data: existente } = await supabase
+                  .from('encomendas_itens')
+                  .select('id')
+                  .eq('condominio_id', condoAcao)
+                  .eq('operation_id', opIdLimpo)
+                  .maybeSingle();
+                if (existente) {
+                  error = null;
+                }
+              }
+            }
+          } else {
+            const insRes = await supabase.from('encomendas_itens').insert([payload]);
+            error = insRes.error;
           }
+
           resError = error;
           if (!resError) {
             invalidarCacheTabela('encomendas_itens', condoAcao).catch(() => {});

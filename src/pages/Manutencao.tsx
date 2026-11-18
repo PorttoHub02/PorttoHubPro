@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '../services/supabase';
-import { uploadFotoComprimidaStorage } from '../services/imageUtils';
+import { uploadFotoComprimidaStorage, normalizarCaminhoStorageParaBanco } from '../services/imageUtils';
 import { 
   Wrench, 
   Plus, 
@@ -155,7 +155,7 @@ export default function Manutencao({ usuarioLogado }: ManutencaoProps) {
     setMensagem({ tipo: '', texto: '' });
 
     try {
-      const { publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, tamanhoOriginalKb, tamanhoComprimidoKb, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta,
         condominioId: condId,
@@ -164,7 +164,7 @@ export default function Manutencao({ usuarioLogado }: ManutencaoProps) {
         qualidade: 0.75
       });
 
-      setUrlCallback(publicUrl);
+      setUrlCallback(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       const detalheEconomia = taxaReducaoPct > 0 ? ` (${tamanhoOriginalKb}KB ➔ ${tamanhoComprimidoKb}KB, -${taxaReducaoPct}%)` : '';
       setMensagem({ tipo: 'sucesso', texto: `Foto salva e comprimida com sucesso!${detalheEconomia}` });
     } catch (err: any) {
@@ -723,7 +723,7 @@ export default function Manutencao({ usuarioLogado }: ManutencaoProps) {
 
                 {fotoRotinaUrl && (
                   <div className="mt-1.5 w-16 h-16 rounded-lg overflow-hidden border-2 border-emerald-500">
-                    <img src={fotoRotinaUrl} alt="Foto Evidência" loading="lazy" decoding="async" className="w-full h-full object-cover" />
+                    <ImagemOtimizada src={fotoRotinaUrl} alt="Foto Evidência" permitirAmpliar={true} className="w-full h-full object-cover" />
                   </div>
                 )}
               </div>

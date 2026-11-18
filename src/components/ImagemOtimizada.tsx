@@ -180,9 +180,9 @@ export const ImagemOtimizada: React.FC<ImagemOtimizadaProps> = ({
                 {alt || 'Visualização do Comprovante / Foto'}
               </span>
               <div className="flex items-center gap-2">
-                {src && (
+                {(urlEfetiva || src) && (
                   <a
-                    href={src}
+                    href={urlEfetiva || src || '#'}
                     download="comprovante-porttohub.jpg"
                     target="_blank"
                     rel="noreferrer"

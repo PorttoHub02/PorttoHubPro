@@ -14,7 +14,13 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { supabase } from '../services/supabase';
-import { uploadFotoComprimidaStorage } from '../services/imageUtils';
+import {
+  uploadFotoComprimidaStorage,
+  normalizarCaminhoStorageParaBanco,
+  resolverUrlFotoPrivada,
+  ehCaminhoPrivadoStorage
+} from '../services/imageUtils';
+import { temAcessoGlobalExplicito, ehAdminCondominio } from '../services/autorizacaoService';
 import {
   carregarCustodiaAtiva,
   carregarCustodiaHistorico,
@@ -90,12 +96,18 @@ interface CustodiaProps {
 
 export default function Custodia({ usuarioLogado }: CustodiaProps) {
   // Controle de Permissões RBAC
-  const eAdmin = usuarioLogado?.cargo === 'admin' || usuarioLogado?.permissao === 'admin' || usuarioLogado?.cargo === 'sindico' || usuarioLogado?.permissao === 'sindico';
+  const eAdmin = temAcessoGlobalExplicito(usuarioLogado) || ehAdminCondominio(usuarioLogado);
+  const eSindico = Boolean(
+    usuarioLogado?.eSindico ||
+    usuarioLogado?.nivel_acesso === 4 ||
+    String(usuarioLogado?.funcao || '').toLowerCase().includes('síndico') ||
+    String(usuarioLogado?.funcao || '').toLowerCase().includes('sindico')
+  );
   const podeCriar = Boolean(verificarPermissao(usuarioLogado, 'custodia', 'criar') || verificarPermissao(usuarioLogado, 'custodia', 'receber') || eAdmin);
   const podeBaixa = Boolean(verificarPermissao(usuarioLogado, 'custodia', 'baixa') || eAdmin);
   const podeEditar = Boolean(verificarPermissao(usuarioLogado, 'custodia', 'editar') || eAdmin);
   const podeExcluir = Boolean(verificarPermissao(usuarioLogado, 'custodia', 'excluir') || eAdmin);
-  const podeAuditoria = Boolean(verificarPermissao(usuarioLogado, 'custodia', 'auditoria') || verificarPermissao(usuarioLogado, 'custodia', 'visualizar') || eAdmin);
+  const podeAuditoria = Boolean(verificarPermissao(usuarioLogado, 'custodia', 'auditoria') || verificarPermissao(usuarioLogado, 'custodia', 'visualizar') || eAdmin || eSindico);
 
   // Estados Principais de Navegação
   const [aba, setAba] = useState<'ativos' | 'historico'>('ativos');
@@ -158,6 +170,37 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
   // Modais de Apoio
   const [itemDossieModal, setItemDossieModal] = useState<ItemCustodia | null>(null);
   const [fotoAmpliadaModal, setFotoAmpliadaModal] = useState<{ url: string; titulo: string } | null>(null);
+  const [urlOriginalAmpliada, setUrlOriginalAmpliada] = useState<string>('');
+  const [resolvendoOriginal, setResolvendoOriginal] = useState(false);
+
+  useEffect(() => {
+    let ativo = true;
+    const raw = fotoAmpliadaModal?.url || '';
+    if (!raw) {
+      setUrlOriginalAmpliada('');
+      return;
+    }
+    if (/^(https?:\/\/|data:image\/|blob:)/i.test(raw) && !ehCaminhoPrivadoStorage(raw)) {
+      setUrlOriginalAmpliada(raw);
+      return;
+    }
+    setUrlOriginalAmpliada('');
+    setResolvendoOriginal(true);
+    resolverUrlFotoPrivada(raw)
+      .then((res) => {
+        if (!ativo) return;
+        if (res && /^(https?:\/\/|data:image\/|blob:)/i.test(res)) {
+          setUrlOriginalAmpliada(res);
+        }
+      })
+      .finally(() => {
+        if (ativo) setResolvendoOriginal(false);
+      });
+    return () => {
+      ativo = false;
+    };
+  }, [fotoAmpliadaModal?.url]);
+
   const [itemEmEdicao, setItemEmEdicao] = useState<ItemCustodia | null>(null);
   const [itemParaExcluir, setItemParaExcluir] = useState<ItemCustodia | null>(null);
   const [modalWhatsProps, setModalWhatsProps] = useState<{
@@ -307,7 +350,7 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
     if (!file) return;
     setUploadingFoto(true);
     try {
-      const { publicUrl, taxaReducaoPct } = await uploadFotoComprimidaStorage({
+      const { storagePath, publicUrl, taxaReducaoPct } = await uploadFotoComprimidaStorage({
         file,
         pasta,
         condominioId: condId,
@@ -315,7 +358,7 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
         maxHeight: 1200,
         qualidade: 0.8
       });
-      callbackUrl(publicUrl);
+      callbackUrl(normalizarCaminhoStorageParaBanco(storagePath || publicUrl));
       setMensagem({
         tipo: 'sucesso',
         texto: `Foto anexada com sucesso! ${taxaReducaoPct > 0 ? `(-${taxaReducaoPct}% otimizada)` : ''}`
@@ -1185,11 +1228,11 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
                           className="w-12 h-12 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-slate-100 shrink-0 cursor-zoom-in group-hover:scale-105 transition-transform shadow-2xs"
                           title="Clique para ampliar foto"
                         >
-                          <img
+                          <ImagemOtimizada
                             src={fotoPreview}
                             alt="Foto do objeto"
+                            permitirAmpliar={false}
                             className="w-full h-full object-cover"
-                            loading="lazy"
                           />
                         </div>
                       ) : (
@@ -1697,9 +1740,10 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
 
                   {baixaFotoUrl ? (
                     <div className="flex items-center gap-3 p-2.5 bg-emerald-50 dark:bg-emerald-950/40 rounded-2xl border border-emerald-300 dark:border-emerald-800">
-                      <img
+                      <ImagemOtimizada
                         src={baixaFotoUrl}
                         alt="Comprovante"
+                        permitirAmpliar={true}
                         className="w-14 h-14 rounded-xl object-cover border border-emerald-400 shrink-0"
                       />
                       <div className="flex-1 min-w-0">
@@ -2228,7 +2272,7 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
                   </label>
                   {fotoEntradaUrl ? (
                     <div className="flex items-center gap-2 p-1.5 bg-emerald-50 dark:bg-emerald-950/40 rounded-xl border border-emerald-300 dark:border-emerald-800">
-                      <img src={fotoEntradaUrl} alt="Objeto" className="w-10 h-10 rounded-lg object-cover" />
+                      <ImagemOtimizada src={fotoEntradaUrl} alt="Objeto" permitirAmpliar={true} className="w-10 h-10 rounded-lg object-cover" />
                       <span className="text-xs font-bold text-emerald-800 dark:text-emerald-200 flex-1 truncate">Foto capturada!</span>
                       <label className="text-[10px] text-blue-600 dark:text-blue-400 font-bold hover:underline cursor-pointer pr-1">
                         Trocar
@@ -2355,24 +2399,34 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
                 {(itemDossieModal.foto_entrada_url || itemDossieModal.foto_url) && (
                   <div className="space-y-1">
                     <span className="text-[10px] font-bold uppercase text-slate-400">Foto de Entrada</span>
-                    <img
-                      src={itemDossieModal.foto_entrada_url || itemDossieModal.foto_url}
-                      alt="Entrada"
-                      className="w-full h-28 object-cover rounded-xl border border-slate-200 dark:border-slate-700 cursor-zoom-in"
+                    <div
                       onClick={() => setFotoAmpliadaModal({ url: itemDossieModal.foto_entrada_url || itemDossieModal.foto_url || '', titulo: 'Foto de Entrada' })}
-                    />
+                      className="cursor-zoom-in"
+                    >
+                      <ImagemOtimizada
+                        src={itemDossieModal.foto_entrada_url || itemDossieModal.foto_url || ''}
+                        alt="Entrada"
+                        permitirAmpliar={false}
+                        className="w-full h-28 object-cover rounded-xl border border-slate-200 dark:border-slate-700"
+                      />
+                    </div>
                   </div>
                 )}
 
                 {itemDossieModal.foto_saida_url && (
                   <div className="space-y-1">
                     <span className="text-[10px] font-bold uppercase text-slate-400">Foto de Saída / Comprovante</span>
-                    <img
-                      src={itemDossieModal.foto_saida_url}
-                      alt="Saída"
-                      className="w-full h-28 object-cover rounded-xl border border-slate-200 dark:border-slate-700 cursor-zoom-in"
+                    <div
                       onClick={() => setFotoAmpliadaModal({ url: itemDossieModal.foto_saida_url || '', titulo: 'Foto de Saída' })}
-                    />
+                      className="cursor-zoom-in"
+                    >
+                      <ImagemOtimizada
+                        src={itemDossieModal.foto_saida_url}
+                        alt="Saída"
+                        permitirAmpliar={false}
+                        className="w-full h-28 object-cover rounded-xl border border-slate-200 dark:border-slate-700"
+                      />
+                    </div>
                   </div>
                 )}
 
@@ -2380,7 +2434,7 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
                   <div className="space-y-1 col-span-2">
                     <span className="text-[10px] font-bold uppercase text-slate-400">Assinatura Digital Coletada</span>
                     <div className="p-2 bg-white rounded-xl border border-slate-300">
-                      <img src={itemDossieModal.assinatura_url} alt="Assinatura" className="max-h-20 object-contain mx-auto" />
+                      <ImagemOtimizada src={itemDossieModal.assinatura_url} alt="Assinatura" permitirAmpliar={false} className="max-h-20 object-contain mx-auto" />
                     </div>
                   </div>
                 )}
@@ -2424,23 +2478,56 @@ export default function Custodia({ usuarioLogado }: CustodiaProps) {
             </div>
 
             <div className="max-h-[75vh] flex items-center justify-center overflow-hidden rounded-xl bg-black">
-              <img
+              <ImagemOtimizada
                 src={fotoAmpliadaModal.url}
                 alt="Comprovante"
+                permitirAmpliar={false}
                 className="max-h-[75vh] w-auto object-contain rounded-xl"
               />
             </div>
 
             <div className="flex justify-between items-center text-[11px] text-slate-400 pt-1">
               <span>Evidência registrada no sistema PorttoHub</span>
-              <a
-                href={fotoAmpliadaModal.url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-emerald-400 hover:underline flex items-center gap-1 font-bold"
-              >
-                Abrir imagem original <ExternalLink className="w-3 h-3" />
-              </a>
+              {urlOriginalAmpliada ? (
+                <a
+                  href={urlOriginalAmpliada}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-emerald-400 hover:underline flex items-center gap-1 font-bold"
+                >
+                  Abrir imagem original <ExternalLink className="w-3 h-3" />
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  disabled={resolvendoOriginal}
+                  onClick={async () => {
+                    if (!fotoAmpliadaModal?.url) return;
+                    setResolvendoOriginal(true);
+                    try {
+                      const signed = await resolverUrlFotoPrivada(fotoAmpliadaModal.url, true);
+                      if (signed && /^(https?:\/\/|data:image\/|blob:)/i.test(signed)) {
+                        setUrlOriginalAmpliada(signed);
+                        const link = document.createElement('a');
+                        link.href = signed;
+                        link.target = '_blank';
+                        link.rel = 'noreferrer';
+                        link.click();
+                      } else {
+                        setMensagem({
+                          tipo: 'erro',
+                          texto: 'Não foi possível gerar a URL assinada da imagem original no Storage privado.'
+                        });
+                      }
+                    } finally {
+                      setResolvendoOriginal(false);
+                    }
+                  }}
+                  className="text-emerald-400 hover:underline flex items-center gap-1 font-bold disabled:opacity-60 cursor-pointer"
+                >
+                  {resolvendoOriginal ? 'Gerando link seguro...' : 'Abrir imagem original'} <ExternalLink className="w-3 h-3" />
+                </button>
+              )}
             </div>
           </div>
         </div>

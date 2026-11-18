@@ -554,7 +554,7 @@ export function adaptRecordForTargetTable(tableName: string, rawRecord: any, con
     const rawCondo = item.condominio_id || item.condominioId || item.id_condominio || item.condo_id || item.tenant_id;
 
     if (tableName === 'operadores') {
-      const eAdmin = item.login === 'admin' || item.perfil === 'admin_geral' || item.nivel_acesso === 0;
+      const eAdmin = item.acesso_global_condominios === true || item.perfil === 'admin_geral';
       if (eAdmin && (rawCondo === 'todos' || rawCondo === 'global' || !rawCondo)) {
         item.condominio_id = null;
       } else if (context?.targetCondominioId && context.targetCondominioId !== 'todos' && !eAdmin) {
@@ -621,7 +621,7 @@ export function adaptRecordForTargetTable(tableName: string, rawRecord: any, con
 
     // Nível de acesso
     if (item.nivel_acesso === undefined || item.nivel_acesso === null) {
-      item.nivel_acesso = (item.login === 'admin' || item.perfil === 'admin_geral') ? 0 : 3;
+      item.nivel_acesso = (item.acesso_global_condominios === true && item.perfil === 'admin_geral') ? 0 : 3;
     }
     if (item.ativo === undefined) item.ativo = true;
   }

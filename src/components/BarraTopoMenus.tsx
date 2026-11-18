@@ -31,6 +31,7 @@ interface BarraTopoMenusProps {
   condominioId?: string;
   operador: any;
   eAdmin?: boolean;
+  eSuperAdminGlobal?: boolean;
   eSindico?: boolean;
   onAbrirDoctor: () => void;
   onAbrirNotificacoes: () => void;
@@ -50,6 +51,7 @@ export default function BarraTopoMenus({
   condominioId,
   operador,
   eAdmin,
+  eSuperAdminGlobal,
   eSindico,
   onAbrirDoctor,
   onAbrirNotificacoes,
@@ -199,7 +201,11 @@ export default function BarraTopoMenus({
                       {operador?.nome || 'Operador'}
                     </p>
                     <p className="text-[10px] text-slate-400 truncate uppercase font-mono">
-                      {eAdmin ? 'ADMIN MASTER' : (eSindico ? 'SÍNDICO' : (operador?.funcao || `NÍVEL ${operador?.nivel_acesso ?? 3}`))}
+                      {(eSuperAdminGlobal || operador?.acesso_global_condominios === true)
+                        ? 'ADMIN GERAL'
+                        : eAdmin
+                          ? 'ADMIN CONDOMÍNIO'
+                          : (eSindico ? 'SÍNDICO' : (operador?.funcao || `NÍVEL ${operador?.nivel_acesso ?? 3}`))}
                     </p>
                   </div>
                 </div>

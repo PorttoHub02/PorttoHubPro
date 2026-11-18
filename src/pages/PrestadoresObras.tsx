@@ -2037,9 +2037,9 @@ export default function PrestadoresObras({ usuarioLogado }: PrestadoresObrasProp
                 {visitasHoje.slice(0, 10).map((v) => (
                   <div key={v.id} className="py-2.5 flex items-center justify-between text-xs text-slate-300">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <div className="w-8 h-8 rounded-xl bg-slate-800 flex items-center justify-center text-purple-400 border border-slate-700 shrink-0">
+                      <div className="w-8 h-8 rounded-xl bg-slate-800 flex items-center justify-center text-purple-400 border border-slate-700 shrink-0 overflow-hidden">
                         {v.foto_rosto ? (
-                          <img src={v.foto_rosto} alt="" className="w-full h-full object-cover rounded-xl" />
+                          <ImagemOtimizada src={v.foto_rosto} alt={v.nome_completo || 'Visitante'} permitirAmpliar={true} className="w-full h-full object-cover rounded-xl" />
                         ) : (
                           <Users className="w-4 h-4" />
                         )}
@@ -2116,7 +2116,7 @@ export default function PrestadoresObras({ usuarioLogado }: PrestadoresObrasProp
                         className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 overflow-hidden shrink-0 flex items-center justify-center text-slate-400 cursor-pointer"
                       >
                         {(h.foto_rosto || h.foto_url) ? (
-                          <img src={h.foto_rosto || h.foto_url} alt="" className="w-full h-full object-cover" />
+                          <ImagemOtimizada src={h.foto_rosto || h.foto_url} alt={h.nome_completo || 'Acesso'} permitirAmpliar={false} className="w-full h-full object-cover" />
                         ) : (
                           <UserCheck className="w-5 h-5" />
                         )}
@@ -2421,7 +2421,7 @@ export default function PrestadoresObras({ usuarioLogado }: PrestadoresObrasProp
                 <div className="flex items-center gap-3">
                   <div className="w-14 h-14 rounded-2xl bg-slate-900 border-2 border-dashed border-slate-700 overflow-hidden shrink-0 flex items-center justify-center text-slate-500">
                     {fotoRosto ? (
-                      <img src={fotoRosto} alt="Rosto" className="w-full h-full object-cover" />
+                      <ImagemOtimizada src={fotoRosto} alt="Rosto" permitirAmpliar={true} className="w-full h-full object-cover" />
                     ) : (
                       <Camera className="w-6 h-6" />
                     )}
@@ -2564,7 +2564,7 @@ export default function PrestadoresObras({ usuarioLogado }: PrestadoresObrasProp
             <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800 flex items-center gap-3">
               <div className="w-12 h-12 rounded-xl bg-slate-900 overflow-hidden shrink-0 flex items-center justify-center text-slate-400 border border-slate-700">
                 {itemSelecionado.foto_rosto ? (
-                  <img src={itemSelecionado.foto_rosto} alt="" className="w-full h-full object-cover" />
+                  <ImagemOtimizada src={itemSelecionado.foto_rosto} alt={itemSelecionado.nome_profissional || itemSelecionado.nome_completo || 'Autorizado'} permitirAmpliar={true} className="w-full h-full object-cover" />
                 ) : itemSelecionado.perfil_acesso === 'autorizado' ? (
                   <Users className="w-6 h-6 text-purple-400" />
                 ) : (
@@ -2970,7 +2970,7 @@ export default function PrestadoresObras({ usuarioLogado }: PrestadoresObrasProp
           className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-50 flex items-center justify-center p-4 cursor-pointer animate-in fade-in"
         >
           <div className="max-w-md w-full max-h-[85vh] rounded-3xl overflow-hidden shadow-2xl border border-slate-800 bg-slate-900 p-2">
-            <img src={modalVisualizarFoto} alt="Foto Expandida" className="w-full h-auto max-h-[80vh] object-contain rounded-2xl mx-auto" />
+            <ImagemOtimizada src={modalVisualizarFoto} alt="Foto Expandida" permitirAmpliar={false} className="w-full h-auto max-h-[80vh] object-contain rounded-2xl mx-auto" />
             <p className="text-center text-xs text-slate-400 pt-2">Clique em qualquer lugar para fechar</p>
           </div>
         </div>

@@ -66,6 +66,7 @@ import { formatarLinkWhatsApp } from '../services/configWhatsappService';
 import { verificarPermissao } from '../services/permissoesService';
 import { supabase } from '../services/supabase';
 import { TotemValidator } from '../components/TotemValidator';
+import { ImagemOtimizada } from '../components/ImagemOtimizada';
 import { Condominium, AccessLog } from '../types';
 
 interface ControleAcessoProps {
@@ -1149,9 +1150,10 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
 
               {formEntrada.foto_entrada_url && (
                 <div className="flex items-center gap-3">
-                  <img
+                  <ImagemOtimizada
                     src={formEntrada.foto_entrada_url}
                     alt="Foto capturada"
+                    permitirAmpliar={true}
                     className="w-20 h-20 rounded-xl object-cover border border-slate-300 dark:border-slate-700 shadow-xs"
                   />
                   <div>
@@ -1261,9 +1263,10 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
                     <div className="flex items-start justify-between gap-2 mb-2">
                       <div className="flex items-center gap-2">
                         {reg.foto_entrada_url ? (
-                          <img
+                          <ImagemOtimizada
                             src={reg.foto_entrada_url}
-                            alt=""
+                            alt={reg.nome || 'Registro de Acesso'}
+                            permitirAmpliar={true}
                             className="w-10 h-10 rounded-xl object-cover border border-slate-200"
                           />
                         ) : (
@@ -1525,9 +1528,10 @@ export default function ControleAcesso({ usuarioLogado }: ControleAcessoProps) {
                 >
                   <div className="flex items-start gap-3">
                     {m.foto_url ? (
-                      <img
+                      <ImagemOtimizada
                         src={m.foto_url}
                         alt={m.nome}
+                        permitirAmpliar={true}
                         className="w-12 h-12 rounded-2xl object-cover border border-slate-200 dark:border-slate-700 shrink-0"
                       />
                     ) : (

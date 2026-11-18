@@ -24,7 +24,7 @@ Aplicação web/PWA multi-condomínio (multi-tenant) para operação de portaria
   - Todas as rotas `/api/*` protegidas exigem `Authorization: Bearer <jwt>` verificado diretamente no Supabase Auth.
   - `POST /api/admin/operadores/provisionar` valida no servidor a identidade real do solicitante, impede gestores locais de alterar contas de outros condomínios, contas globais (`acesso_global_condominios = true`) ou fornecer `auth_user_id` arbitrário sem vínculo de `operador_id`.
   - `SUPABASE_SERVICE_ROLE_KEY` nunca é exposta ao frontend nem retornada em respostas HTTP.
-- **PostgreSQL RLS & Storage (`supabase/sql/`)**: políticas baseadas em `auth.uid()` e vínculos em `operadores` / `operador_condominios`, com Storage privado estritamente segregado no prefixo `condominios/{condominio_id}/...`.
+- **PostgreSQL RLS & Storage (`supabase/sql/`)**: políticas baseadas em `auth.uid()` e vínculos em `operadores` / `operador_condominios`, com Storage privado estritamente segregado nos prefixos `condominios/{condominio_id}/...` e `operadores/{auth.uid()}/...` (avatares pessoais privados).
 
 ### 1.3 Controle de Acesso, QR Code e Offline-First
 - **Passes Virtuais QR (`src/services/passeQrValidation.ts`, `src/server/apiHandlers.ts`, `supabase/sql/05B_FUNCOES_PASSE_QR.sql`)**:
@@ -103,11 +103,12 @@ O arquivo `wrangler.jsonc` aponta diretamente para `"name": "porttohubpro"`, reu
 
 ```bash
 npm install
-npm run dev       # Servidor Express + Vite na porta 3000
-npm test          # Suíte de testes de segurança, domínio e auditoria
-npm run lint      # Verificação TypeScript (tsc --noEmit)
-npm run build     # Build de produção em ./dist
-npm run deploy    # Build + wrangler deploy no Worker existente (porttohubpro)
+npm run dev              # Servidor Express + Vite na porta 3000
+npm test                 # Suíte unitária/mock de segurança, domínio e auditoria
+npm run test:integration # Testes reais contra Supabase (requer variáveis SUPABASE_TEST_*)
+npm run lint             # Verificação TypeScript (tsc --noEmit)
+npm run build            # Build de produção em ./dist
+npm run deploy           # Build + wrangler deploy no Worker existente (porttohubpro)
 ```
 
 Para configurar secrets via CLI no Worker `porttohubpro` (ou cadastre pelo painel Cloudflare em *Workers & Pages -> porttohubpro -> Settings -> Variables and Secrets*):

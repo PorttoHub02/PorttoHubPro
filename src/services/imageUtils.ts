@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import { supabaseStorage, obterStorageBucket, obterSupabaseUrl } from './supabaseStorage';
+import { supabaseStorage, obterStorageBucket } from './supabaseStorage';
 
 /**
  * Utilitário de Otimização e Compressão Estrita de Imagens (Client-Side)
@@ -269,7 +269,12 @@ export function extrairCaminhoStorageSupabase(valor?: string | null): { bucket: 
 
   const bucketPadrao = obterStorageBucket();
 
-  if (limpo.startsWith('condominios/') || limpo.startsWith('/condominios/')) {
+  if (
+    limpo.startsWith('condominios/') ||
+    limpo.startsWith('/condominios/') ||
+    limpo.startsWith('operadores/') ||
+    limpo.startsWith('/operadores/')
+  ) {
     return { bucket: bucketPadrao, path: limpo.replace(/^\/+/, '') };
   }
 
@@ -284,9 +289,66 @@ export function extrairCaminhoStorageSupabase(valor?: string | null): { bucket: 
   return null;
 }
 
+export function ehCaminhoPrivadoStorage(valor?: string | null): boolean {
+  return Boolean(extrairCaminhoStorageSupabase(valor));
+}
+
+/**
+ * Normaliza qualquer URL do Supabase Storage (signed ou legado) para o caminho canônico relativo (`condominios/...`)
+ * antes de persistir no banco, evitando gravar tokens assinados expirados.
+ */
+export function normalizarCaminhoStorageParaBanco(urlOuPath?: string | null): string {
+  if (!urlOuPath) return '';
+  const limpo = String(urlOuPath).trim();
+  if (!limpo) return '';
+  if (limpo.startsWith('data:') || limpo.startsWith('blob:')) return limpo;
+
+  const parsed = extrairCaminhoStorageSupabase(limpo);
+  if (parsed?.path) {
+    return parsed.path;
+  }
+
+  return limpo;
+}
+
+/**
+ * Remove um objeto do bucket privado `encomendas` usando caminho canônico ou URL.
+ */
+export async function removerFotoStoragePrivado(urlOuPath?: string | null): Promise<boolean> {
+  const parsed = extrairCaminhoStorageSupabase(urlOuPath);
+  if (!parsed) return false;
+  try {
+    const storageClient = supabase?.storage || supabaseStorage?.storage;
+    if (!storageClient) return false;
+    const { error } = await storageClient.from(parsed.bucket).remove([parsed.path]);
+    return !error;
+  } catch (err) {
+    console.warn('[Storage] Erro ao remover arquivo privado:', err);
+    return false;
+  }
+}
+
+/**
+ * Baixa o Blob de um objeto do bucket privado `encomendas`.
+ */
+export async function baixarFotoStoragePrivada(urlOuPath?: string | null): Promise<Blob | null> {
+  const parsed = extrairCaminhoStorageSupabase(urlOuPath);
+  if (!parsed) return null;
+  try {
+    const storageClient = supabase?.storage || supabaseStorage?.storage;
+    if (!storageClient) return null;
+    const { data, error } = await storageClient.from(parsed.bucket).download(parsed.path);
+    if (error || !data) return null;
+    return data;
+  } catch (err) {
+    console.warn('[Storage] Erro ao baixar arquivo privado:', err);
+    return null;
+  }
+}
+
 /**
  * Resolve qualquer URL ou path privado do Supabase Storage para uma Signed URL fresca (TTL 1h, cache RAM 45min).
- * Tolera URLs públicas legadas, data:image/ e blob: durante transição.
+ * Tolera data:image/, blob: e URLs legadas convertidas em Signed URLs autenticadas.
  */
 export async function resolverUrlFotoPrivada(
   urlOuPath?: string | null,
@@ -330,11 +392,11 @@ export async function resolverUrlFotoPrivada(
     console.warn('[Storage] Aviso ao gerar signed URL:', err);
   }
 
-  return formatarUrlFoto(limpo);
+  return parsed.path;
 }
 
 /**
- * Normaliza e formata qualquer URL de foto armazenada.
+ * Normaliza referências de foto sem sintetizar URLs públicas de Storage privado.
  */
 export function formatarUrlFoto(url?: string | null): string {
   if (!url) return '';
@@ -342,7 +404,6 @@ export function formatarUrlFoto(url?: string | null): string {
   if (!limpa) return '';
 
   if (
-    limpa.includes('.supabase.co/storage/v1/object/') ||
     limpa.startsWith('http://') ||
     limpa.startsWith('https://') ||
     limpa.startsWith('data:image/') ||
@@ -351,11 +412,7 @@ export function formatarUrlFoto(url?: string | null): string {
     return limpa;
   }
 
-  const caminhoLimpo = limpa.replace(/^\/+/, '').replace(/^uploads\//, '');
-  const baseUrl = obterSupabaseUrl();
-  const bucket = obterStorageBucket();
-  if (!baseUrl) return caminhoLimpo;
-  return `${baseUrl}/storage/v1/object/public/${bucket}/${caminhoLimpo}`;
+  return limpa.replace(/^\/+/, '').replace(/^uploads\//, '');
 }
 
 export interface UploadComprimidoParams {
@@ -363,6 +420,7 @@ export interface UploadComprimidoParams {
   bucket?: string;
   pasta: string;
   condominioId?: string;
+  escopoUsuarioAuthId?: string;
   maxWidth?: number;
   maxHeight?: number;
   qualidade?: number;
@@ -397,18 +455,28 @@ function resolverCondominioIdUpload(condominioIdParam?: string): string {
   return '';
 }
 
+function resolverUsuarioAuthIdUpload(escopoUsuarioAuthId?: string): string {
+  const str = String(escopoUsuarioAuthId || '').trim();
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str)) {
+    return str.toLowerCase();
+  }
+  return '';
+}
+
 /**
  * Upload Oficial Otimizado com Supabase Storage Privado Multi-Tenant:
  * 1. Preview Otimista Imediato (0ms) via callback.
  * 2. Compressão no cliente via createImageBitmap / Canvas (< 400KB).
  * 3. Caminho particionado por condomínio: condominios/{condominio_id}/{pasta}/{arquivo}.jpg
- * 4. Gera Signed URL privada imediatamente (com fallback para URL legada se necessário).
+ *    (ou operadores/{auth_uid}/{arquivo}.jpg para avatar próprio sem condomínio ativo).
+ * 4. Gera Signed URL privada imediatamente.
  */
 export async function uploadFotoComprimidaStorage({
   file,
   bucket: bucketParam,
   pasta,
   condominioId,
+  escopoUsuarioAuthId,
   maxWidth = 1080,
   maxHeight = 1080,
   qualidade = 0.72,
@@ -444,64 +512,74 @@ export async function uploadFotoComprimidaStorage({
 
   const pastaLimpa = (pasta || 'etiquetas').replace(/[^a-zA-Z0-9_-]/g, '') || 'etiquetas';
   const condoLimpo = resolverCondominioIdUpload(condominioId);
+  const authUidLimpo = resolverUsuarioAuthIdUpload(escopoUsuarioAuthId);
+  if (!condoLimpo && !authUidLimpo) {
+    throw new Error('condominioId ou escopoUsuarioAuthId válido é obrigatório para upload no storage privado.');
+  }
+
   const sufixoAleatorio = Math.random().toString(36).substring(2, 8);
   const nomeArquivo = `${Date.now()}_${sufixoAleatorio}.jpg`;
-  const storagePath = condoLimpo
-    ? `condominios/${condoLimpo}/${pastaLimpa}/${nomeArquivo}`
-    : `${pastaLimpa}/${nomeArquivo}`;
+  const storagePath = authUidLimpo && (!condoLimpo || pastaLimpa === 'operadores')
+    ? `operadores/${authUidLimpo}/${nomeArquivo}`
+    : `condominios/${condoLimpo}/${pastaLimpa}/${nomeArquivo}`;
   const bucket = bucketParam || obterStorageBucket();
+  const estaOnline = typeof navigator === 'undefined' ? true : navigator.onLine;
 
-  let finalUrl = '';
   let signedUrl = '';
-  let uploadSucesso = false;
+  let ultimoErroStorage: string | null = null;
 
-  try {
+  if (estaOnline) {
     const storageClient = supabase?.storage || supabaseStorage?.storage;
-    if (storageClient) {
-      const { error: uploadError } = await storageClient
-        .from(bucket)
-        .upload(storagePath, arquivoComprimido, {
-          contentType: 'image/jpeg',
-          cacheControl: '3600',
-          upsert: true
-        });
-
-      if (uploadError) {
-        console.warn('[Supabase Storage] Aviso no upload privado:', uploadError);
-      } else {
-        // Prioriza Signed URL privada para bucket com private = true
-        const { data: signedData } = await storageClient
-          .from(bucket)
-          .createSignedUrl(storagePath, 3600);
-
-        if (signedData?.signedUrl) {
-          signedUrl = signedData.signedUrl;
-          finalUrl = signedData.signedUrl;
-          CACHE_URLS_ASSINADAS.set(`${bucket}:${storagePath}`, {
-            url: signedData.signedUrl,
-            expiraEm: Date.now() + 45 * 60 * 1000
-          });
-          uploadSucesso = true;
-        } else {
-          const { data: urlData } = storageClient.from(bucket).getPublicUrl(storagePath);
-          if (urlData?.publicUrl) {
-            finalUrl = urlData.publicUrl;
-            uploadSucesso = true;
-          }
-        }
-      }
+    if (!storageClient) {
+      throw new Error('Cliente Supabase Storage indisponível.');
     }
-  } catch (errStorage: any) {
-    console.warn('[Supabase Storage] Exceção no upload direto:', errStorage);
+
+    const { error: uploadError } = await storageClient
+      .from(bucket)
+      .upload(storagePath, arquivoComprimido, {
+        contentType: 'image/jpeg',
+        cacheControl: '3600',
+        upsert: true
+      });
+
+    if (uploadError) {
+      ultimoErroStorage = uploadError.message || 'Falha ao enviar arquivo para o Storage privado.';
+      throw new Error(`[Storage Privado] ${ultimoErroStorage}`);
+    }
+
+    const { data: signedData, error: signedErr } = await storageClient
+      .from(bucket)
+      .createSignedUrl(storagePath, 3600);
+
+    if (signedErr || !signedData?.signedUrl) {
+      throw new Error(
+        `[Storage Privado] Arquivo gravado em ${storagePath}, mas não foi possível gerar URL assinada: ${signedErr?.message || 'erro desconhecido'}`
+      );
+    }
+
+    signedUrl = signedData.signedUrl;
+    CACHE_URLS_ASSINADAS.set(`${bucket}:${storagePath}`, {
+      url: signedUrl,
+      expiraEm: Date.now() + 45 * 60 * 1000
+    });
+
+    return {
+      publicUrl: signedUrl,
+      signedUrl,
+      storagePath,
+      fileName: storagePath,
+      tamanhoOriginalKb,
+      tamanhoComprimidoKb,
+      taxaReducaoPct,
+      arquivoComprimido
+    };
   }
 
-  if (!uploadSucesso || !finalUrl) {
-    finalUrl = base64Fallback || (typeof file === 'string' ? file : '');
-  }
-
+  // Modo estritamente offline: retorna fallback local para preview e sincronização posterior
+  const offlineFallback = base64Fallback || (typeof file === 'string' ? file : '');
   return {
-    publicUrl: formatarUrlFoto(finalUrl),
-    signedUrl: signedUrl || undefined,
+    publicUrl: offlineFallback,
+    signedUrl: undefined,
     storagePath,
     fileName: storagePath,
     tamanhoOriginalKb,

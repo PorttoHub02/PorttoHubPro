@@ -1,6 +1,15 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase, obterAccessTokenAtual } from '../services/supabase';
-import { isCondominioIdValido, temAcessoGlobalExplicito, OPERADOR_SAFE_COLUMNS } from '../services/autorizacaoService';
+import {
+  isCondominioIdValido,
+  temAcessoGlobalExplicito,
+  ehAdminCondominio,
+  ehPerfilSupervisor,
+  ehPerfilSindico,
+  normalizarPerfilOperador,
+  podeGerenciarOperadoresNoCondominio,
+  OPERADOR_SAFE_COLUMNS
+} from '../services/autorizacaoService';
 import { 
   Building2,
   MapPin,
@@ -57,7 +66,11 @@ import {
   EyeOff,
   Briefcase
 } from 'lucide-react';
-import { comprimirImagemBase64 } from '../services/imageUtils';
+import {
+  comprimirImagemBase64,
+  normalizarCaminhoStorageParaBanco,
+  uploadFotoComprimidaStorage
+} from '../services/imageUtils';
 import { 
   carregarCondominioConfig, 
   salvarCondominioConfig, 
@@ -205,8 +218,8 @@ export function obterFuncaoOperador(op: any): string {
       if (salvo) return salvo;
     }
   }
-  if (op.perfil === 'admin') return 'Administrador Master';
-  if (op.perfil === 'master') return 'Gerente / Master';
+  if (op.perfil === 'admin_geral') return 'Administrador Geral';
+  if (op.perfil === 'admin_condominio' || op.perfil === 'admin_local' || op.perfil === 'admin' || op.perfil === 'master') return 'Administrador de Condomínio';
   if (op.perfil === 'supervisor') return 'Supervisor Operacional';
   if (op.perfil === 'sindico') return 'Síndico';
   return 'Porteiro';
@@ -254,9 +267,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
   const nivelNum = usuarioLogado?.nivel_acesso !== undefined && usuarioLogado?.nivel_acesso !== null 
     ? Number(usuarioLogado.nivel_acesso) 
     : 3;
-  const perfilStr = (usuarioLogado?.perfil || '').toLowerCase();
-  const loginStr = (usuarioLogado?.login || '').toLowerCase();
-  const nomeStr = (usuarioLogado?.nome || '').toLowerCase();
+  const perfilPadraoLogado = normalizarPerfilOperador(usuarioLogado);
 
   // Regra C: Acesso global somente com flag explícito do banco/backend (nunca por login === 'admin' ou nivel_acesso <= 1)
   const eAdminGlobal = Boolean(
@@ -266,26 +277,15 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
   // Detecção estrita de perfil Síndico
   const ehSindicaLvl1 = Boolean(
     !eAdminGlobal &&
-    (
-      perfilStr.includes('sind') ||
-      Boolean(usuarioLogado?.eSindico) ||
-      loginStr.includes('sindic') ||
-      nomeStr.includes('sindic') ||
-      nivelNum === 4 ||
-      usuarioLogado?.nivel_acesso_custom_id === 'nivel_4'
-    )
+    (ehPerfilSindico(usuarioLogado) || Boolean(usuarioLogado?.eSindico))
   );
 
-  const eAdminLocal = !ehSindicaLvl1 && !eAdminGlobal && Boolean(
-    perfilStr === 'admin' ||
-    perfilStr === 'admin_geral' ||
-    nivelNum === 0
-  );
-  const eAdmin = eAdminGlobal || eAdminLocal;
-  const eMaster = !ehSindicaLvl1 && (eAdminGlobal || perfilStr === 'master' || nivelNum === 1 || nivelNum === 0);
-  const eSupervisor = !ehSindicaLvl1 && !eAdminGlobal && (perfilStr === 'supervisor' || nivelNum === 2);
-  const eOperador = (perfilStr === 'operador' || perfilStr === 'porteiro' || nivelNum >= 3) && !eAdmin && !eSupervisor && !ehSindicaLvl1;
-  const eSindico = ehSindicaLvl1 || perfilStr === 'sindico' || perfilStr === 'síndico' || nivelNum === 4;
+  const eAdminCondominio = !ehSindicaLvl1 && !eAdminGlobal && ehAdminCondominio(usuarioLogado);
+  const eAdminLocal = eAdminCondominio;
+  const eAdmin = eAdminGlobal || eAdminCondominio;
+  const eSupervisor = !ehSindicaLvl1 && !eAdminGlobal && !eAdminCondominio && ehPerfilSupervisor(usuarioLogado);
+  const eOperador = (perfilPadraoLogado === 'operador' || nivelNum >= 3) && !eAdmin && !eSupervisor && !ehSindicaLvl1;
+  const eSindico = ehSindicaLvl1;
 
   // Permissões granulares de Cadastros (Cadastro Base - RBAC)
   const podeAcessarCadastros = eAdmin || ehSindicaLvl1 || verificarPermissao(usuarioLogado, 'cadastros', 'visualizar');
@@ -296,22 +296,22 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
   const podeGerenciarMoradores = podeCadastrarMorador || podeEditarMorador;
   const podeGerenciarVeiculos = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'gerenciar_veiculos') || verificarPermissao(usuarioLogado, 'cadastros', 'moradores'));
   const podeVincularTags = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'vincular_tags') || verificarPermissao(usuarioLogado, 'cadastros', 'moradores'));
-  const podeAlterarStatusAcessoMorador = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'status_acesso_morador') || eMaster || eSupervisor);
+  const podeAlterarStatusAcessoMorador = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'status_acesso_morador'));
   const podeExportarMoradores = eAdmin || ehSindicaLvl1 || verificarPermissao(usuarioLogado, 'cadastros', 'exportar_moradores') || verificarPermissao(usuarioLogado, 'historico_absoluto', 'exportar_csv');
 
-  const podeVerOperadores = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'visualizar_operadores') || verificarPermissao(usuarioLogado, 'cadastros', 'operadores') || verificarPermissao(usuarioLogado, 'cadastros', 'editar_operadores'));
-  const podeCadastrarOperadores = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'operadores') || verificarPermissao(usuarioLogado, 'cadastros', 'cadastrar_operadores'));
-  const podeEditarOperadores = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'editar_operadores'));
-  const podeAlterarSenhaOperador = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'alterar_senha_operador') || eMaster);
-  const podeExcluirOperadores = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'excluir_operadores') || verificarPermissao(usuarioLogado, 'cadastros', 'excluir'));
-  const podeGerenciarNiveis = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'gerenciar_niveis') || eMaster);
+  const podeVerOperadores = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'visualizar_operadores'));
+  const podeCadastrarOperadores = !eSindico && (eAdmin || (eAdminCondominio && verificarPermissao(usuarioLogado, 'cadastros', 'operadores')));
+  const podeEditarOperadores = !eSindico && (eAdmin || (eAdminCondominio && verificarPermissao(usuarioLogado, 'cadastros', 'editar_operadores')));
+  const podeAlterarSenhaOperador = !eSindico && (eAdmin || (eAdminCondominio && verificarPermissao(usuarioLogado, 'cadastros', 'alterar_senha_operador')));
+  const podeExcluirOperadores = !eSindico && (eAdmin || (eAdminCondominio && verificarPermissao(usuarioLogado, 'cadastros', 'excluir_operadores')));
+  const podeGerenciarNiveis = eAdminGlobal;
 
   const podeConfigurarCondominio = !eSindico && (eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'configurar_condominio'));
   const podeCadastrarNovosCondominios = eAdminGlobal;
   const podeExcluirCadastros = eAdmin || verificarPermissao(usuarioLogado, 'cadastros', 'excluir');
 
-  // Diretriz de Segurança RBAC: Permite customizar numeração se for Admin/Master/Supervisor ou tiver permissão ativa
-  const podeCustomizarEstrutura = !eSindico && (eAdmin || eMaster || (eSupervisor && podeConfigurarCondominio) || (eAdminGlobal && verificarPermissao(usuarioLogado, 'cadastros', 'condominios')));
+  // Diretriz de Segurança RBAC: Permite customizar numeração se for Admin ou Supervisor com permissão explícita
+  const podeCustomizarEstrutura = !eSindico && (eAdmin || (eSupervisor && podeConfigurarCondominio) || (eAdminGlobal && verificarPermissao(usuarioLogado, 'cadastros', 'condominios')));
 
   // Estado da Unidade que a Síndica está acessando no momento
   const [unidadeAcessadaManual, setUnidadeAcessadaManual] = useState<string>(() => {
@@ -480,32 +480,35 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
 
   const [mapaVinculosOperadores, setMapaVinculosOperadores] = useState<Record<string, string[]>>({});
 
-  // ISOLAMENTO RIGOROSO MULTI-TENANT: Operadores pertencem ao condomínio ativo ou possuem vínculo explícito (Supervisor)
+  // ISOLAMENTO RIGOROSO MULTI-TENANT: Operadores pertencem ao condomínio ativo ou possuem vínculo explícito (Supervisor / Global)
   const operadoresDoCondoAtivo = useMemo(() => {
     if (!isCondominioIdValido(condoAtivoId)) return [];
     const cidNorm = String(condoAtivoId).trim().toLowerCase();
     return operadores.filter(op => {
       const opCid = String(op.condominio_id || '').trim().toLowerCase();
       if (opCid === cidNorm) return true;
-      const links = mapaVinculosOperadores[op.id] || [];
-      return links.some(lid => String(lid).trim().toLowerCase() === cidNorm);
+      if (eAdminGlobal || eSupervisor) {
+        const links = mapaVinculosOperadores[op.id] || [];
+        return links.some(lid => String(lid).trim().toLowerCase() === cidNorm);
+      }
+      return false;
     });
-  }, [operadores, condoAtivoId, mapaVinculosOperadores]);
+  }, [operadores, condoAtivoId, mapaVinculosOperadores, eAdminGlobal, eSupervisor]);
 
   // Lista visível de operadores filtrada por permissões e pelo condomínio ativo
   const operadoresVisiveis = useMemo(() => {
     return operadoresDoCondoAtivo.filter(op => {
-      const ehContaGlobal = op.acesso_global_condominios === true || op.perfil === 'admin_geral';
+      const ehContaGlobal = op.acesso_global_condominios === true || normalizarPerfilOperador(op) === 'admin_geral';
       if (ehContaGlobal && !eAdminGlobal) {
         return false;
       }
-      const ehContaAdmin = op.perfil?.toLowerCase() === 'admin' || Number(op.nivel_acesso) === 0;
-      if (ehContaAdmin && !eAdmin) {
+      const ehContaAdminCondo = normalizarPerfilOperador(op) === 'admin_condominio';
+      if (ehContaAdminCondo && !eAdmin && op.id !== usuarioLogado?.id) {
         return false;
       }
       return true;
     });
-  }, [operadoresDoCondoAtivo, eAdminGlobal, eAdmin]);
+  }, [operadoresDoCondoAtivo, eAdminGlobal, eAdmin, usuarioLogado?.id]);
   const [loading, setLoading] = useState(false);
   const [mensagem, setMensagem] = useState({ tipo: '', texto: '' });
 
@@ -773,10 +776,24 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const b64 = await comprimirImagemBase64(file, 400, 400, 0.82);
-      setFotoMorador(b64);
-    } catch (err) {
+      const targetCondo = isCondominioIdValido(condominioIdMorador) ? condominioIdMorador : condoAtivoId;
+      if (isCondominioIdValido(targetCondo) && (typeof navigator === 'undefined' || navigator.onLine)) {
+        const up = await uploadFotoComprimidaStorage({
+          file,
+          pasta: 'moradores',
+          condominioId: targetCondo,
+          maxWidth: 480,
+          maxHeight: 480,
+          qualidade: 0.78
+        });
+        setFotoMorador(up.storagePath);
+      } else {
+        const b64 = await comprimirImagemBase64(file, 400, 400, 0.82);
+        setFotoMorador(b64);
+      }
+    } catch (err: any) {
       console.error('Erro ao processar foto do morador:', err);
+      setMensagem({ tipo: 'erro', texto: err?.message || 'Não foi possível enviar a foto do morador.' });
     }
   };
 
@@ -784,10 +801,24 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const b64 = await comprimirImagemBase64(file, 400, 400, 0.82);
-      setFotoOperador(b64);
-    } catch (err) {
+      const targetCondo = isCondominioIdValido(condominioIdOperador) ? condominioIdOperador : condoAtivoId;
+      if (isCondominioIdValido(targetCondo) && (typeof navigator === 'undefined' || navigator.onLine)) {
+        const up = await uploadFotoComprimidaStorage({
+          file,
+          pasta: 'operadores',
+          condominioId: targetCondo,
+          maxWidth: 480,
+          maxHeight: 480,
+          qualidade: 0.78
+        });
+        setFotoOperador(up.storagePath);
+      } else {
+        const b64 = await comprimirImagemBase64(file, 400, 400, 0.82);
+        setFotoOperador(b64);
+      }
+    } catch (err: any) {
       console.error('Erro ao processar foto do operador:', err);
+      setMensagem({ tipo: 'erro', texto: err?.message || 'Não foi possível enviar a foto do operador.' });
     }
   };
   const [statusAcessoMorador, setStatusAcessoMorador] = useState<'liberado' | 'bloqueado' | 'aviso'>('liberado');
@@ -1546,9 +1577,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
 
   const salvarOperador = async (e: React.FormEvent) => {
     e.preventDefault();
-    const podeGerenciarOperadores = eAdmin || eMaster || (idEdicao ? podeEditarOperadores : podeCadastrarOperadores);
+    const editandoProprioPerfil = Boolean(idEdicao && usuarioLogado?.id && idEdicao === usuarioLogado.id);
+    const podeGerenciarOperadores = eAdmin && (idEdicao ? podeEditarOperadores : podeCadastrarOperadores);
     if (!podeGerenciarOperadores) {
-      setMensagem({ tipo: 'erro', texto: 'Seu perfil de acesso não possui permissão para cadastrar ou gerenciar operadores.' });
+      setMensagem({ tipo: 'erro', texto: 'Apenas Administradores autorizados podem cadastrar ou gerenciar operadores.' });
       return;
     }
 
@@ -1577,67 +1609,105 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
 
     try {
       let nivelNum = 3;
-      let perfilStr = 'operador';
+      let perfilStr: 'admin_geral' | 'admin_condominio' | 'supervisor' | 'operador' = 'operador';
       let customId: string | null = null;
 
       if (nivelAcesso.startsWith('nivel_')) {
         const parsed = parseInt(nivelAcesso.replace('nivel_', ''), 10);
         nivelNum = !isNaN(parsed) ? parsed : 3;
-        perfilStr = nivelNum === 0 ? 'admin' : nivelNum === 1 ? 'master' : nivelNum === 2 ? 'supervisor' : nivelNum === 4 ? 'sindico' : 'operador';
+        perfilStr =
+          nivelNum === 0
+            ? 'admin_geral'
+            : nivelNum === 1
+              ? 'admin_condominio'
+              : nivelNum === 2
+                ? 'supervisor'
+                : 'operador';
         customId = nivelAcesso;
       } else if (!isNaN(parseInt(nivelAcesso, 10)) && !nivelAcesso.startsWith('custom_')) {
         nivelNum = parseInt(nivelAcesso, 10);
-        perfilStr = nivelNum === 0 ? 'admin' : nivelNum === 1 ? 'master' : nivelNum === 2 ? 'supervisor' : nivelNum === 4 ? 'sindico' : 'operador';
+        perfilStr =
+          nivelNum === 0
+            ? 'admin_geral'
+            : nivelNum === 1
+              ? 'admin_condominio'
+              : nivelNum === 2
+                ? 'supervisor'
+                : 'operador';
         customId = `nivel_${nivelNum}`;
       } else {
-        const objCustom = listaNiveis.find(n => n.id === nivelAcesso);
         customId = nivelAcesso;
-        perfilStr = objCustom?.nome || 'custom';
+        perfilStr = 'operador';
         nivelNum = 3;
       }
 
-      // Não-administradores não podem criar ou promover usuários para nível Admin/Master
-      if (!eAdmin && nivelNum <= 1) {
-        setMensagem({ tipo: 'erro', texto: 'Apenas Administradores podem conceder nível de Administrador.' });
+      // Não-globais não podem criar ou promover usuários para Administrador Geral
+      if (!eAdminGlobal && (nivelNum === 0 || perfilStr === 'admin_geral')) {
+        setMensagem({ tipo: 'erro', texto: 'Somente o Administrador Geral pode criar ou conceder perfil de Administrador Geral.' });
         setLoading(false);
         return;
       }
 
       // Regra C: Apenas Administrador Global pode conceder acesso_global_condominios
-      const acessoGlobalFinal = eAdminGlobal ? Boolean(acessoGlobalOperador) : false;
+      const acessoGlobalFinal = eAdminGlobal ? Boolean(acessoGlobalOperador || perfilStr === 'admin_geral') : false;
       if (!eAdminGlobal && acessoGlobalOperador) {
         setMensagem({ tipo: 'erro', texto: 'Somente um Administrador Geral pode conceder acesso global a múltiplos condomínios.' });
         setLoading(false);
         return;
       }
 
-      const ehSupervisorAlvo =
-        nivelNum === 2 ||
-        perfilStr.toLowerCase() === 'supervisor' ||
-        (funcaoOperador === 'Outro' ? funcaoCustomizada : funcaoOperador).toLowerCase().includes('supervisor');
+      const opOriginal = idEdicao ? operadores.find((o) => o.id === idEdicao) : null;
 
-      // REGRA OBRIGATÓRIA MULTI-TENANT: Todo operador deve estar vinculado a condomínio(s) válido(s)
-      let targetCondominioId: string | null = isCondominioIdValido(condominioIdOperador)
-        ? condominioIdOperador
-        : (isCondominioIdValido(condoAtivoId) ? condoAtivoId : (usuarioLogado?.condominio_id || null));
-
-      if (!eAdminGlobal && !eSupervisor) {
-        targetCondominioId = condoAtivoId || usuarioLogado?.condominio_id || null;
+      // Proteção local de Admin de Condomínio
+      if (!eAdminGlobal && opOriginal) {
+        if (opOriginal.acesso_global_condominios === true || normalizarPerfilOperador(opOriginal) === 'admin_geral') {
+          setMensagem({ tipo: 'erro', texto: 'Administrador de Condomínio não pode alterar contas de Administrador Geral.' });
+          setLoading(false);
+          return;
+        }
+        if (editandoProprioPerfil) {
+          const perfilOriginal = normalizarPerfilOperador(opOriginal);
+          const nivelOriginal = Number(opOriginal.nivel_acesso ?? 1);
+          const mudouPrivilegio =
+            perfilStr !== perfilOriginal ||
+            nivelNum !== nivelOriginal ||
+            Boolean(ativoOperador) !== Boolean(opOriginal.ativo !== false);
+          if (mudouPrivilegio) {
+            setMensagem({ tipo: 'erro', texto: 'Você não pode alterar seu próprio perfil, privilégios, status ou vínculo condominial.' });
+            setLoading(false);
+            return;
+          }
+        }
       }
 
-      if (!isCondominioIdValido(targetCondominioId)) {
-        const primeiroValido = condominios.find(c => isCondominioIdValido(c.id))?.id;
-        targetCondominioId = primeiroValido || null;
-      }
+      const ehSupervisorAlvo = perfilStr === 'supervisor';
 
-      if (!targetCondominioId) {
-        setMensagem({ tipo: 'erro', texto: 'Selecione obrigatoriamente o condomínio principal ao qual este operador pertence.' });
+      // REGRA OBRIGATÓRIA MULTI-TENANT: Admin de Condomínio atua exclusivamente no seu próprio condomínio principal
+      let targetCondominioId: string | null = eAdminGlobal
+        ? (isCondominioIdValido(condominioIdOperador)
+            ? condominioIdOperador
+            : (isCondominioIdValido(condoAtivoId) ? condoAtivoId : (usuarioLogado?.condominio_id || null)))
+        : (isCondominioIdValido(usuarioLogado?.condominio_id) ? usuarioLogado.condominio_id : null);
+
+      if (!eAdminGlobal && opOriginal && isCondominioIdValido(opOriginal.condominio_id) && opOriginal.condominio_id !== targetCondominioId) {
+        setMensagem({ tipo: 'erro', texto: 'Administrador de Condomínio não pode gerenciar nem transferir operadores de outros condomínios.' });
         setLoading(false);
         return;
       }
 
-      // Regra B vs Regra A: Supervisor pode ter N vínculos explícitos; Porteiro/Síndico ficam restritos ao condomínio principal
-      const condominiosPermitidosFinais = ehSupervisorAlvo
+      if (eAdminGlobal && !isCondominioIdValido(targetCondominioId)) {
+        const primeiroValido = condominios.find(c => isCondominioIdValido(c.id))?.id;
+        targetCondominioId = primeiroValido || null;
+      }
+
+      if (!targetCondominioId || !podeGerenciarOperadoresNoCondominio(usuarioLogado, targetCondominioId)) {
+        setMensagem({ tipo: 'erro', texto: 'Você não possui autorização administrativa para gerenciar operadores neste condomínio.' });
+        setLoading(false);
+        return;
+      }
+
+      // Regra B vs Regra A: Supervisor pode ter N vínculos explícitos; Admin Local / Porteiro / Síndico ficam no condomínio principal
+      const condominiosPermitidosFinais = ehSupervisorAlvo && eAdminGlobal
         ? Array.from(new Set([targetCondominioId, ...condominiosVinculadosOperador].filter(id => isCondominioIdValido(id))))
         : [targetCondominioId];
 
@@ -1654,6 +1724,8 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         unidade_acesso: unidadeFinal,
         unidade: unidadeFinal
       };
+
+      const fotoUrlNormalizada = normalizarCaminhoStorageParaBanco(fotoOperador) || null;
 
       // Provisiona / atualiza credencial no Supabase Auth via backend seguro quando e-mail ou senha informados
       let authUserIdResolvido: string | null = authUserIdEdicao;
@@ -1673,7 +1745,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
             email: emailLimpo,
             password: senhaLimpa || undefined,
             nome: nomeOperador.trim(),
-            condominio_id: targetCondominioId
+            condominio_id: targetCondominioId,
+            perfil: perfilStr,
+            nivel_acesso: nivelNum,
+            acesso_global_condominios: acessoGlobalFinal
           })
         });
         const provData = await respProvision.json().catch(() => ({}));
@@ -1696,7 +1771,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           perfil: perfilStr,
           funcao: funcaoFinal,
           cargo: funcaoFinal,
-          foto_url: fotoOperador || null,
+          foto_url: fotoUrlNormalizada,
           condominio_id: targetCondominioId,
           acesso_global_condominios: acessoGlobalFinal,
           permissoes: permissoesFinais,
@@ -1708,7 +1783,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           .from('operadores')
           .update(dadosAtualizacao)
           .eq('id', idEdicao);
-        if (!eAdminGlobal && !eSupervisor && isCondominioIdValido(targetCondominioId)) {
+        if (!eAdminGlobal && isCondominioIdValido(targetCondominioId)) {
           updateQuery = updateQuery.eq('condominio_id', targetCondominioId);
         }
         let { error } = await updateQuery;
@@ -1732,7 +1807,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
             nome: nomeOperador.trim(),
             login: loginOperador.trim().toLowerCase(),
             nivel_acesso: nivelNum,
-            foto_url: fotoOperador || null,
+            foto_url: fotoUrlNormalizada,
             condominio_id: targetCondominioId,
             ativo: Boolean(ativoOperador)
           };
@@ -1777,7 +1852,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           perfil: perfilStr,
           funcao: funcaoFinal,
           cargo: funcaoFinal,
-          foto_url: fotoOperador || null,
+          foto_url: fotoUrlNormalizada,
           condominio_id: targetCondominioId,
           acesso_global_condominios: acessoGlobalFinal,
           permissoes: permissoesFinais,
@@ -1842,6 +1917,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
   };
 
   const mudarStatusContaOperador = async (novoAtivo: boolean) => {
+    if (!eAdminGlobal && idEdicao && idEdicao === usuarioLogado?.id) {
+      setMensagem({ tipo: 'erro', texto: 'Você não pode alterar o status da sua própria conta.' });
+      return;
+    }
     setAtivoOperador(novoAtivo);
     if (idEdicao) {
       try {
@@ -1874,6 +1953,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
       setMensagem({ tipo: 'erro', texto: 'Seu perfil de acesso não possui permissão para editar operadores.' });
       return;
     }
+    if (!eAdminGlobal && (op.acesso_global_condominios === true || normalizarPerfilOperador(op) === 'admin_geral')) {
+      setMensagem({ tipo: 'erro', texto: 'Somente o Administrador Geral pode editar contas globais.' });
+      return;
+    }
     setIdEdicao(op.id);
     setNomeOperador(op.nome || '');
     setLoginOperador(op.login || '');
@@ -1888,9 +1971,18 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
     const linksAtuais = mapaVinculosOperadores[op.id] || (isCondominioIdValido(cidPrincipal) ? [cidPrincipal] : []);
     setCondominiosVinculadosOperador(linksAtuais);
 
+    const perfilNorm = normalizarPerfilOperador(op);
     const nivelDefinido = op.nivel_acesso_custom_id ||
       (op.nivel_acesso !== undefined && op.nivel_acesso !== null && !isNaN(Number(op.nivel_acesso)) ? `nivel_${op.nivel_acesso}` : null) ||
-      (op.perfil === 'admin' ? 'nivel_0' : op.perfil === 'master' ? 'nivel_1' : op.perfil === 'supervisor' ? 'nivel_2' : (op.perfil === 'sindico' || op.perfil === 'Síndico') ? 'nivel_4' : 'nivel_3');
+      (perfilNorm === 'admin_geral'
+        ? 'nivel_0'
+        : perfilNorm === 'admin_condominio'
+          ? 'nivel_1'
+          : perfilNorm === 'supervisor'
+            ? 'nivel_2'
+            : ehPerfilSindico(op)
+              ? 'nivel_4'
+              : 'nivel_3');
     setNivelAcesso(nivelDefinido);
     const rawUnid = (op.unidade || op.permissoes?.unidade_acesso || op.permissoes?.unidade || '').trim();
     setUnidadeOperador(rawUnid && rawUnid.toUpperCase() !== 'TODAS' && rawUnid !== '*' ? rawUnid : 'TODAS');
@@ -1919,6 +2011,14 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
   };
 
   const alternarStatusOperador = async (op: any) => {
+    if (!eAdminGlobal && op.id === usuarioLogado?.id) {
+      setMensagem({ tipo: 'erro', texto: 'Você não pode desativar a sua própria conta.' });
+      return;
+    }
+    if (!eAdminGlobal && (op.acesso_global_condominios === true || normalizarPerfilOperador(op) === 'admin_geral')) {
+      setMensagem({ tipo: 'erro', texto: 'Somente o Administrador Geral pode alterar o status de contas globais.' });
+      return;
+    }
     const novoStatus = !(op.ativo !== false);
     try {
       let q = supabase
@@ -1985,7 +2085,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
       cpf: cpfMorador.trim() || null,
       rg: rgMorador.trim() || null,
       email: emailMorador.trim() || null,
-      foto_url: fotoMorador || null,
+      foto_url: normalizarCaminhoStorageParaBanco(fotoMorador) || null,
       tag_rfid: tagRfidMorador.trim() || null,
       codigo_acesso: codigoAcessoMorador.trim() || null,
       status_acesso: statusAcessoMorador || 'liberado',
@@ -3376,7 +3476,12 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                 <div className="flex flex-col sm:flex-row items-center gap-5 p-4 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
                   <div className="relative group shrink-0">
                     {fotoOperador ? (
-                      <img src={fotoOperador} alt="Foto Operador" loading="lazy" decoding="async" className="w-20 h-20 rounded-2xl object-cover border-2 border-blue-500 shadow-md" />
+                      <ImagemOtimizada
+                        src={fotoOperador}
+                        alt="Foto Operador"
+                        containerClassName="w-20 h-20 rounded-2xl overflow-hidden border-2 border-blue-500 shadow-md"
+                        className="w-full h-full object-cover"
+                      />
                     ) : (
                       <div className="w-20 h-20 rounded-2xl bg-slate-800 text-blue-400 font-black text-2xl flex items-center justify-center border border-slate-700 shadow-inner">
                         {nomeOperador ? nomeOperador.charAt(0).toUpperCase() : 'OP'}
@@ -3634,8 +3739,9 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                     </label>
                     <select
                       value={nivelAcesso}
+                      disabled={!eAdminGlobal && Boolean(idEdicao && idEdicao === usuarioLogado?.id)}
                       onChange={(e) => handleMudarNivelOperador(e.target.value)}
-                      className="w-full p-3 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-xl text-sm font-bold text-slate-900 dark:text-slate-100 focus:bg-white dark:focus:bg-slate-900 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 focus:outline-none transition cursor-pointer"
+                      className="w-full p-3 bg-slate-50 dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-xl text-sm font-bold text-slate-900 dark:text-slate-100 focus:bg-white dark:focus:bg-slate-900 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 focus:outline-none transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                     >
                       {listaNiveis.map((n) => {
                         if (n.id === 'nivel_0' && !eAdminGlobal && nivelAcesso !== '0' && nivelAcesso !== 'nivel_0') {
@@ -3648,6 +3754,11 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                         );
                       })}
                     </select>
+                    {!eAdminGlobal && idEdicao && idEdicao === usuarioLogado?.id && (
+                      <p className="text-[11px] text-amber-600 dark:text-amber-400 font-semibold mt-1">
+                        Por segurança, Administradores de Condomínio não podem alterar o próprio perfil ou privilégios.
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -3692,7 +3803,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {(eAdminGlobal || eSupervisor) && (
+                  {eAdminGlobal && (
                     <div className="md:col-span-2">
                       <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1.5">
                         Condomínio Principal *
@@ -3717,7 +3828,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                     </div>
                   )}
 
-                  {(nivelAcesso === 'nivel_2' || funcaoOperador === 'Supervisor') && (
+                  {eAdminGlobal && (nivelAcesso === 'nivel_2' || funcaoOperador === 'Supervisor') && (
                     <div className="md:col-span-2 space-y-2 p-4 rounded-xl bg-blue-50/50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800/60">
                       <label className="block text-xs font-black text-blue-900 dark:text-blue-200 uppercase tracking-wider">
                         Condomínios Autorizados para Supervisão (operador_condominios)
@@ -3864,9 +3975,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                     <div className="grid grid-cols-2 gap-3">
                       <button
                         type="button"
+                        disabled={!eAdminGlobal && Boolean(idEdicao && idEdicao === usuarioLogado?.id)}
                         onClick={() => mudarStatusContaOperador(true)}
                         title="Ativar acesso do operador"
-                        className={`py-3 px-4 rounded-xl text-xs font-black flex items-center justify-center gap-2 transition cursor-pointer border ${
+                        className={`py-3 px-4 rounded-xl text-xs font-black flex items-center justify-center gap-2 transition cursor-pointer border disabled:opacity-50 disabled:cursor-not-allowed ${
                           ativoOperador
                             ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm shadow-emerald-600/30'
                             : 'bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-900'
@@ -3877,9 +3989,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                       </button>
                       <button
                         type="button"
+                        disabled={!eAdminGlobal && Boolean(idEdicao && idEdicao === usuarioLogado?.id)}
                         onClick={() => mudarStatusContaOperador(false)}
                         title="Desativar acesso e revogar login deste operador"
-                        className={`py-3 px-4 rounded-xl text-xs font-black flex items-center justify-center gap-2 transition cursor-pointer border ${
+                        className={`py-3 px-4 rounded-xl text-xs font-black flex items-center justify-center gap-2 transition cursor-pointer border disabled:opacity-50 disabled:cursor-not-allowed ${
                           !ativoOperador
                             ? 'bg-red-600 text-white border-red-600 shadow-sm shadow-red-600/30'
                             : 'bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-400 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-900'
@@ -3957,7 +4070,12 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                 <div className="flex flex-col sm:flex-row items-center gap-5 p-4 rounded-xl bg-purple-50/50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800">
                   <div className="relative group shrink-0">
                     {fotoMorador ? (
-                      <img src={fotoMorador} alt="Foto Morador" loading="lazy" decoding="async" className="w-20 h-20 rounded-2xl object-cover border-2 border-purple-500 shadow-md" />
+                      <ImagemOtimizada
+                        src={fotoMorador}
+                        alt="Foto Morador"
+                        containerClassName="w-20 h-20 rounded-2xl overflow-hidden border-2 border-purple-500 shadow-md"
+                        className="w-full h-full object-cover"
+                      />
                     ) : (
                       <div className="w-20 h-20 rounded-2xl bg-purple-100 dark:bg-purple-950 text-purple-800 dark:text-purple-300 font-black text-2xl flex items-center justify-center border border-purple-300 dark:border-purple-800 shadow-inner">
                         {nomeMorador ? nomeMorador.charAt(0).toUpperCase() : 'MO'}
@@ -4802,14 +4920,13 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2.5 min-w-0">
                         {op.foto_url ? (
-                          <img 
-                            src={op.foto_url} 
-                            alt={op.nome} 
-                            loading="lazy" 
-                            decoding="async" 
-                            className={`w-9 h-9 rounded-lg object-cover border shrink-0 ${
+                          <ImagemOtimizada
+                            src={op.foto_url}
+                            alt={op.nome}
+                            containerClassName={`w-9 h-9 rounded-lg overflow-hidden border shrink-0 ${
                               estaAtivo ? 'border-slate-200 dark:border-slate-700' : 'border-red-300 dark:border-red-800 opacity-60'
-                            }`} 
+                            }`}
+                            className="w-full h-full object-cover"
                           />
                         ) : (
                           <div className={`w-9 h-9 rounded-lg font-bold text-xs flex items-center justify-center shrink-0 border ${
@@ -4839,9 +4956,9 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                       <div className="flex items-center gap-1 shrink-0">
                         <button
                           type="button"
-                          disabled={!eAdmin && !podeEditarOperadores}
+                          disabled={(!eAdmin && !podeEditarOperadores) || (!eAdminGlobal && op.id === usuarioLogado?.id)}
                           onClick={() => (eAdmin || podeEditarOperadores) && alternarStatusOperador(op)}
-                          title={estaAtivo ? "Clique para desativar login de ex-funcionário" : "Clique para reativar"}
+                          title={(!eAdminGlobal && op.id === usuarioLogado?.id) ? "Você não pode alterar seu próprio status" : (estaAtivo ? "Clique para desativar login de ex-funcionário" : "Clique para reativar")}
                           className={`px-2 py-0.5 rounded-lg text-[10px] font-bold transition cursor-pointer border ${
                             estaAtivo
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-red-50 hover:text-red-700 hover:border-red-200'
@@ -5491,11 +5608,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
                           <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-2.5">
                             <div className="flex items-center gap-2.5 min-w-0">
                               {m.foto_url ? (
-                                <img 
+                                <ImagemOtimizada 
                                   src={m.foto_url} 
                                   alt={m.nome} 
-                                  loading="lazy"
-                                  decoding="async"
+                                  permitirAmpliar={true}
                                   className="w-11 h-11 rounded-2xl object-cover shrink-0 border-2 border-purple-400 shadow-2xs" 
                                 />
                               ) : (

@@ -392,15 +392,27 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
     return jsonResponse({ error: 'A senha deve possuir entre 6 e 128 caracteres.' }, 400);
   }
 
+  const perfilSolicitado = String(body.perfil || '').trim().toLowerCase();
+  const nivelSolicitado = body.nivel_acesso !== undefined && body.nivel_acesso !== null ? Number(body.nivel_acesso) : null;
+
   if (!auth.context.eAdminGlobal) {
-    if (body.acesso_global_condominios === true || body.global === true) {
-      return jsonResponse({ error: 'Operações globais são restritas ao administrador global autorizado.' }, 403);
+    if (body.acesso_global_condominios === true || body.global === true || perfilSolicitado === 'admin_geral' || nivelSolicitado === 0) {
+      return jsonResponse(
+        { error: 'Administrador de condomínio não pode conceder acesso global nem criar Administrador Geral.' },
+        403
+      );
     }
     if (!isValidUuid(targetCondominioId)) {
       return jsonResponse({ error: 'Condomínio de destino obrigatório e deve ser um UUID válido.' }, 400);
     }
     if (!podeGerenciarOperadores(auth.context, targetCondominioId)) {
       return jsonResponse({ error: 'Sem permissão para provisionar operadores neste condomínio.' }, 403);
+    }
+    if (operadorIdAlvo && operadorIdAlvo === auth.context.operador.id) {
+      return jsonResponse(
+        { error: 'Administrador de condomínio não pode alterar seu próprio perfil, privilégios ou vínculo pelo endpoint administrativo.' },
+        403
+      );
     }
     if (authUserIdInformado && !operadorIdAlvo) {
       return jsonResponse(
@@ -422,7 +434,7 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
 
   if (operadorIdAlvo) {
     const opRes = await fetchFn(
-      `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios,email&id=eq.${encodeURIComponent(operadorIdAlvo)}&limit=1`,
+      `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios,email,perfil,nivel_acesso&id=eq.${encodeURIComponent(operadorIdAlvo)}&limit=1`,
       { headers: adminHeaders }
     );
     if (!opRes.ok) {
@@ -437,11 +449,11 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
     }
 
     if (!auth.context.eAdminGlobal) {
-      if (opTarget.acesso_global_condominios === true) {
-        return jsonResponse({ error: 'Gestor local não pode alterar contas administrativas globais.' }, 403);
+      if (opTarget.acesso_global_condominios === true || String(opTarget.perfil || '').toLowerCase() === 'admin_geral') {
+        return jsonResponse({ error: 'Administrador de condomínio não pode alterar contas administrativas globais.' }, 403);
       }
-      if (!isCondominioAutorizado(auth.context, opTarget.condominio_id)) {
-        return jsonResponse({ error: 'Não autorizado a alterar credenciais de operador de outro condomínio.' }, 403);
+      if (String(opTarget.condominio_id || '').trim() !== String(auth.context.operador.condominio_id || '').trim()) {
+        return jsonResponse({ error: 'Não autorizado a alterar ou transferir operador de outro condomínio.' }, 403);
       }
       if (String(opTarget.condominio_id || '').trim() !== targetCondominioId) {
         return jsonResponse({ error: 'O condomínio informado diverge do condomínio real do operador-alvo.' }, 403);
@@ -496,7 +508,7 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
 
     if (email) {
       const existingOpByEmailRes = await fetchFn(
-        `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios&email=ilike.${encodeURIComponent(email)}&limit=5`,
+        `${cfg.url}/rest/v1/operadores?select=id,condominio_id,auth_user_id,acesso_global_condominios,perfil&email=ilike.${encodeURIComponent(email)}&limit=5`,
         { headers: adminHeaders }
       );
       if (!existingOpByEmailRes.ok) {
@@ -507,7 +519,11 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
         const conflitoOutro = existingRows.find(r => r.id !== operadorIdAlvo);
         if (conflitoOutro) {
           if (!auth.context.eAdminGlobal) {
-            if (conflitoOutro.acesso_global_condominios === true || !isCondominioAutorizado(auth.context, conflitoOutro.condominio_id)) {
+            if (
+              conflitoOutro.acesso_global_condominios === true ||
+              String(conflitoOutro.perfil || '').toLowerCase() === 'admin_geral' ||
+              String(conflitoOutro.condominio_id || '').trim() !== String(auth.context.operador.condominio_id || '').trim()
+            ) {
               return jsonResponse(
                 { error: 'Não autorizado: este e-mail já pertence a um operador global ou de outro condomínio.' },
                 403
