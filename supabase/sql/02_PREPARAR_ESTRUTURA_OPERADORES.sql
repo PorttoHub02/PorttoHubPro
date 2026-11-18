@@ -57,6 +57,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_operadores_email_lower
 CREATE INDEX IF NOT EXISTS idx_operadores_condominio_ativo
   ON public.operadores(condominio_id, ativo);
 
+-- Padronização oficial de perfis (não destrutiva):
+-- admin_geral | admin_condominio | supervisor | operador
+UPDATE public.operadores
+SET perfil = 'admin_geral', updated_at = NOW()
+WHERE COALESCE(acesso_global_condominios, FALSE) = TRUE
+  AND lower(COALESCE(perfil, '')) <> 'admin_geral';
+
+UPDATE public.operadores
+SET perfil = 'admin_condominio', updated_at = NOW()
+WHERE COALESCE(acesso_global_condominios, FALSE) = FALSE
+  AND lower(COALESCE(perfil, '')) IN ('admin', 'admin_geral', 'master', 'admin_local');
+
+UPDATE public.operadores
+SET perfil = 'supervisor', updated_at = NOW()
+WHERE COALESCE(acesso_global_condominios, FALSE) = FALSE
+  AND lower(COALESCE(perfil, '')) = 'supervisor';
+
+UPDATE public.operadores
+SET perfil = 'operador', updated_at = NOW()
+WHERE COALESCE(acesso_global_condominios, FALSE) = FALSE
+  AND lower(COALESCE(perfil, '')) NOT IN ('admin_condominio', 'supervisor', 'operador');
+
 COMMIT;
 
 NOTIFY pgrst, 'reload schema';

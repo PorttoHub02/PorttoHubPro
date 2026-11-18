@@ -151,3 +151,40 @@ SELECT * FROM (
     ) = 0 THEN 'OK' ELSE 'ATENCAO' END
 ) resumo
 ORDER BY ordem;
+
+-- 8. CONFERE PERFIS PADRONIZADOS E ASSINATURAS DE FUNCOES OFICIAIS
+SELECT
+  COALESCE(NULLIF(trim(perfil), ''), '(vazio)') AS perfil,
+  COUNT(*) AS total,
+  COUNT(*) FILTER (WHERE COALESCE(acesso_global_condominios, FALSE) = TRUE) AS com_acesso_global
+FROM public.operadores
+GROUP BY 1
+ORDER BY 1;
+
+SELECT
+  p.proname AS funcao,
+  pg_get_function_identity_arguments(p.oid) AS argumentos
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN (
+    'operador_atual_id',
+    'operador_tem_acesso_global',
+    'operador_pode_gerenciar_operadores',
+    'operador_pode_acessar_condominio',
+    'operador_preserva_proprio_perfil',
+    'operador_pode_editar_alvo_local',
+    'proteger_campos_operador',
+    'validar_e_consumir_passe_qr'
+  )
+ORDER BY p.proname, argumentos;
+
+SELECT
+  tgname AS trigger_nome,
+  tgenabled AS status
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname = 'operadores'
+  AND NOT t.tgisinternal;

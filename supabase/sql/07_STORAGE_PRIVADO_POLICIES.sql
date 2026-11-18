@@ -44,8 +44,13 @@ DROP POLICY IF EXISTS "porttohub_storage_insert" ON storage.objects;
 DROP POLICY IF EXISTS "porttohub_storage_update" ON storage.objects;
 DROP POLICY IF EXISTS "porttohub_storage_delete" ON storage.objects;
 
+DROP POLICY IF EXISTS "porttohub_storage_operadores_select" ON storage.objects;
+DROP POLICY IF EXISTS "porttohub_storage_operadores_insert" ON storage.objects;
+DROP POLICY IF EXISTS "porttohub_storage_operadores_update" ON storage.objects;
+DROP POLICY IF EXISTS "porttohub_storage_operadores_delete" ON storage.objects;
+
 -- 3. Políticas privadas isoladas por condominio_id no prefixo do path:
---    Formato obrigatório para novos uploads: condominios/<condominio_id>/<modulo>/<arquivo>
+--    Formato obrigatório para módulos condominiais: condominios/<condominio_id>/<modulo>/<arquivo>
 CREATE POLICY "porttohub_storage_select"
   ON storage.objects
   FOR SELECT
@@ -89,6 +94,57 @@ CREATE POLICY "porttohub_storage_delete"
     bucket_id = 'encomendas'
     AND (storage.foldername(name))[1] = 'condominios'
     AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
+  );
+
+-- 4. Políticas privadas de foto de perfil do próprio operador autenticado:
+--    Formato seguro sem vínculo condominial obrigatório: operadores/<auth.uid()>/<arquivo>
+--    Atende inclusive admin_geral sem condomínio ativo, sem conceder acesso a outros condomínios.
+CREATE POLICY "porttohub_storage_operadores_select"
+  ON storage.objects
+  FOR SELECT
+  TO authenticated
+  USING (
+    bucket_id = 'encomendas'
+    AND (storage.foldername(name))[1] = 'operadores'
+    AND (
+      (storage.foldername(name))[2] = auth.uid()::text
+      OR public.operador_tem_acesso_global()
+    )
+  );
+
+CREATE POLICY "porttohub_storage_operadores_insert"
+  ON storage.objects
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    bucket_id = 'encomendas'
+    AND (storage.foldername(name))[1] = 'operadores'
+    AND (storage.foldername(name))[2] = auth.uid()::text
+  );
+
+CREATE POLICY "porttohub_storage_operadores_update"
+  ON storage.objects
+  FOR UPDATE
+  TO authenticated
+  USING (
+    bucket_id = 'encomendas'
+    AND (storage.foldername(name))[1] = 'operadores'
+    AND (storage.foldername(name))[2] = auth.uid()::text
+  )
+  WITH CHECK (
+    bucket_id = 'encomendas'
+    AND (storage.foldername(name))[1] = 'operadores'
+    AND (storage.foldername(name))[2] = auth.uid()::text
+  );
+
+CREATE POLICY "porttohub_storage_operadores_delete"
+  ON storage.objects
+  FOR DELETE
+  TO authenticated
+  USING (
+    bucket_id = 'encomendas'
+    AND (storage.foldername(name))[1] = 'operadores'
+    AND (storage.foldername(name))[2] = auth.uid()::text
   );
 
 COMMIT;

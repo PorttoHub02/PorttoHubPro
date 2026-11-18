@@ -189,6 +189,7 @@ BEGIN
     'valido', TRUE,
     'consumido', TRUE,
     'registro_id', v_registro_id,
+    'registro', (SELECT to_jsonb(r) FROM public.registros_acesso r WHERE r.id = v_registro_id),
     'passe', to_jsonb(v_passe)
   );
 END;
