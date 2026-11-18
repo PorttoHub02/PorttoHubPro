@@ -2,15 +2,16 @@
 -- PORTTOHUB PRO — 09_VALIDACAO_SEGURANCA.sql (100% SOMENTE LEITURA)
 -- ============================================================================
 -- O QUE ESTE ARQUIVO FAZ:
---   Audita o banco de DESTINO após a aplicação dos scripts 02 a 08 para provar
---   que não restou nenhuma política permissiva USING (true), nenhum bucket
---   público indevido, nenhum acesso anônimo aberto e nenhum operador sem vínculo.
+--   Audita o banco de DESTINO após a aplicação dos scripts 02 a 08 e/ou 11
+--   para comprovar RLS ativa, ausência de USING (true), revogação de anon/PUBLIC
+--   em tabelas e funções SECURITY DEFINER/RPC, trigger INVOKER, Storage
+--   privado com 8 políticas e constraint chk_passes_qr_usos_limite validada.
 --
 -- ONDE EXECUTAR:
 --   Supabase Dashboard do DESTINO -> SQL Editor -> New query -> Run.
 -- ============================================================================
 
--- 1. GARANTE QUE NAO EXISTA NENHUMA POLITICA USING (true) / WITH CHECK (true)
+-- 1. POLITICAS PERMISSIVAS USING (true) / WITH CHECK (true) (Esperado: 0 linhas)
 SELECT
   schemaname,
   tablename,
@@ -26,41 +27,77 @@ WHERE schemaname IN ('public', 'storage')
   )
 ORDER BY schemaname, tablename;
 
--- 2. GARANTE QUE TODAS AS TABELAS PUBLIC ESTAO COM RLS ATIVO
+-- 2. TABELAS PUBLIC SEM RLS ATIVO OU SEM POLITICA (Esperado: 0 linhas)
 SELECT
   c.relname AS tabela,
-  c.relrowsecurity AS rls_ativo
+  c.relrowsecurity AS rls_ativo,
+  (SELECT COUNT(*) FROM pg_policies p WHERE p.schemaname = 'public' AND p.tablename = c.relname) AS qtd_politicas
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public'
   AND c.relkind = 'r'
-  AND c.relrowsecurity = FALSE
+  AND (
+    c.relrowsecurity = FALSE
+    OR NOT EXISTS (
+      SELECT 1 FROM pg_policies p WHERE p.schemaname = 'public' AND p.tablename = c.relname
+    )
+  )
 ORDER BY c.relname;
 
--- 3. GARANTE QUE O ROLE anon NAO POSSUI MAIS SELECT/INSERT/UPDATE/DELETE INDEVIDO
+-- 3. PRIVILEGIOS INDEVIDOS EM TABELAS PUBLIC (anon, PUBLIC ou TRUNCATE/TRIGGER/REFERENCES em authenticated)
 SELECT
   table_name,
   grantee,
   privilege_type
 FROM information_schema.role_table_grants
 WHERE table_schema = 'public'
-  AND grantee = 'anon'
-ORDER BY table_name, privilege_type;
+  AND (
+    grantee IN ('anon', 'PUBLIC')
+    OR (grantee = 'authenticated' AND privilege_type IN ('TRUNCATE', 'TRIGGER', 'REFERENCES'))
+  )
+ORDER BY table_name, grantee, privilege_type;
 
--- 4. CONFERE QUE O BUCKET 'encomendas' ESTA PRIVADO (bucket_publico = false)
-SELECT id, name, public AS bucket_publico, file_size_limit
+-- 4. PRIVILEGIOS EXECUTE INDEVIDOS EM FUNCOES DE SEGURANCA/RPC (anon ou public nao devem executar)
+SELECT
+  p.proname AS funcao,
+  pg_get_function_identity_arguments(p.oid) AS argumentos,
+  p.prosecdef AS is_security_definer,
+  has_function_privilege('anon', p.oid, 'EXECUTE') AS anon_executa,
+  has_function_privilege('public', p.oid, 'EXECUTE') AS public_executa,
+  has_function_privilege('authenticated', p.oid, 'EXECUTE') AS authenticated_executa
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN (
+    'operador_atual_id',
+    'operador_tem_acesso_global',
+    'operador_pode_gerenciar_operadores',
+    'operador_pode_acessar_condominio',
+    'operador_auth_email_corresponde',
+    'operador_tem_permissao_modulo',
+    'operador_preserva_proprio_perfil',
+    'operador_pode_editar_alvo_local',
+    'proteger_campos_operador',
+    'proteger_campos_passe_qr',
+    'validar_e_consumir_passe_qr'
+  )
+ORDER BY p.proname, argumentos;
+
+-- 5. BUCKET 'encomendas' E POLITICAS PRIVADAS DE STORAGE
+SELECT id, name, public AS bucket_publico, file_size_limit, allowed_mime_types
 FROM storage.buckets
 WHERE id = 'encomendas';
 
--- 5. CONFERE QUEM POSSUI acesso_global_condominios = TRUE
-SELECT id, nome, login, email, nivel_acesso, perfil, acesso_global_condominios, ativo
-FROM public.operadores
-WHERE acesso_global_condominios = TRUE;
+SELECT policyname, cmd, roles
+FROM pg_policies
+WHERE schemaname = 'storage'
+  AND tablename = 'objects'
+ORDER BY policyname;
 
--- 6. CONFERE OPERADORES AINDA SEM auth_user_id (devem ser 0 antes do go-live final)
-SELECT id, nome, login, email, condominio_id, ativo
-FROM public.operadores
-WHERE auth_user_id IS NULL AND COALESCE(ativo, TRUE) = TRUE;
+-- 6. CONFERENCIA DA CONSTRAINT chk_passes_qr_usos_limite
+SELECT conname, convalidated
+FROM pg_constraint
+WHERE conname = 'chk_passes_qr_usos_limite';
 
 -- 7. RESUMO CONSOLIDADO PARA CONFERENCIA RAPIDA NO SQL EDITOR
 SELECT * FROM (
@@ -77,7 +114,7 @@ SELECT * FROM (
       SELECT COUNT(*) FROM pg_policies
       WHERE schemaname IN ('public', 'storage')
         AND (COALESCE(qual, '') IN ('true', '(true)') OR COALESCE(with_check, '') IN ('true', '(true)'))
-    ) = 0 THEN 'OK' ELSE 'ATENCAO' END AS status
+    ) = 0 THEN 'OK' ELSE 'FALHA' END AS status
   UNION ALL
   SELECT
     2,
@@ -92,37 +129,147 @@ SELECT * FROM (
       SELECT COUNT(*) FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity = FALSE
-    ) = 0 THEN 'OK' ELSE 'ATENCAO' END
+    ) = 0 THEN 'OK' ELSE 'FALHA' END
   UNION ALL
   SELECT
     3,
-    '3. Permissoes diretas para anon em public',
+    '3. Tabelas public sem nenhuma politica RLS',
+    (
+      SELECT COUNT(*) FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'r'
+        AND NOT EXISTS (SELECT 1 FROM pg_policies p WHERE p.schemaname = 'public' AND p.tablename = c.relname)
+    ),
+    'Esperado: 0',
+    CASE WHEN (
+      SELECT COUNT(*) FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relkind = 'r'
+        AND NOT EXISTS (SELECT 1 FROM pg_policies p WHERE p.schemaname = 'public' AND p.tablename = c.relname)
+    ) = 0 THEN 'OK' ELSE 'FALHA' END
+  UNION ALL
+  SELECT
+    4,
+    '4. Grants diretos anon/PUBLIC ou excessivos (TRUNCATE/TRIGGER/REFERENCES) em public',
     (
       SELECT COUNT(*) FROM information_schema.role_table_grants
-      WHERE table_schema = 'public' AND grantee = 'anon'
+      WHERE table_schema = 'public'
+        AND (
+          grantee IN ('anon', 'PUBLIC')
+          OR (grantee = 'authenticated' AND privilege_type IN ('TRUNCATE', 'TRIGGER', 'REFERENCES'))
+        )
     ),
     'Esperado: 0',
     CASE WHEN (
       SELECT COUNT(*) FROM information_schema.role_table_grants
-      WHERE table_schema = 'public' AND grantee = 'anon'
-    ) = 0 THEN 'OK' ELSE 'ATENCAO' END
-  UNION ALL
-  SELECT
-    4,
-    '4. Bucket encomendas configurado como privado',
-    (
-      SELECT COUNT(*) FROM storage.buckets
-      WHERE id = 'encomendas' AND public = FALSE
-    ),
-    'Esperado: 1',
-    CASE WHEN (
-      SELECT COUNT(*) FROM storage.buckets
-      WHERE id = 'encomendas' AND public = FALSE
-    ) = 1 THEN 'OK' ELSE 'ATENCAO' END
+      WHERE table_schema = 'public'
+        AND (
+          grantee IN ('anon', 'PUBLIC')
+          OR (grantee = 'authenticated' AND privilege_type IN ('TRUNCATE', 'TRIGGER', 'REFERENCES'))
+        )
+    ) = 0 THEN 'OK' ELSE 'FALHA' END
   UNION ALL
   SELECT
     5,
-    '5. Administradores globais ativos vinculados ao Auth',
+    '5. Funcoes de seguranca/RPC executaveis por anon ou PUBLIC',
+    (
+      SELECT COUNT(*) FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.proname IN (
+          'operador_atual_id', 'operador_tem_acesso_global', 'operador_pode_gerenciar_operadores',
+          'operador_pode_acessar_condominio', 'operador_auth_email_corresponde',
+          'operador_tem_permissao_modulo', 'operador_preserva_proprio_perfil',
+          'operador_pode_editar_alvo_local', 'proteger_campos_operador',
+          'proteger_campos_passe_qr', 'validar_e_consumir_passe_qr'
+        )
+        AND (
+          has_function_privilege('anon', p.oid, 'EXECUTE')
+          OR has_function_privilege('public', p.oid, 'EXECUTE')
+        )
+    ),
+    'Esperado: 0',
+    CASE WHEN (
+      SELECT COUNT(*) FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.proname IN (
+          'operador_atual_id', 'operador_tem_acesso_global', 'operador_pode_gerenciar_operadores',
+          'operador_pode_acessar_condominio', 'operador_auth_email_corresponde',
+          'operador_tem_permissao_modulo', 'operador_preserva_proprio_perfil',
+          'operador_pode_editar_alvo_local', 'proteger_campos_operador',
+          'proteger_campos_passe_qr', 'validar_e_consumir_passe_qr'
+        )
+        AND (
+          has_function_privilege('anon', p.oid, 'EXECUTE')
+          OR has_function_privilege('public', p.oid, 'EXECUTE')
+        )
+    ) = 0 THEN 'OK' ELSE 'FALHA' END
+  UNION ALL
+  SELECT
+    6,
+    '6. Trigger proteger_campos_operador em modo SECURITY INVOKER',
+    (
+      SELECT COUNT(*) FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = 'proteger_campos_operador' AND p.prosecdef = FALSE
+    ),
+    'Esperado: 1',
+    CASE WHEN (
+      SELECT COUNT(*) FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = 'proteger_campos_operador' AND p.prosecdef = FALSE
+    ) = 1 THEN 'OK' ELSE 'FALHA' END
+  UNION ALL
+  SELECT
+    7,
+    '7. Bucket encomendas privado + 8 politicas (condominios + operadores)',
+    (
+      SELECT CASE WHEN
+        (SELECT COUNT(*) FROM storage.buckets WHERE id = 'encomendas' AND public = FALSE) = 1
+        AND (
+          SELECT COUNT(*) FROM pg_policies
+          WHERE schemaname = 'storage' AND tablename = 'objects'
+            AND policyname IN (
+              'porttohub_storage_select', 'porttohub_storage_insert',
+              'porttohub_storage_update', 'porttohub_storage_delete',
+              'porttohub_storage_operadores_select', 'porttohub_storage_operadores_insert',
+              'porttohub_storage_operadores_update', 'porttohub_storage_operadores_delete'
+            )
+        ) = 8
+      THEN 1 ELSE 0 END
+    ),
+    'Esperado: 1',
+    CASE WHEN
+      (SELECT COUNT(*) FROM storage.buckets WHERE id = 'encomendas' AND public = FALSE) = 1
+      AND (
+        SELECT COUNT(*) FROM pg_policies
+        WHERE schemaname = 'storage' AND tablename = 'objects'
+          AND policyname IN (
+            'porttohub_storage_select', 'porttohub_storage_insert',
+            'porttohub_storage_update', 'porttohub_storage_delete',
+            'porttohub_storage_operadores_select', 'porttohub_storage_operadores_insert',
+            'porttohub_storage_operadores_update', 'porttohub_storage_operadores_delete'
+          )
+      ) = 8
+    THEN 'OK' ELSE 'ATENCAO' END
+  UNION ALL
+  SELECT
+    8,
+    '8. Constraint chk_passes_qr_usos_limite validada (convalidated)',
+    (
+      SELECT COUNT(*) FROM pg_constraint
+      WHERE conname = 'chk_passes_qr_usos_limite' AND convalidated = TRUE
+    ),
+    'Esperado: 1',
+    CASE WHEN (
+      SELECT COUNT(*) FROM pg_constraint
+      WHERE conname = 'chk_passes_qr_usos_limite' AND convalidated = TRUE
+    ) = 1 THEN 'OK' ELSE 'ATENCAO' END
+  UNION ALL
+  SELECT
+    9,
+    '9. Administradores globais ativos vinculados ao Auth',
     (
       SELECT COUNT(*) FROM public.operadores
       WHERE acesso_global_condominios = TRUE
@@ -135,11 +282,11 @@ SELECT * FROM (
       WHERE acesso_global_condominios = TRUE
         AND COALESCE(ativo, TRUE) = TRUE
         AND auth_user_id IS NOT NULL
-    ) >= 1 THEN 'OK' ELSE 'ATENCAO' END
+    ) >= 1 THEN 'OK' ELSE 'FALHA' END
   UNION ALL
   SELECT
-    6,
-    '6. Operadores ativos ainda sem auth_user_id',
+    10,
+    '10. Operadores ativos ainda sem auth_user_id',
     (
       SELECT COUNT(*) FROM public.operadores
       WHERE auth_user_id IS NULL AND COALESCE(ativo, TRUE) = TRUE
@@ -151,40 +298,3 @@ SELECT * FROM (
     ) = 0 THEN 'OK' ELSE 'ATENCAO' END
 ) resumo
 ORDER BY ordem;
-
--- 8. CONFERE PERFIS PADRONIZADOS E ASSINATURAS DE FUNCOES OFICIAIS
-SELECT
-  COALESCE(NULLIF(trim(perfil), ''), '(vazio)') AS perfil,
-  COUNT(*) AS total,
-  COUNT(*) FILTER (WHERE COALESCE(acesso_global_condominios, FALSE) = TRUE) AS com_acesso_global
-FROM public.operadores
-GROUP BY 1
-ORDER BY 1;
-
-SELECT
-  p.proname AS funcao,
-  pg_get_function_identity_arguments(p.oid) AS argumentos
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-WHERE n.nspname = 'public'
-  AND p.proname IN (
-    'operador_atual_id',
-    'operador_tem_acesso_global',
-    'operador_pode_gerenciar_operadores',
-    'operador_pode_acessar_condominio',
-    'operador_preserva_proprio_perfil',
-    'operador_pode_editar_alvo_local',
-    'proteger_campos_operador',
-    'validar_e_consumir_passe_qr'
-  )
-ORDER BY p.proname, argumentos;
-
-SELECT
-  tgname AS trigger_nome,
-  tgenabled AS status
-FROM pg_trigger t
-JOIN pg_class c ON c.oid = t.tgrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public'
-  AND c.relname = 'operadores'
-  AND NOT t.tgisinternal;

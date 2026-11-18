@@ -40,6 +40,7 @@ import {
   handleAdminProvisionarOperador,
   handleValidarPasseQR,
   handleCacheQuery,
+  handleCacheWarmup,
   handleCacheStats,
   handleCacheClear
 } from '../src/server/apiHandlers.ts';
@@ -113,10 +114,23 @@ function createProvisioningMockEnv() {
       acesso_global_condominios: true,
       ativo: true,
       auth_user_id: AUTH_GLOBAL
+    },
+    {
+      id: 'aaaa5555-5555-4555-8555-555555555555',
+      nome: 'Novo Porteiro Sem Auth',
+      login: 'novo.porteiro',
+      email: 'novo.porteiro@condo.test',
+      perfil: 'operador',
+      nivel_acesso: 3,
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      auth_user_id: null as string | null
     }
   ];
 
   const authUpdates: string[] = [];
+  const dbPatches: Array<{ id: string; body: any }> = [];
 
   const mockFetch: typeof fetch = async (input: any, init?: any) => {
     const urlStr = typeof input === 'string' ? input : input.url;
@@ -134,7 +148,7 @@ function createProvisioningMockEnv() {
       return new Response(JSON.stringify({ error: 'invalid' }), { status: 401 });
     }
 
-    if (url.pathname === '/rest/v1/operadores') {
+    if (url.pathname === '/rest/v1/operadores' && method === 'GET') {
       const idParam = url.searchParams.get('id');
       const authIdParam = url.searchParams.get('auth_user_id');
       const emailParam = url.searchParams.get('email');
@@ -150,6 +164,19 @@ function createProvisioningMockEnv() {
       return new Response(JSON.stringify(filtered), { status: 200 });
     }
 
+    if (url.pathname === '/rest/v1/operadores' && method === 'PATCH') {
+      const idParam = url.searchParams.get('id');
+      const targetId = idParam?.startsWith('eq.') ? idParam.slice(3) : '';
+      const patchBody = JSON.parse(String(init?.body || '{}'));
+      const foundOp = operadoresDb.find(o => o.id === targetId);
+      if (!foundOp) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      Object.assign(foundOp, patchBody);
+      dbPatches.push({ id: targetId, body: patchBody });
+      return new Response(JSON.stringify([foundOp]), { status: 200 });
+    }
+
     if (url.pathname === '/rest/v1/operador_condominios') {
       return new Response(JSON.stringify([]), { status: 200 });
     }
@@ -161,13 +188,18 @@ function createProvisioningMockEnv() {
     }
 
     if (url.pathname === '/auth/v1/admin/users' && method === 'POST') {
-      return new Response(JSON.stringify({ msg: 'User already registered' }), { status: 422 });
+      const reqBody = JSON.parse(String(init?.body || '{}'));
+      const emailReq = String(reqBody.email || '').toLowerCase();
+      if (operadoresDb.some(o => o.email.toLowerCase() === emailReq && o.auth_user_id)) {
+        return new Response(JSON.stringify({ msg: 'User already registered' }), { status: 422 });
+      }
+      return new Response(JSON.stringify({ id: 'bbbb5555-5555-4555-8555-555555555555', email: emailReq }), { status: 200 });
     }
 
     if (url.pathname === '/auth/v1/admin/users' && method === 'GET') {
       const filterEmail = (url.searchParams.get('filter') || '').toLowerCase();
       const matched = operadoresDb
-        .filter(o => o.email.toLowerCase() === filterEmail)
+        .filter(o => o.email.toLowerCase() === filterEmail && o.auth_user_id)
         .map(o => ({ id: o.auth_user_id, email: o.email }));
       return new Response(JSON.stringify({ users: matched }), { status: 200 });
     }
@@ -177,6 +209,8 @@ function createProvisioningMockEnv() {
 
   return {
     authUpdates,
+    dbPatches,
+    operadoresDb,
     env: {
       SUPABASE_URL: 'https://mock.supabase.co',
       SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
@@ -971,7 +1005,7 @@ test('[Mock/Unit] Passe QR RPC retorna registro + registro_id e scripts SQL 05/0
   const trechoFnGerenciar = sql05.split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id TEXT)')[1]
     .split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id UUID)')[0];
   assert.equal(trechoFnGerenciar.includes('operador_condominios'), false);
-  assert.ok(trechoFnGerenciar.includes("lower(COALESCE(o.perfil, '')) = 'admin_condominio'"));
+  assert.ok(trechoFnGerenciar.includes("lower(COALESCE(o.perfil, '')) IN ('admin_condominio'"));
 
   // 05B: retorna ambos registro_id e registro completo
   assert.ok(sql05b.includes("'registro_id', v_registro_id"));
@@ -987,3 +1021,688 @@ test('[Mock/Unit] Passe QR RPC retorna registro + registro_id e scripts SQL 05/0
   assert.ok(sql07.includes('porttohub_storage_operadores_select'));
   assert.ok(sql07.includes("(storage.foldername(name))[2] = auth.uid()::text"));
 });
+
+test('[Auditoria Completa 1-12] Proteção de permissões/perfil, usuários inativos, vínculo Auth e fail-closed no frontend/backend', async () => {
+  const { authenticateRequest } = await import('../src/server/authMiddleware.ts');
+  const {
+    salvarPermissoesOperador,
+    salvarNivelAcesso,
+    excluirNivelAcesso
+  } = await import('../src/services/permissoesService.ts');
+  const { supabase } = await import('../src/services/supabase.ts');
+
+  // 1 & 2: Frontend fail-closed — se Supabase rejeitar (ex: 42501 RLS ou trigger), NÃO escreve cache local e lança erro
+  const origFrom = supabase.from.bind(supabase);
+  const origStorage = (globalThis as any).localStorage;
+  const mockStore = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (mockStore.has(k) ? mockStore.get(k)! : null),
+    setItem: (k: string, v: string) => { mockStore.set(k, String(v)); },
+    removeItem: (k: string) => { mockStore.delete(k); }
+  };
+
+  try {
+    const errRes = {
+      data: null,
+      error: { code: '42501', message: 'Acesso negado: não é permitido alterar os próprios campos administrativos, permissões ou vínculo de autenticação.' }
+    };
+    const cfgErrRes = {
+      data: null,
+      error: { code: '42501', message: 'new row violates row-level security policy for table "configuracoes"' }
+    };
+    (supabase as any).from = (table: string) => ({
+      update: () => ({
+        eq: () => {
+          const res = table === 'configuracoes' ? cfgErrRes : errRes;
+          return Object.assign(Promise.resolve(res), {
+            select: async () => res
+          });
+        }
+      }),
+      upsert: async () => cfgErrRes
+    });
+
+    await assert.rejects(
+      () => salvarPermissoesOperador(OP_ALVO_A, { encomendas: { visualizar: true } } as any, 'porteiro.a', CONDO_A),
+      /42501|permiss|Acesso negado/i
+    );
+    assert.equal(mockStore.has(`porttohub_operador_permissoes_${OP_ALVO_A}`), false);
+
+    await assert.rejects(
+      () => salvarNivelAcesso({ id: 'custom_1', nome: 'Teste', permissoes: {} }, CONDO_A),
+      /42501|Permissão negada/i
+    );
+
+    await assert.rejects(
+      () => excluirNivelAcesso('custom_1', CONDO_A),
+      /42501|Falha ao excluir/i
+    );
+  } finally {
+    (supabase as any).from = origFrom;
+    (globalThis as any).localStorage = origStorage;
+  }
+
+  // 8 & 9: Usuário inativo e usuário com auth_user_id incompatível são bloqueados no servidor
+  const makeAuthFetch = (opRow: any): typeof fetch => async (input: any) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      const byAuth = url.searchParams.get('auth_user_id');
+      if (byAuth && opRow.auth_user_id !== AUTH_ALVO_A) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      return new Response(JSON.stringify([opRow]), { status: 200 });
+    }
+    return new Response(JSON.stringify([]), { status: 200 });
+  };
+
+  const authInactive = await authenticateRequest(
+    new Request('http://localhost/api/cache/stats', { headers: { Authorization: 'Bearer jwt-inativo' } }),
+    {
+      SUPABASE_URL: 'https://mock.supabase.co',
+      SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+      __fetchImpl: makeAuthFetch({
+        id: OP_ALVO_A,
+        condominio_id: CONDO_A,
+        perfil: 'operador',
+        ativo: false,
+        auth_user_id: AUTH_ALVO_A
+      })
+    } as any
+  );
+  assert.equal(authInactive.ok, false);
+  if (!authInactive.ok) assert.equal(authInactive.status, 403);
+
+  const authMismatch = await authenticateRequest(
+    new Request('http://localhost/api/cache/stats', { headers: { Authorization: 'Bearer jwt-outro' } }),
+    {
+      SUPABASE_URL: 'https://mock.supabase.co',
+      SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+      __fetchImpl: makeAuthFetch({
+        id: OP_ALVO_B,
+        condominio_id: CONDO_B,
+        email: 'porteiro.a@condo.test',
+        perfil: 'operador',
+        ativo: true,
+        auth_user_id: AUTH_ALVO_B // Pertence a outra conta Auth!
+      })
+    } as any
+  );
+  assert.equal(authMismatch.ok, false);
+  if (!authMismatch.ok) assert.equal(authMismatch.status, 403);
+
+  // 10, 11, 12: Cross-condominio bloqueado em /api/cache/query e Cadastros sem fallback inseguro
+  const mockFetchCrossCondo: typeof fetch = async (input: any) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      return new Response(JSON.stringify([{
+        id: OP_ALVO_A,
+        condominio_id: CONDO_A,
+        perfil: 'operador',
+        ativo: true,
+        acesso_global_condominios: false,
+        auth_user_id: AUTH_ALVO_A
+      }]), { status: 200 });
+    }
+    return new Response(JSON.stringify([]), { status: 200 });
+  };
+  const crossCacheRes = await handleCacheQuery(
+    new Request('http://localhost/api/cache/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ table: 'moradores', condominioId: CONDO_B })
+    }),
+    {
+      SUPABASE_URL: 'https://mock.supabase.co',
+      SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+      __fetchImpl: mockFetchCrossCondo
+    } as any
+  );
+  assert.equal(crossCacheRes.status, 403);
+
+  const cadastrosCode = fs.readFileSync(path.resolve('src/pages/Cadastros.tsx'), 'utf8');
+  assert.equal(cadastrosCode.includes('Fallback: salvando operador sem colunas extras'), false);
+  assert.equal(cadastrosCode.includes('Fallback: cadastrando operador sem colunas extras'), false);
+});
+
+test('[Auditoria Completa 16-23] QR Code: bloqueio de spoofing de operador, erro RPC fail-closed, sem consumo não altera usos e registro de entrada correto', async () => {
+  // 16a: Cliente envia operadorNome falso no payload, mas handler e RPC recebem apenas o operador real da sessão autenticada
+  let rpcPayloadCapturado: any = null;
+  const mockFetchAntiSpoof: typeof fetch = async (input: any, init?: any) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      return new Response(JSON.stringify([{
+        id: OP_ALVO_A,
+        nome: 'Porteiro Real Alpha',
+        login: 'porteiro.a',
+        perfil: 'operador',
+        condominio_id: CONDO_A,
+        acesso_global_condominios: false,
+        ativo: true,
+        auth_user_id: AUTH_ALVO_A
+      }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operador_condominios') {
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/rpc/validar_e_consumir_passe_qr') {
+      rpcPayloadCapturado = JSON.parse(String(init?.body || '{}'));
+      return new Response(JSON.stringify({
+        valido: true,
+        consumido: true,
+        registro_id: 'rrrr1111-1111-4111-8111-111111111111',
+        registro: {
+          id: 'rrrr1111-1111-4111-8111-111111111111',
+          condominio_id: CONDO_A,
+          operador_entrada_nome: 'Porteiro Real Alpha',
+          status: 'presente'
+        },
+        passe: { id: 'pppp1111-1111-4111-8111-111111111111', usos_realizados: 1, max_usos: 1, status: 'utilizado' }
+      }), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  const resSpoof = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({
+        condominioId: CONDO_A,
+        token: 'PASS-REAL-0001',
+        consumir: true,
+        operadorNome: 'FALSO_ADMIN_INVASOR',
+        p_operador_nome: 'FALSO_ADMIN_INVASOR'
+      })
+    }),
+    {
+      SUPABASE_URL: 'https://mock.supabase.co',
+      SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+      __fetchImpl: mockFetchAntiSpoof
+    } as any
+  );
+  assert.equal(resSpoof.status, 200);
+  assert.equal(rpcPayloadCapturado?.p_operador_nome, 'Porteiro Real Alpha');
+  assert.notEqual(rpcPayloadCapturado?.p_operador_nome, 'FALSO_ADMIN_INVASOR');
+
+  // 16b: Erro real na RPC (500) NÃO deve acionar fallback CAS — deve falhar fechado (502)
+  let fallbackTentado = false;
+  const mockFetchRpc500: typeof fetch = async (input: any) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      return new Response(JSON.stringify([{
+        id: OP_ALVO_A,
+        nome: 'Porteiro Real Alpha',
+        condominio_id: CONDO_A,
+        ativo: true,
+        auth_user_id: AUTH_ALVO_A
+      }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operador_condominios') {
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/rpc/validar_e_consumir_passe_qr') {
+      return new Response(JSON.stringify({ message: 'internal db error' }), { status: 500 });
+    }
+    if (url.pathname === '/rest/v1/passes_virtuais_qr') {
+      fallbackTentado = true;
+    }
+    return new Response('{}', { status: 404 });
+  };
+  const resRpc500 = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-REAL-0001', consumir: true })
+    }),
+    {
+      SUPABASE_URL: 'https://mock.supabase.co',
+      SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+      __fetchImpl: mockFetchRpc500
+    } as any
+  );
+  assert.equal(resRpc500.status, 502);
+  assert.equal(fallbackTentado, false);
+
+  // 19, 20, 22, 23: Passe outro condomínio recusado, limite atingido recusado, validação sem consumo não altera passe
+  const hojeBr = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date());
+
+  const passeMulti = {
+    id: 'cccc2222-2222-4222-8222-222222222222',
+    token: 'PASS-READ-ONLY',
+    condominio_id: CONDO_A,
+    morador_nome: 'Maria',
+    unidade_bloco: 'B - 202',
+    visitante_nome: 'Visitante Leitura',
+    tipo: 'visitante',
+    data_validade: hojeBr,
+    hora_inicio: '00:00',
+    hora_fim: '23:59',
+    max_usos: 2,
+    usos_realizados: 1,
+    status: 'valido'
+  };
+  let patchChamado = false;
+  let registroInserido = false;
+  const mockFetchReadOnly: typeof fetch = async (input: any, init?: any) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    const method = (init?.method || 'GET').toUpperCase();
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      return new Response(JSON.stringify([{ id: OP_ALVO_A, nome: 'Porteiro', condominio_id: CONDO_A, ativo: true, auth_user_id: AUTH_ALVO_A }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operador_condominios') {
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/rpc/validar_e_consumir_passe_qr') {
+      return new Response(JSON.stringify({ code: 'PGRST202' }), { status: 404 });
+    }
+    if (url.pathname === '/rest/v1/passes_virtuais_qr' && method === 'GET') {
+      return new Response(JSON.stringify([{ ...passeMulti }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/passes_virtuais_qr' && method === 'PATCH') {
+      patchChamado = true;
+    }
+    if (url.pathname === '/rest/v1/registros_acesso' && method === 'POST') {
+      registroInserido = true;
+    }
+    return new Response('{}', { status: 404 });
+  };
+  const envRo: any = {
+    SUPABASE_URL: 'https://mock.supabase.co',
+    SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+    __fetchImpl: mockFetchReadOnly
+  };
+  const resOutroCondoPasse = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_B, token: 'PASS-READ-ONLY', consumir: true })
+    }),
+    envRo
+  );
+  assert.equal(resOutroCondoPasse.status, 403);
+
+  const resSemConsumo = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-READ-ONLY', consumir: false })
+    }),
+    envRo
+  );
+  assert.equal(resSemConsumo.status, 200);
+  assert.equal(patchChamado, false);
+  assert.equal(registroInserido, false);
+  assert.equal(passeMulti.usos_realizados, 1);
+
+  assert.equal(
+    validarRegraPasseQR({ ...passeMulti, usos_realizados: 2, max_usos: 2 }, CONDO_A).valido,
+    false
+  );
+});
+
+test('[Auditoria SQL 05/05B/06/07/08/09/11/12] Trigger SECURITY INVOKER, proteção permissoes, revogação anon/PUBLIC/TRUNCATE, 8 policies Storage, constraint e auditoria read-only', () => {
+  const sql05 = fs.readFileSync(path.resolve('supabase/sql/05_FUNCOES_AUTORIZACAO.sql'), 'utf8');
+  const sql05b = fs.readFileSync(path.resolve('supabase/sql/05B_FUNCOES_PASSE_QR.sql'), 'utf8');
+  const sql06 = fs.readFileSync(path.resolve('supabase/sql/06_RLS_TABELAS_MULTI_TENANT.sql'), 'utf8');
+  const sql07 = fs.readFileSync(path.resolve('supabase/sql/07_STORAGE_PRIVADO_POLICIES.sql'), 'utf8');
+  const sql08 = fs.readFileSync(path.resolve('supabase/sql/08_INDICES_E_CONSTRAINTS.sql'), 'utf8');
+  const sql09 = fs.readFileSync(path.resolve('supabase/sql/09_VALIDACAO_SEGURANCA.sql'), 'utf8');
+  const sql11 = fs.readFileSync(path.resolve('supabase/sql/11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql'), 'utf8');
+  const sql12 = fs.readFileSync(path.resolve('supabase/sql/12_AUDITORIA_FINAL_SEGURANCA.sql'), 'utf8');
+
+  // Trigger proteger_campos_operador NÃO pode ser SECURITY DEFINER (evita bypass current_user=postgres)
+  for (const [nome, conteudo] of [['06', sql06], ['11', sql11]] as const) {
+    const triggerFn = conteudo.split('CREATE OR REPLACE FUNCTION public.proteger_campos_operador()')[1].split('REVOKE ALL ON FUNCTION public.proteger_campos_operador()')[0];
+    assert.equal(triggerFn.includes('SECURITY DEFINER'), false, `${nome}: proteger_campos_operador não pode usar SECURITY DEFINER`);
+    assert.ok(triggerFn.includes('SECURITY INVOKER'), `${nome}: proteger_campos_operador deve usar SECURITY INVOKER`);
+    assert.ok(triggerFn.includes('NEW.permissoes'), `${nome}: proteger_campos_operador deve proteger coluna permissoes`);
+    assert.ok(conteudo.includes('REVOKE TRUNCATE, TRIGGER, REFERENCES ON TABLE public.%I FROM authenticated;'), `${nome}: deve revogar TRUNCATE/TRIGGER/REFERENCES`);
+    assert.ok(conteudo.includes('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon;'), `${nome}: deve revogar PUBLIC e anon das tabelas`);
+    assert.equal(/\bFOR\s+ALL\s+TO\s+authenticated\b/i.test(conteudo), false, `${nome}: não deve usar política genérica FOR ALL`);
+  }
+
+  // 05 e 11 protegem permissoes em operador_preserva_proprio_perfil e revogam PUBLIC, anon
+  assert.ok(sql05.includes('operador_auth_email_corresponde'));
+  assert.ok(sql05.includes('COALESCE(cur.permissoes'));
+  assert.ok(sql05.includes('FROM PUBLIC, anon;'));
+
+  // 05B e 11 derivam operador exclusivamente de auth.uid()
+  assert.ok(sql05b.includes('WHERE o.auth_user_id = auth.uid()'));
+  assert.ok(sql05b.includes('FROM PUBLIC, anon;'));
+
+  // 07 possui todas as 8 políticas privadas + UUID check + operador ativo
+  assert.ok(sql07.includes('porttohub_storage_operadores_delete'));
+  assert.ok(sql07.includes('public.operador_atual_id() IS NOT NULL'));
+
+  // 08 e 11 validam chk_passes_qr_usos_limite com checagem prévia sem apagar dados
+  assert.ok(sql08.includes('VALIDATE CONSTRAINT chk_passes_qr_usos_limite'));
+  assert.ok(sql11.includes('VALIDATE CONSTRAINT chk_passes_qr_usos_limite'));
+  const sql11SemComentarios = sql11.replace(/--[^\n]*/g, '');
+  assert.equal(/\bDROP\s+TABLE\b/i.test(sql11SemComentarios), false);
+  assert.equal(/\bTRUNCATE\b/i.test(sql11SemComentarios.replace(/REVOKE TRUNCATE[^\n]*/g, '')), false);
+
+  // 09 e 12 auditam privilégios de funções e classificam OK / ATENCAO / FALHA
+  assert.ok(sql09.includes('has_function_privilege'));
+  assert.ok(sql12.includes('has_function_privilege'));
+  assert.ok(sql12.includes("'OK'") && sql12.includes("'ATENCAO'") && sql12.includes("'FALHA'"));
+});
+
+test('[Segunda Rodada] Provisionamento service_role vincula auth_user_id, OCR/QR/Cache bloqueiam por permissoes e Passe QR concorrente (2 chamadas) sem bypass', async () => {
+  // 1. Provisionamento com operador_id sem auth_user_id cria usuário no Auth e faz PATCH service_role na tabela operadores
+  const { env: provEnv, dbPatches, operadoresDb } = createProvisioningMockEnv();
+  const OP_SEM_AUTH = 'aaaa5555-5555-4555-8555-555555555555';
+  const resNovoProv = await handleAdminProvisionarOperador(
+    new Request('http://localhost/api/admin/operadores/provisionar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-gestor-a' },
+      body: JSON.stringify({
+        operador_id: OP_SEM_AUTH,
+        condominio_id: CONDO_A,
+        email: 'novo.porteiro@condo.test',
+        password: 'SenhaForte123!',
+        nome: 'Novo Porteiro Sem Auth'
+      })
+    }),
+    provEnv
+  );
+  assert.equal(resNovoProv.status, 200);
+  const provJson: any = await resNovoProv.json();
+  assert.equal(provJson.acao, 'criado');
+  assert.equal(provJson.operador_vinculado, true);
+  assert.equal(provJson.auth_user_id, 'bbbb5555-5555-4555-8555-555555555555');
+  assert.equal(dbPatches.length, 1);
+  assert.equal(dbPatches[0].id, OP_SEM_AUTH);
+  assert.equal(dbPatches[0].body.auth_user_id, 'bbbb5555-5555-4555-8555-555555555555');
+  assert.equal(operadoresDb.find(o => o.id === OP_SEM_AUTH)?.auth_user_id, 'bbbb5555-5555-4555-8555-555555555555');
+
+  // 2. Gestor sem permissão em cadastros.operadores é bloqueado no provisionamento
+  const gestorObj = operadoresDb.find(o => o.id === OP_GESTOR_A)! as any;
+  gestorObj.permissoes = { cadastros: { visualizar: true, operadores: false, editar_operadores: false } };
+  const resSemPermCad = await handleAdminProvisionarOperador(
+    new Request('http://localhost/api/admin/operadores/provisionar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-gestor-a' },
+      body: JSON.stringify({
+        operador_id: OP_ALVO_A,
+        condominio_id: CONDO_A,
+        email: 'porteiro.a@condo.test',
+        password: 'NovaSenha123!'
+      })
+    }),
+    provEnv
+  );
+  assert.equal(resSemPermCad.status, 403);
+
+  // 3. Porteiro com permissoes restritas é barrado em OCR, Controle de Acesso (QR), /api/cache/query e /api/cache/warmup
+  const permissoesRestritas = {
+    encomendas: { visualizar: true, criar: false, entrada_lote: false, triagem: false },
+    controle_acesso: { visualizar: true, liberar_entrada: false },
+    custodia: { visualizar: false },
+    chaves: { visualizar: false },
+    moradores: { visualizar: true }
+  };
+
+  const hojeBr = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date());
+
+  const passeUnicoConcorrente = {
+    id: 'cccc3333-3333-4333-8333-333333333333',
+    token: 'PASS-RACE-0002',
+    condominio_id: CONDO_A,
+    morador_nome: 'João',
+    unidade_bloco: 'A - 101',
+    visitante_nome: 'Visitante Concorrente',
+    tipo: 'visitante',
+    data_validade: hojeBr,
+    hora_inicio: '00:00',
+    hora_fim: '23:59',
+    max_usos: 1,
+    usos_realizados: 0,
+    status: 'valido'
+  };
+
+  let operadorPermissoesAtuais: any = permissoesRestritas;
+  const mockFetchPerm: typeof fetch = async (input: any, init?: any) => {
+    const url = new URL(typeof input === 'string' ? input : input.url);
+    const method = (init?.method || 'GET').toUpperCase();
+
+    if (url.pathname === '/auth/v1/user') {
+      return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'porteiro.a@condo.test' }), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operadores') {
+      return new Response(JSON.stringify([{
+        id: OP_ALVO_A,
+        nome: 'Porteiro Alpha',
+        login: 'porteiro.a',
+        email: 'porteiro.a@condo.test',
+        perfil: 'operador',
+        nivel_acesso: 3,
+        condominio_id: CONDO_A,
+        acesso_global_condominios: false,
+        ativo: true,
+        auth_user_id: AUTH_ALVO_A,
+        permissoes: operadorPermissoesAtuais
+      }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/operador_condominios') {
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/rpc/validar_e_consumir_passe_qr') {
+      return new Response(JSON.stringify({ code: 'PGRST202' }), { status: 404 });
+    }
+    if (url.pathname === '/rest/v1/passes_virtuais_qr' && method === 'GET') {
+      return new Response(JSON.stringify([{ ...passeUnicoConcorrente }]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/passes_virtuais_qr' && method === 'PATCH') {
+      const usosEsp = Number((url.searchParams.get('usos_realizados') || '').replace('eq.', ''));
+      const statusEsp = (url.searchParams.get('status') || '').replace('eq.', '');
+      if (passeUnicoConcorrente.usos_realizados === usosEsp && passeUnicoConcorrente.status === statusEsp) {
+        const b = JSON.parse(String(init.body || '{}'));
+        passeUnicoConcorrente.usos_realizados = b.usos_realizados;
+        passeUnicoConcorrente.status = b.status;
+        return new Response(JSON.stringify([{ ...passeUnicoConcorrente }]), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    }
+    if (url.pathname === '/rest/v1/registros_acesso' && method === 'POST') {
+      return new Response(JSON.stringify([{ id: 'rrrr2222-2222-4222-8222-222222222222', condominio_id: CONDO_A }]), { status: 201 });
+    }
+    if (['/rest/v1/moradores', '/rest/v1/entregadores', '/rest/v1/bancada_volumes'].includes(url.pathname)) {
+      return new Response(JSON.stringify([{ id: 'row-1', condominio_id: CONDO_A }]), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 404 });
+  };
+
+  const envPerm: any = {
+    SUPABASE_URL: 'https://mock.supabase.co',
+    SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+    SUPABASE_SERVICE_ROLE_KEY: 'mock_service_role_key_12345678901234567890',
+    GEMINI_API_KEY: 'mock-gemini-key',
+    __fetchImpl: mockFetchPerm
+  };
+
+  const resOcrNegado = await handleOcrEtiqueta(
+    new Request('http://localhost/api/ocr-etiqueta', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ imagemBase64: 'data:image/jpeg;base64,/9j/4AAQ' })
+    }),
+    envPerm
+  );
+  assert.equal(resOcrNegado.status, 403);
+
+  const resQrLeitura = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-RACE-0002', consumir: false })
+    }),
+    envPerm
+  );
+  assert.equal(resQrLeitura.status, 200);
+
+  const resQrConsumoNegado = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-RACE-0002', consumir: true })
+    }),
+    envPerm
+  );
+  assert.equal(resQrConsumoNegado.status, 403);
+
+  const resCacheCustodiaNegado = await handleCacheQuery(
+    new Request('http://localhost/api/cache/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ table: 'custodia', condominioId: CONDO_A })
+    }),
+    envPerm
+  );
+  assert.equal(resCacheCustodiaNegado.status, 403);
+
+  const resCacheMoradoresOk = await handleCacheQuery(
+    new Request('http://localhost/api/cache/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ table: 'moradores', condominioId: CONDO_A })
+    }),
+    envPerm
+  );
+  assert.equal(resCacheMoradoresOk.status, 200);
+
+  const resWarmupParcial = await handleCacheWarmup(
+    new Request('http://localhost/api/cache/warmup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A })
+    }),
+    envPerm
+  );
+  assert.equal(resWarmupParcial.status, 200);
+  const warmupJson: any = await resWarmupParcial.json();
+  assert.equal(warmupJson.tabelasAquecidas.find((t: any) => t.table === 'chaves')?.status, 'negado');
+  assert.equal(warmupJson.tabelasAquecidas.find((t: any) => t.table === 'moradores')?.status, 'ok');
+
+  // Chamada anônima ao QR é rejeitada com 401
+  const resQrAnon = await handleValidarPasseQR(
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-RACE-0002', consumir: true })
+    }),
+    envPerm
+  );
+  assert.equal(resQrAnon.status, 401);
+
+  // Libera permissão de controle_acesso para testar exatamente 2 chamadas simultâneas com max_usos = 1
+  operadorPermissoesAtuais = { controle_acesso: { visualizar: true, liberar_entrada: true } };
+  const makeRaceReq = () =>
+    new Request('http://localhost/api/controle-acesso/validar-passe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer jwt-porteiro-a' },
+      body: JSON.stringify({ condominioId: CONDO_A, token: 'PASS-RACE-0002', consumir: true })
+    });
+  const [race1, race2] = await Promise.all([
+    handleValidarPasseQR(makeRaceReq(), envPerm),
+    handleValidarPasseQR(makeRaceReq(), envPerm)
+  ]);
+  assert.equal([race1.status, race2.status].filter(s => s === 200).length, 1);
+  assert.equal([race1.status, race2.status].filter(s => s === 400 || s === 409).length, 1);
+  assert.equal(passeUnicoConcorrente.usos_realizados, 1);
+});
+
+test('[Segunda Rodada SQL & Frontend] Sem bypass current_user NOT IN, trigger QR SECURITY INVOKER, proteção auth_email e migração 11/12 seguras', () => {
+  const sql05 = fs.readFileSync(path.resolve('supabase/sql/05_FUNCOES_AUTORIZACAO.sql'), 'utf8');
+  const sql05b = fs.readFileSync(path.resolve('supabase/sql/05B_FUNCOES_PASSE_QR.sql'), 'utf8');
+  const sql06 = fs.readFileSync(path.resolve('supabase/sql/06_RLS_TABELAS_MULTI_TENANT.sql'), 'utf8');
+  const sql07 = fs.readFileSync(path.resolve('supabase/sql/07_STORAGE_PRIVADO_POLICIES.sql'), 'utf8');
+  const sql11 = fs.readFileSync(path.resolve('supabase/sql/11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql'), 'utf8');
+  const sql12 = fs.readFileSync(path.resolve('supabase/sql/12_AUDITORIA_FINAL_SEGURANCA.sql'), 'utf8');
+  const cadastrosCode = fs.readFileSync(path.resolve('src/pages/Cadastros.tsx'), 'utf8');
+
+  // 1. Zero bypass current_user NOT IN em 05B e 11; exige service_role quando auth.uid() IS NULL
+  for (const [nome, conteudo] of [['05B', sql05b], ['11', sql11]] as const) {
+    assert.equal(/current_user\s+NOT\s+IN\s*\(\s*'postgres'/i.test(conteudo), false, `${nome}: não pode conter bypass current_user NOT IN`);
+    assert.ok(/v_jwt_role\s*(?:=|<>)\s*'service_role'/.test(conteudo), `${nome}: deve validar service_role no JWT`);
+    assert.ok(conteudo.includes('operador_tem_permissao_modulo'), `${nome}: validar_e_consumir_passe_qr deve exigir permissão funcional`);
+    assert.ok(conteudo.includes("set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE)"), `${nome}: RPC deve sinalizar consumo ao trigger`);
+  }
+
+  // 2. 06 e 11 possuem proteger_campos_passe_qr SECURITY INVOKER, permissões por módulo e integridade cross-condo em tabelas filhas
+  for (const [nome, conteudo] of [['06', sql06], ['11', sql11]] as const) {
+    const qrTrigFn = conteudo.split('CREATE OR REPLACE FUNCTION public.proteger_campos_passe_qr()')[1]
+      .split('REVOKE ALL ON FUNCTION public.proteger_campos_passe_qr()')[0]
+      .replace(/--[^\n]*/g, '');
+    assert.equal(qrTrigFn.includes('SECURITY DEFINER'), false, `${nome}: proteger_campos_passe_qr deve ser SECURITY INVOKER`);
+    assert.ok(qrTrigFn.includes('SECURITY INVOKER'), `${nome}: proteger_campos_passe_qr deve usar SECURITY INVOKER`);
+    assert.ok(qrTrigFn.includes('COALESCE(NEW.usos_realizados, 0) IS DISTINCT FROM COALESCE(OLD.usos_realizados, 0)'), `${nome}: deve proteger usos_realizados`);
+    assert.ok(conteudo.includes('trg_proteger_campos_passe_qr'), `${nome}: trigger de passes QR ausente`);
+    assert.ok(conteudo.includes('operador_tem_permissao_modulo'), `${nome}: RLS deve validar operador_tem_permissao_modulo`);
+    assert.ok(conteudo.includes('encomendas_itens_insert'), `${nome}: policy de encomendas_itens deve validar FK do mesmo condomínio`);
+    assert.ok(conteudo.includes('rondas_registros_insert'), `${nome}: policy de rondas_registros deve validar FK de ponto do mesmo condomínio`);
+  }
+
+  // 3. operador_auth_email_corresponde bloqueia consulta arbitrária a auth.users por authenticated
+  for (const [nome, conteudo] of [['05', sql05], ['11', sql11]] as const) {
+    const fnEmail = conteudo.split('CREATE OR REPLACE FUNCTION public.operador_auth_email_corresponde')[1]
+      .split('REVOKE ALL ON FUNCTION public.operador_auth_email_corresponde')[0];
+    assert.ok(
+      fnEmail.includes('p_auth_user_id IS DISTINCT FROM auth.uid()') || fnEmail.includes('p_auth_user_id = auth.uid()'),
+      `${nome}: operador_auth_email_corresponde deve restringir a próprio uid ou service_role`
+    );
+    assert.ok(
+      /v_jwt_role\s*(?:=|<>)\s*'service_role'/.test(fnEmail),
+      `${nome}: operador_auth_email_corresponde deve aceitar service_role`
+    );
+    assert.ok(
+      /CREATE OR REPLACE FUNCTION public\.operador_tem_permissao_modulo\(\s*p_condominio_id TEXT/.test(conteudo),
+      `${nome}: função operador_tem_permissao_modulo(TEXT) ausente`
+    );
+  }
+
+  // 4. Storage 07 e 11 exigem operador ativo nas 4 políticas condominios/ além de operadores/
+  assert.equal((sql07.match(/public\.operador_atual_id\(\) IS NOT NULL/g) || []).length >= 8, true);
+  assert.equal((sql11.match(/public\.operador_atual_id\(\) IS NOT NULL/g) || []).length >= 8, true);
+
+  // 5. Migração 11 faz pré-auditoria de pg_policies e só remove policies das 35 tabelas explícitas (todas_tabelas)
+  assert.ok(sql11.includes('Pre-auditoria pg_policies'));
+  assert.ok(sql11.includes('FOREACH tbl IN ARRAY todas_tabelas'));
+  assert.ok(sql11.includes("WHERE schemaname = 'public' AND tablename = tbl"));
+
+  // 6. Auditoria 12 é 100% read-only e documenta escopo SQL vs backend /api/*
+  const sql12NoComments = sql12.replace(/--[^\n]*/g, '').replace(/'[^']*'/g, "''");
+  assert.equal(/\b(CREATE|DROP|ALTER|INSERT|UPDATE|DELETE|TRUNCATE)\b/i.test(sql12NoComments), false, '12 deve ser exclusivamente read-only');
+  assert.ok(sql12.includes('pg_get_functiondef'));
+  assert.ok(sql12.includes('trg_proteger_campos_passe_qr'));
+  assert.ok(sql12.includes('/api/*'));
+
+  // 7. Cadastros.tsx insere novo operador com auth_user_id: null antes de provisionar via backend
+  assert.ok(cadastrosCode.includes('auth_user_id: null'));
+  assert.ok(cadastrosCode.includes('chamarProvisionamentoBackend(opIdSalvo)'));
+});
+

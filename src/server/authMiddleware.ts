@@ -67,6 +67,8 @@ export interface AuthContext {
     email?: string;
     perfil?: string;
     nivel_acesso?: number;
+    nivel_acesso_custom_id?: string | null;
+    permissoes?: Record<string, any> | null;
     condominio_id?: string | null;
     acesso_global_condominios?: boolean;
     ativo?: boolean;
@@ -135,7 +137,7 @@ export async function authenticateRequest(
 
   let operador: any = null;
   try {
-    const opCols = 'id,nome,login,email,perfil,nivel_acesso,condominio_id,acesso_global_condominios,ativo,auth_user_id';
+    const opCols = 'id,nome,login,email,perfil,nivel_acesso,nivel_acesso_custom_id,permissoes,condominio_id,acesso_global_condominios,ativo,auth_user_id';
     const opResp = await fetchFn(
       `${cfg.url}/rest/v1/operadores?select=${opCols}&auth_user_id=eq.${encodeURIComponent(authUser.id)}&limit=1`,
       { headers: baseHeaders }
@@ -165,6 +167,10 @@ export async function authenticateRequest(
 
   if (!operador) {
     return { ok: false, status: 403, error: 'Conta Auth sem operador vinculado na base.' };
+  }
+
+  if (operador.auth_user_id && String(operador.auth_user_id) !== String(authUser.id)) {
+    return { ok: false, status: 403, error: 'Vínculo auth_user_id incompatível com a conta autenticada.' };
   }
 
   if (operador.ativo === false) {
@@ -238,3 +244,276 @@ export function podeGerenciarOperadores(ctx: AuthContext, targetCondominioId?: s
   const primaryCondo = String(ctx.operador.condominio_id || '').trim();
   return isValidUuid(primaryCondo) && primaryCondo === targetCondominioId.trim();
 }
+
+function resolverAliasAcaoBackend(modKey: string, acao: string): string | null {
+  if (modKey === 'encomendas') {
+    if (['entrada_lote', 'criar_lote', 'triagem', 'baixa', 'cadastrar_entregador'].includes(acao)) return 'criar';
+    if (['editar_pacote', 'editar_lotes'].includes(acao)) return 'editar';
+    if (['excluir_pacote', 'excluir_lotes'].includes(acao)) return 'excluir';
+    if (['dossie', 'historico'].includes(acao)) return 'visualizar';
+  }
+  if (modKey === 'custodia') {
+    if (acao === 'receber') return 'criar';
+    if (acao === 'baixa') return 'editar';
+    if (acao === 'auditoria') return 'visualizar';
+  }
+  if (modKey === 'chaves') {
+    if (['cadastrar', 'emprestar'].includes(acao)) return 'criar';
+    if (acao === 'devolver') return 'editar';
+  }
+  if (modKey === 'rondas') {
+    if (['iniciar_ronda', 'cadastrar_pontos'].includes(acao)) return 'criar';
+    if (acao === 'setores') return 'editar';
+  }
+  if (modKey === 'autorizados') {
+    if (['cadastrar', 'dar_entrada'].includes(acao)) return 'criar';
+    if (acao === 'dar_saida') return 'editar';
+  }
+  if (modKey === 'materiais') {
+    if (acao === 'cadastrar_equipamentos') return 'criar';
+    if (acao === 'alterar_status') return 'editar';
+  }
+  if (modKey === 'manutencao') {
+    if (acao === 'abrir_os') return 'criar';
+    if (acao === 'concluir') return 'editar';
+  }
+  if (modKey === 'ocorrencias' && acao === 'resolver') return 'editar';
+  if (modKey === 'passagem_posto') {
+    if (acao === 'assumir_posto') return 'criar';
+    if (acao === 'relatorio') return 'visualizar';
+  }
+  if (modKey === 'cadastros') {
+    if (['operadores', 'cadastrar_operadores', 'cadastrar_morador'].includes(acao)) return 'criar';
+    if (['editar_operadores', 'editar_morador', 'configurar_condominio'].includes(acao)) return 'editar';
+    if (['excluir_operadores', 'excluir_morador'].includes(acao)) return 'excluir';
+    if (['visualizar_moradores', 'visualizar_operadores', 'exportar_moradores'].includes(acao)) return 'visualizar';
+  }
+  if (modKey === 'historico_absoluto') {
+    if (['ver_feed', 'ver_metricas', 'exportar_csv'].includes(acao)) return 'visualizar';
+    if (acao === 'limpar_dados') return 'excluir';
+  }
+  if (modKey === 'bancada') {
+    if (acao === 'lancar') return 'criar';
+    if (acao === 'baixa') return 'editar';
+    if (acao === 'zerar') return 'excluir';
+    if (acao === 'historico') return 'visualizar';
+  }
+  if (modKey === 'reservas') {
+    if (['aprovar', 'gerenciar_areas', 'vistoria'].includes(acao)) return 'editar';
+    if (acao === 'cancelar') return 'excluir';
+  }
+  if (modKey === 'controle_acesso') {
+    if (['liberar_entrada', 'gerar_passe_qr'].includes(acao)) return 'criar';
+    if (['registrar_saida', 'bloquear', 'configurar_portoes'].includes(acao)) return 'editar';
+  }
+  return null;
+}
+
+/**
+ * Sincronizado com public.operador_tem_permissao_modulo() e src/services/permissoesService.ts.
+ * Avalia vínculo multi-tenant, regras rígidas de perfil, operadores.permissoes e matriz oficial padrão.
+ */
+export function temPermissaoModuloBackend(
+  ctx: AuthContext,
+  modulo: string,
+  acao = 'visualizar',
+  targetCondominioId?: string | null
+): boolean {
+  if (!ctx || ctx.operador?.ativo === false) return false;
+
+  if (targetCondominioId && !isCondominioAutorizado(ctx, targetCondominioId)) {
+    return false;
+  }
+
+  if (ctx.eAdminGlobal) return true;
+
+  let modKey = String(modulo || '').trim().toLowerCase();
+  const acaoKey = String(acao || 'visualizar').trim().toLowerCase();
+  if (!modKey || !acaoKey) return false;
+
+  if (modKey === 'prestadores') modKey = 'autorizados';
+  if (modKey === 'passagem') modKey = 'passagem_posto';
+
+  const perfilRaw = String(ctx.operador.perfil || '').trim().toLowerCase();
+  const nivelNum = ctx.operador.nivel_acesso !== undefined && ctx.operador.nivel_acesso !== null
+    ? Number(ctx.operador.nivel_acesso)
+    : 3;
+
+  const ehAdminCondo = ctx.perfilNormalizado === 'admin_condominio';
+  const ehSupervisor = !ehAdminCondo && ctx.perfilNormalizado === 'supervisor';
+  const ehSindico = !ehAdminCondo && !ehSupervisor && (perfilRaw.includes('sind') || nivelNum === 4);
+
+  if (modKey === 'materiais' && (acaoKey === 'excluir' || acaoKey === 'excluir_equipamento')) {
+    if (!ehAdminCondo && !ehSupervisor && (nivelNum >= 3 || perfilRaw === 'operador' || perfilRaw === 'porteiro')) {
+      return false;
+    }
+  }
+
+  if (modKey === 'configuracoes') {
+    return false;
+  }
+
+  if (modKey === 'cadastros') {
+    if (acaoKey === 'condominios' || acaoKey === 'gerenciar_niveis') {
+      return false;
+    }
+    if (['operadores', 'cadastrar_operadores', 'editar_operadores', 'alterar_senha_operador', 'excluir_operadores'].includes(acaoKey)) {
+      const condoCheck = targetCondominioId || ctx.operador.condominio_id;
+      if (!podeGerenciarOperadores(ctx, condoCheck)) {
+        return false;
+      }
+    }
+  }
+
+  const perm: Record<string, any> =
+    ctx.operador.permissoes && typeof ctx.operador.permissoes === 'object' ? ctx.operador.permissoes : {};
+
+  if (ehSindico) {
+    const modCfg =
+      perm[modKey] ||
+      (modKey === 'autorizados' ? perm.prestadores : undefined) ||
+      (modKey === 'passagem_posto' ? perm.passagem : undefined) ||
+      (modKey === 'moradores' ? perm.moradores || perm.cadastros : undefined);
+
+    if (modCfg && typeof modCfg === 'object' && modCfg.visualizar === false) {
+      return false;
+    }
+    if (modKey === 'ocorrencias') {
+      return acaoKey === 'visualizar' || acaoKey === 'criar' || acaoKey === 'resolver';
+    }
+    return [
+      'visualizar',
+      'relatorio',
+      'dossie',
+      'historico',
+      'ver_feed',
+      'ver_metricas',
+      'exportar_csv',
+      'visualizar_moradores',
+      'visualizar_operadores',
+      'auditoria'
+    ].includes(acaoKey);
+  }
+
+  if (modKey === 'moradores') {
+    const modObj = perm.moradores;
+    const cadObj = perm.cadastros;
+
+    if (modObj && typeof modObj === 'object') {
+      if (modObj.visualizar === false) return false;
+      if (acaoKey === 'visualizar' && modObj.visualizar !== undefined) return Boolean(modObj.visualizar);
+      if (modObj[acaoKey] !== undefined) return Boolean(modObj[acaoKey]);
+      if (['adicionar', 'cadastrar', 'criar'].includes(acaoKey)) {
+        const val = modObj.adicionar ?? modObj.criar ?? modObj.cadastrar;
+        if (val !== undefined) return Boolean(val);
+      }
+    }
+
+    if (cadObj && typeof cadObj === 'object') {
+      if (cadObj.visualizar === false) return false;
+      if (acaoKey === 'visualizar' && cadObj.visualizar_moradores !== undefined) return Boolean(cadObj.visualizar_moradores);
+      if (['criar', 'adicionar', 'cadastrar'].includes(acaoKey) && (cadObj.cadastrar_morador !== undefined || cadObj.moradores !== undefined)) {
+        return Boolean(cadObj.cadastrar_morador ?? cadObj.moradores);
+      }
+      if (acaoKey === 'editar' && (cadObj.editar_morador !== undefined || cadObj.moradores !== undefined)) {
+        return Boolean(cadObj.editar_morador ?? cadObj.moradores);
+      }
+      if (acaoKey === 'excluir' && cadObj.excluir_morador !== undefined) {
+        return Boolean(cadObj.excluir_morador);
+      }
+    }
+  } else {
+    const modObj =
+      perm[modKey] ||
+      (modKey === 'autorizados' ? perm.prestadores : undefined) ||
+      (modKey === 'passagem_posto' ? perm.passagem : undefined);
+
+    if (modObj && typeof modObj === 'object') {
+      if (modObj.visualizar === false) return false;
+      if (acaoKey === 'visualizar') {
+        return modObj.visualizar !== undefined ? Boolean(modObj.visualizar) : true;
+      }
+      if (modObj[acaoKey] !== undefined) {
+        return Boolean(modObj[acaoKey]);
+      }
+      const fallbackAcao = resolverAliasAcaoBackend(modKey, acaoKey);
+      if (fallbackAcao && modObj[fallbackAcao] !== undefined) {
+        return Boolean(modObj[fallbackAcao]);
+      }
+    }
+  }
+
+  // Matriz padrão oficial (espelha NIVEIS_PADRAO e operador_tem_permissao_modulo)
+  if (['visualizar', 'historico', 'relatorio', 'ver_feed', 'auditoria', 'visualizar_moradores'].includes(acaoKey)) {
+    if (modKey === 'encomendas' && acaoKey === 'dossie' && !ehAdminCondo && !ehSupervisor) {
+      return false;
+    }
+    return true;
+  }
+
+  if (ehAdminCondo) {
+    if (modKey === 'historico_absoluto') return false;
+    if (modKey === 'cadastros' && ['excluir', 'excluir_morador', 'excluir_operadores', 'condominios', 'gerenciar_niveis'].includes(acaoKey)) {
+      return false;
+    }
+    if (modKey === 'reservas' && acaoKey === 'cancelar') return true;
+    if (['excluir', 'excluir_pacote', 'excluir_lotes'].includes(acaoKey)) {
+      return modKey === 'encomendas';
+    }
+    return true;
+  }
+
+  if (ehSupervisor) {
+    if (modKey === 'historico_absoluto') return false;
+    if (modKey === 'custodia' && ['editar', 'excluir'].includes(acaoKey)) return false;
+    if (modKey === 'rondas' && ['setores', 'excluir'].includes(acaoKey)) return false;
+    if (modKey === 'bancada' && ['zerar', 'excluir'].includes(acaoKey)) return false;
+    if (modKey === 'reservas' && ['gerenciar_areas', 'excluir'].includes(acaoKey)) return false;
+    if (modKey === 'controle_acesso' && ['configurar_portoes', 'excluir'].includes(acaoKey)) return false;
+    if (modKey === 'cadastros') {
+      return [
+        'visualizar_moradores', 'cadastrar_morador', 'editar_morador', 'gerenciar_veiculos',
+        'vincular_tags', 'status_acesso_morador', 'exportar_moradores', 'visualizar_operadores', 'criar', 'editar'
+      ].includes(acaoKey);
+    }
+    if (['excluir', 'excluir_pacote', 'excluir_lotes'].includes(acaoKey)) {
+      return modKey === 'encomendas';
+    }
+    return true;
+  }
+
+  // Perfil Operador / Porteiro (Nível 3)
+  switch (modKey) {
+    case 'encomendas':
+      return ['criar', 'entrada_lote', 'criar_lote', 'cadastrar_entregador', 'triagem', 'baixa', 'historico'].includes(acaoKey);
+    case 'custodia':
+      return ['criar', 'receber', 'baixa'].includes(acaoKey);
+    case 'chaves':
+      return ['criar', 'emprestar', 'devolver'].includes(acaoKey);
+    case 'rondas':
+      return ['criar', 'iniciar_ronda'].includes(acaoKey);
+    case 'autorizados':
+      return ['criar', 'cadastrar', 'dar_entrada', 'dar_saida'].includes(acaoKey);
+    case 'materiais':
+      return acaoKey === 'alterar_status';
+    case 'manutencao':
+      return ['criar', 'abrir_os'].includes(acaoKey);
+    case 'ocorrencias':
+      return acaoKey === 'criar';
+    case 'passagem_posto':
+      return ['criar', 'editar', 'assumir_posto'].includes(acaoKey);
+    case 'cadastros':
+      return ['visualizar_moradores', 'cadastrar_morador', 'gerenciar_veiculos'].includes(acaoKey);
+    case 'moradores':
+      return ['criar', 'adicionar', 'cadastrar'].includes(acaoKey);
+    case 'bancada':
+      return ['criar', 'lancar', 'baixa'].includes(acaoKey);
+    case 'reservas':
+      return ['criar', 'vistoria'].includes(acaoKey);
+    case 'controle_acesso':
+      return ['criar', 'editar', 'liberar_entrada', 'registrar_saida', 'gerar_passe_qr'].includes(acaoKey);
+    default:
+      return false;
+  }
+}
+

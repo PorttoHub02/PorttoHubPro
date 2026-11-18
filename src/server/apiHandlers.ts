@@ -9,7 +9,9 @@ import {
   getSupabaseServerConfig,
   isCondominioAutorizado,
   isValidUuid,
-  podeGerenciarOperadores
+  podeGerenciarOperadores,
+  temPermissaoModuloBackend,
+  type AuthContext
 } from './authMiddleware';
 import { buildTenantCacheKey, createUpstashCache, type RuntimeEnv } from './upstashClient';
 import { validarRegraPasseQR } from '../services/passeQrValidation';
@@ -49,6 +51,55 @@ const ALLOWED_CACHE_TABLES = new Set([
 ]);
 
 const GLOBAL_TABLE_WITHOUT_CONDO_ID = new Set(['condominios']);
+
+function verificarPermissaoTabelaCache(ctx: AuthContext, table: string, condominioId?: string): boolean {
+  if (ctx.eAdminGlobal) return true;
+  switch (table) {
+    case 'condominios':
+      return ctx.operador?.ativo !== false;
+    case 'configuracoes':
+    case 'niveis_acesso':
+    case 'lembretes_portaria':
+      return isCondominioAutorizado(ctx, condominioId);
+    case 'operadores':
+      return (
+        podeGerenciarOperadores(ctx, condominioId) &&
+        temPermissaoModuloBackend(ctx, 'cadastros', 'visualizar_operadores', condominioId)
+      );
+    case 'moradores':
+      return (
+        temPermissaoModuloBackend(ctx, 'cadastros', 'visualizar_moradores', condominioId) ||
+        temPermissaoModuloBackend(ctx, 'moradores', 'visualizar', condominioId)
+      );
+    case 'encomendas_itens':
+    case 'entregadores':
+      return temPermissaoModuloBackend(ctx, 'encomendas', 'visualizar', condominioId);
+    case 'custodia':
+      return temPermissaoModuloBackend(ctx, 'custodia', 'visualizar', condominioId);
+    case 'chaves':
+      return temPermissaoModuloBackend(ctx, 'chaves', 'visualizar', condominioId);
+    case 'bancada_volumes':
+      return temPermissaoModuloBackend(ctx, 'bancada', 'visualizar', condominioId);
+    case 'registros_acesso':
+      return temPermissaoModuloBackend(ctx, 'controle_acesso', 'visualizar', condominioId);
+    case 'materiais_posto':
+      return temPermissaoModuloBackend(ctx, 'materiais', 'visualizar', condominioId);
+    case 'rondas_pontos':
+    case 'rondas':
+      return temPermissaoModuloBackend(ctx, 'rondas', 'visualizar', condominioId);
+    case 'ocorrencias':
+      return temPermissaoModuloBackend(ctx, 'ocorrencias', 'visualizar', condominioId);
+    case 'prestadores':
+      return temPermissaoModuloBackend(ctx, 'autorizados', 'visualizar', condominioId);
+    case 'reservas_areas':
+    case 'areas_comuns':
+      return temPermissaoModuloBackend(ctx, 'reservas', 'visualizar', condominioId);
+    case 'manutencoes':
+      return temPermissaoModuloBackend(ctx, 'manutencao', 'visualizar', condominioId);
+    default:
+      return false;
+  }
+}
 
 // Rate limit simples em memória por usuário (30 requisições / 60s)
 const ocrRateMap = new Map<string, { count: number; resetAt: number }>();
@@ -199,6 +250,14 @@ export async function handleOcrEtiqueta(request: Request, env: RuntimeEnv): Prom
   const auth = await authenticateRequest(request, env);
   if (!auth.ok) {
     return jsonResponse({ erro: auth.error }, auth.status);
+  }
+
+  if (
+    !temPermissaoModuloBackend(auth.context, 'encomendas', 'criar') &&
+    !temPermissaoModuloBackend(auth.context, 'encomendas', 'entrada_lote') &&
+    !temPermissaoModuloBackend(auth.context, 'encomendas', 'triagem')
+  ) {
+    return jsonResponse({ erro: 'Sem permissão no módulo Encomendas para leitura OCR de etiquetas.' }, 403);
   }
 
   if (!checkOcrRateLimit(auth.context.authUser.id)) {
@@ -408,6 +467,10 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
     if (!podeGerenciarOperadores(auth.context, targetCondominioId)) {
       return jsonResponse({ error: 'Sem permissão para provisionar operadores neste condomínio.' }, 403);
     }
+    const acaoOperador = operadorIdAlvo ? 'editar_operadores' : 'operadores';
+    if (!temPermissaoModuloBackend(auth.context, 'cadastros', acaoOperador, targetCondominioId)) {
+      return jsonResponse({ error: 'Operador sem permissão funcional no módulo Cadastros (operadores).' }, 403);
+    }
     if (operadorIdAlvo && operadorIdAlvo === auth.context.operador.id) {
       return jsonResponse(
         { error: 'Administrador de condomínio não pode alterar seu próprio perfil, privilégios ou vínculo pelo endpoint administrativo.' },
@@ -477,6 +540,43 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
     return jsonResponse({ error: 'Informe um e-mail válido para criar ou atualizar o acesso Auth.' }, 400);
   }
 
+  const vincularOperadorNoBanco = async (finalAuthUserId: string): Promise<Response | null> => {
+    if (!operadorIdAlvo || !opTarget) return null;
+    const authDivergente = String(opTarget.auth_user_id || '').trim() !== String(finalAuthUserId).trim();
+    const emailDivergente = Boolean(email && String(opTarget.email || '').trim().toLowerCase() !== email);
+    if (!authDivergente && !emailDivergente) return null;
+
+    const patchPayload: Record<string, any> = {
+      auth_user_id: finalAuthUserId,
+      migrado_auth_em: new Date().toISOString()
+    };
+    if (email) {
+      patchPayload.email = email;
+    }
+
+    const patchOpRes = await fetchFn(
+      `${cfg.url}/rest/v1/operadores?id=eq.${encodeURIComponent(operadorIdAlvo)}`,
+      {
+        method: 'PATCH',
+        headers: {
+          ...adminHeaders,
+          Prefer: 'return=representation'
+        },
+        body: JSON.stringify(patchPayload)
+      }
+    );
+    if (!patchOpRes.ok) {
+      const patchErrText = await patchOpRes.text().catch(() => '');
+      return jsonResponse(
+        {
+          error: `Conta Auth processada, mas falhou ao vincular auth_user_id na tabela operadores: ${patchErrText || patchOpRes.status}`
+        },
+        502
+      );
+    }
+    return null;
+  };
+
   try {
     // 1. Atualização de usuário Auth existente
     if (authUserIdExistente && isValidUuid(authUserIdExistente)) {
@@ -494,9 +594,19 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
       if (!updRes.ok) {
         return jsonResponse({ error: updJson?.msg || updJson?.message || 'Erro ao atualizar usuário no Supabase Auth.' }, updRes.status);
       }
+      const finalAuthId = String(updJson?.id || authUserIdExistente);
+      const linkErrRes = await vincularOperadorNoBanco(finalAuthId);
+      if (linkErrRes) return linkErrRes;
+
+      const cache = createUpstashCache(env);
+      await cache.invalidateByTag('table:operadores');
+      if (targetCondominioId) {
+        await cache.invalidateByPattern(`porttohub:v1:condo:${targetCondominioId}:operadores:*`);
+      }
       return jsonResponse({
         sucesso: true,
-        auth_user_id: updJson?.id || authUserIdExistente,
+        auth_user_id: finalAuthId,
+        operador_vinculado: Boolean(operadorIdAlvo),
         acao: 'atualizado'
       });
     }
@@ -553,9 +663,19 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
     const createJson: any = await createRes.json().catch(() => ({}));
 
     if (createRes.ok && createJson?.id) {
+      const finalAuthId = String(createJson.id);
+      const linkErrRes = await vincularOperadorNoBanco(finalAuthId);
+      if (linkErrRes) return linkErrRes;
+
+      const cache = createUpstashCache(env);
+      await cache.invalidateByTag('table:operadores');
+      if (targetCondominioId) {
+        await cache.invalidateByPattern(`porttohub:v1:condo:${targetCondominioId}:operadores:*`);
+      }
       return jsonResponse({
         sucesso: true,
-        auth_user_id: createJson.id,
+        auth_user_id: finalAuthId,
+        operador_vinculado: Boolean(operadorIdAlvo),
         acao: 'criado'
       });
     }
@@ -605,9 +725,19 @@ export async function handleAdminProvisionarOperador(request: Request, env: Runt
           })
         });
         if (syncRes.ok) {
+          const finalAuthId = String(found.id);
+          const linkErrRes = await vincularOperadorNoBanco(finalAuthId);
+          if (linkErrRes) return linkErrRes;
+
+          const cache = createUpstashCache(env);
+          await cache.invalidateByTag('table:operadores');
+          if (targetCondominioId) {
+            await cache.invalidateByPattern(`porttohub:v1:condo:${targetCondominioId}:operadores:*`);
+          }
           return jsonResponse({
             sucesso: true,
-            auth_user_id: found.id,
+            auth_user_id: finalAuthId,
+            operador_vinculado: Boolean(operadorIdAlvo),
             acao: 'vinculado_e_atualizado'
           });
         }
@@ -645,6 +775,10 @@ export async function handleValidarPasseQR(request: Request, env: RuntimeEnv): P
   if (!isCondominioAutorizado(auth.context, condominioId)) {
     return jsonResponse({ valido: false, motivo: 'Acesso negado a este condomínio.' }, 403);
   }
+  const acaoQr = consumir ? 'liberar_entrada' : 'visualizar';
+  if (!temPermissaoModuloBackend(auth.context, 'controle_acesso', acaoQr, condominioId)) {
+    return jsonResponse({ valido: false, motivo: 'Acesso negado: operador sem permissão no módulo Controle de Acesso.' }, 403);
+  }
   if (!token) {
     return jsonResponse({ valido: false, motivo: 'Código do Passe Virtual não informado.' }, 400);
   }
@@ -656,6 +790,13 @@ export async function handleValidarPasseQR(request: Request, env: RuntimeEnv): P
     Authorization: `Bearer ${auth.context.jwt}`,
     'Content-Type': 'application/json'
   };
+  const fallbackHeaders = cfg.serviceRoleKey
+    ? {
+        apikey: cfg.serviceRoleKey,
+        Authorization: `Bearer ${cfg.serviceRoleKey}`,
+        'Content-Type': 'application/json'
+      }
+    : userHeaders;
 
   try {
     // 1. Tenta RPC transacional atômica no PostgreSQL (FOR UPDATE)
@@ -676,7 +817,22 @@ export async function handleValidarPasseQR(request: Request, env: RuntimeEnv): P
       return jsonResponse(rpcJson, rpcJson?.valido ? 200 : 400);
     }
 
-    // 2. Fallback seguro caso RPC ainda não tenha sido aplicada: consulta + CAS condicional
+    const rpcErrText = await rpcRes.text().catch(() => '');
+    const isRpcMissing =
+      rpcRes.status === 404 &&
+      (rpcErrText.includes('PGRST202') || rpcErrText.toLowerCase().includes('could not find the function'));
+
+    if (!isRpcMissing) {
+      return jsonResponse(
+        {
+          valido: false,
+          motivo: 'Falha na validação transacional do Passe Virtual no servidor.'
+        },
+        rpcRes.status >= 400 && rpcRes.status < 500 ? rpcRes.status : 502
+      );
+    }
+
+    // 2. Fallback CAS permitido exclusivamente quando a função RPC ainda não existe (404 PGRST202)
     const tokenLimpo = token.toUpperCase();
     const filtroToken = isValidUuid(token)
       ? `or=(token.ilike.${encodeURIComponent(tokenLimpo)},id.eq.${encodeURIComponent(token)})`
@@ -715,7 +871,7 @@ export async function handleValidarPasseQR(request: Request, env: RuntimeEnv): P
       {
         method: 'PATCH',
         headers: {
-          ...userHeaders,
+          ...fallbackHeaders,
           Prefer: 'return=representation'
         },
         body: JSON.stringify({
@@ -767,7 +923,7 @@ export async function handleValidarPasseQR(request: Request, env: RuntimeEnv): P
         `${cfg.url}/rest/v1/passes_virtuais_qr?id=eq.${encodeURIComponent(passe.id)}&condominio_id=eq.${encodeURIComponent(condominioId)}`,
         {
           method: 'PATCH',
-          headers: userHeaders,
+          headers: fallbackHeaders,
           body: JSON.stringify({ usos_realizados: usosAtuais, status: 'valido' })
         }
       ).catch(() => {});
@@ -838,6 +994,10 @@ export async function handleCacheQuery(request: Request, env: RuntimeEnv): Promi
     filtersList.push(...semCondo);
   }
 
+  if (!verificarPermissaoTabelaCache(auth.context, table, isGlobalTable ? undefined : candidateCondoId)) {
+    return jsonResponse({ erro: `Sem permissão no módulo correspondente para consultar "${table}".`, data: [] }, 403);
+  }
+
   const cache = createUpstashCache(env);
   const cacheKey = buildTenantCacheKey({
     table,
@@ -905,8 +1065,9 @@ export async function handleCacheQuery(request: Request, env: RuntimeEnv): Promi
     queryParams.set('limit', String(Math.min(Number(limit), 2000)));
   }
 
+  const fetchFn = getFetchFn(env);
   const restUrl = `${cfg.url}/rest/v1/${table}?${queryParams.toString()}`;
-  const supabaseRes = await fetch(restUrl, {
+  const supabaseRes = await fetchFn(restUrl, {
     method: 'GET',
     headers: {
       apikey: cfg.anonKey,
@@ -1054,11 +1215,16 @@ export async function handleCacheWarmup(request: Request, env: RuntimeEnv): Prom
     { table: 'bancada_volumes', ttl: 60, select: '*' }
   ];
 
+  const fetchFn = getFetchFn(env);
   const resultados: any[] = [];
   for (const item of tabelasParaAquecer) {
+    if (!verificarPermissaoTabelaCache(auth.context, item.table, condominioId)) {
+      resultados.push({ table: item.table, status: 'negado' });
+      continue;
+    }
     try {
       const restUrl = `${cfg.url}/rest/v1/${item.table}?select=${encodeURIComponent(item.select)}&condominio_id=eq.${encodeURIComponent(condominioId)}`;
-      const resp = await fetch(restUrl, {
+      const resp = await fetchFn(restUrl, {
         headers: {
           apikey: cfg.anonKey,
           Authorization: `Bearer ${auth.context.jwt}`
@@ -1096,9 +1262,10 @@ export async function handleCacheBenchmark(request: Request, env: RuntimeEnv): P
   const cfg = getSupabaseServerConfig(env);
   const cache = createUpstashCache(env);
 
+  const fetchFn = getFetchFn(env);
   try {
     const t0 = Date.now();
-    const supRes = await fetch(`${cfg.url}/rest/v1/condominios?select=id,nome&limit=20`, {
+    const supRes = await fetchFn(`${cfg.url}/rest/v1/condominios?select=id,nome&limit=20`, {
       headers: {
         apikey: cfg.anonKey,
         Authorization: `Bearer ${auth.context.jwt}`

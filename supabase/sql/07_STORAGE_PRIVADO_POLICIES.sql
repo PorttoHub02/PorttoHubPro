@@ -3,18 +3,18 @@
 -- ============================================================================
 -- O QUE ESTE ARQUIVO FAZ:
 --   1. Torna o bucket 'encomendas' PRIVADO (public = FALSE) no Supabase Storage,
---      impedindo que fotos de pacotes, moradores e visitantes sejam acessíveis
---      por links públicos abertos na internet.
---   2. Remove políticas antigas TO public e exige usuário autenticado + acesso
---      ao condomínio dono da pasta (condominios/{condominio_id}/...).
+--      impedindo que fotos de pacotes, moradores, visitantes e avatares sejam
+--      acessíveis por links públicos abertos na internet.
+--   2. Remove políticas antigas TO public e exige usuário autenticado e ativo,
+--      garantindo as 8 políticas privadas oficiais:
+--        - 4 CRUD em `condominios/{condominio_id}/...` (com UUID válido)
+--        - 4 CRUD em `operadores/{auth.uid()}/...` (escopo próprio autenticado)
 --
 -- QUANDO EXECUTAR (SEQUÊNCIA ÚNICA OFICIAL):
---   - Em banco NOVO / implantação inicial: execute normalmente na ordem oficial,
---     logo após 06_RLS_TABELAS_MULTI_TENANT.sql e antes de 08 e 09, garantindo
---     que o Storage já nasça 100% privado antes da publicação no Cloudflare.
---   - Em atualização de sistema legado em produção: certifique-se de que o
---     frontend publicado já utiliza URLs assinadas e prefixo
---     condominios/{condominio_id}/... antes de aplicar este bloqueio.
+--   - Em banco NOVO / implantação inicial: execute na ordem oficial logo após
+--     06_RLS_TABELAS_MULTI_TENANT.sql e antes de 08 e 09.
+--   - Em atualização de produção: execute após garantir que o app usa URLs
+--     assinadas (createSignedUrl) e os prefixos oficiais.
 -- ============================================================================
 
 BEGIN;
@@ -34,7 +34,7 @@ SET
   file_size_limit = 10485760,
   allowed_mime_types = ARRAY['image/jpeg', 'image/png', 'image/webp'];
 
--- 2. Remove políticas públicas antigas do bucket 'encomendas'
+-- 2. Remove políticas públicas antigas e recria políticas oficiais do bucket 'encomendas'
 DROP POLICY IF EXISTS "Permitir_upload_publico_encomendas" ON storage.objects;
 DROP POLICY IF EXISTS "Permitir_leitura_publica_encomendas" ON storage.objects;
 DROP POLICY IF EXISTS "Permitir_update_publico_encomendas" ON storage.objects;
@@ -50,14 +50,17 @@ DROP POLICY IF EXISTS "porttohub_storage_operadores_update" ON storage.objects;
 DROP POLICY IF EXISTS "porttohub_storage_operadores_delete" ON storage.objects;
 
 -- 3. Políticas privadas isoladas por condominio_id no prefixo do path:
---    Formato obrigatório para módulos condominiais: condominios/<condominio_id>/<modulo>/<arquivo>
+--    Formato obrigatório para módulos condominiais: condominios/<condominio_uuid>/<modulo>/<arquivo>
 CREATE POLICY "porttohub_storage_select"
   ON storage.objects
   FOR SELECT
   TO authenticated
   USING (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'condominios'
+    AND (storage.foldername(name))[2] ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
   );
 
@@ -67,7 +70,10 @@ CREATE POLICY "porttohub_storage_insert"
   TO authenticated
   WITH CHECK (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'condominios'
+    AND (storage.foldername(name))[2] ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
   );
 
@@ -77,12 +83,18 @@ CREATE POLICY "porttohub_storage_update"
   TO authenticated
   USING (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'condominios'
+    AND (storage.foldername(name))[2] ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
   )
   WITH CHECK (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'condominios'
+    AND (storage.foldername(name))[2] ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
   );
 
@@ -92,19 +104,23 @@ CREATE POLICY "porttohub_storage_delete"
   TO authenticated
   USING (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'condominios'
+    AND (storage.foldername(name))[2] ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     AND public.operador_pode_acessar_condominio((storage.foldername(name))[2])
   );
 
--- 4. Políticas privadas de foto de perfil do próprio operador autenticado:
+-- 4. Políticas privadas de foto de perfil do próprio operador ativo autenticado:
 --    Formato seguro sem vínculo condominial obrigatório: operadores/<auth.uid()>/<arquivo>
---    Atende inclusive admin_geral sem condomínio ativo, sem conceder acesso a outros condomínios.
 CREATE POLICY "porttohub_storage_operadores_select"
   ON storage.objects
   FOR SELECT
   TO authenticated
   USING (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'operadores'
     AND (
       (storage.foldername(name))[2] = auth.uid()::text
@@ -118,6 +134,8 @@ CREATE POLICY "porttohub_storage_operadores_insert"
   TO authenticated
   WITH CHECK (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'operadores'
     AND (storage.foldername(name))[2] = auth.uid()::text
   );
@@ -128,11 +146,15 @@ CREATE POLICY "porttohub_storage_operadores_update"
   TO authenticated
   USING (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'operadores'
     AND (storage.foldername(name))[2] = auth.uid()::text
   )
   WITH CHECK (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'operadores'
     AND (storage.foldername(name))[2] = auth.uid()::text
   );
@@ -143,6 +165,8 @@ CREATE POLICY "porttohub_storage_operadores_delete"
   TO authenticated
   USING (
     bucket_id = 'encomendas'
+    AND auth.uid() IS NOT NULL
+    AND public.operador_atual_id() IS NOT NULL
     AND (storage.foldername(name))[1] = 'operadores'
     AND (storage.foldername(name))[2] = auth.uid()::text
   );

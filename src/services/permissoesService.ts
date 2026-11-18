@@ -1,6 +1,7 @@
-import { supabase } from './supabase';
+import { supabase, formatarErroDetalhadoSupabase } from './supabase';
 import { isUUID } from './condominioService';
 import { normalizarPerfilOperador, temAcessoGlobalExplicito } from './autorizacaoService';
+import { invalidarCacheTabela } from './redisCacheService';
 
 export interface PermissaoModuloPadrao {
   visualizar?: boolean;
@@ -564,77 +565,77 @@ export async function salvarNivelAcesso(nivel: NivelAcessoItem, condominioId?: s
   const atuais = obterNiveisLocal();
   let targetCondo = condominioId || nivel.condominio_id;
   if (!targetCondo || targetCondo === 'global' || targetCondo === 'todos' || !isUUID(targetCondo)) {
-    try {
-      const { data: c } = await supabase.from('condominios').select('id').limit(1).maybeSingle();
-      if (c?.id && isUUID(c.id)) targetCondo = c.id;
-      else targetCondo = undefined;
-    } catch (e) {
-      // ignore
-    }
+    const { data: c } = await supabase.from('condominios').select('id').limit(1).maybeSingle();
+    if (c?.id && isUUID(c.id)) targetCondo = c.id;
+    else targetCondo = undefined;
+  }
+
+  if (!targetCondo || !isUUID(targetCondo)) {
+    throw new Error('Selecione um condomínio válido antes de salvar níveis de acesso no servidor.');
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new Error('Alteração de níveis de acesso exige conexão ativa com o servidor.');
   }
 
   const nivelParaSalvar: NivelAcessoItem = {
     ...nivel,
-    condominio_id: (targetCondo && isUUID(targetCondo)) ? targetCondo : (isUUID(nivel.condominio_id) ? nivel.condominio_id : null)
+    condominio_id: targetCondo
   };
 
   const idx = atuais.findIndex(n => n.id === nivel.id);
-  let atualizados: NivelAcessoItem[];
+  const atualizados: NivelAcessoItem[] = idx >= 0
+    ? atuais.map((item, i) => (i === idx ? nivelParaSalvar : item))
+    : [...atuais, nivelParaSalvar];
 
-  if (idx >= 0) {
-    atualizados = [...atuais];
-    atualizados[idx] = nivelParaSalvar;
-  } else {
-    atualizados = [...atuais, nivelParaSalvar];
+  const { error: upsertErr } = await supabase
+    .from('configuracoes')
+    .upsert({
+      condominio_id: targetCondo,
+      niveis_acesso: atualizados
+    } as any, { onConflict: 'condominio_id' });
+
+  if (upsertErr) {
+    if (upsertErr.code === '42501' || (upsertErr.message || '').toLowerCase().includes('row-level security')) {
+      throw new Error(formatarErroDetalhadoSupabase(upsertErr, 'Permissão negada para salvar níveis de acesso'));
+    }
+    const { error: updErr } = await supabase
+      .from('configuracoes')
+      .update({ niveis_acesso: atualizados } as any)
+      .eq('condominio_id', targetCondo);
+    if (updErr) {
+      throw new Error(formatarErroDetalhadoSupabase(updErr, 'Falha ao salvar níveis de acesso no Supabase'));
+    }
   }
 
   salvarNiveisLocal(atualizados);
-
-  if (targetCondo && isUUID(targetCondo)) {
-    try {
-      // Salva a lista completa consolidada de níveis para este condomínio (incluindo padrões customizados)
-      const { error: upsertErr } = await supabase
-        .from('configuracoes')
-        .upsert({
-          condominio_id: targetCondo,
-          niveis_acesso: atualizados
-        } as any, { onConflict: 'condominio_id' });
-
-      if (upsertErr) {
-        // Fallback para update simples
-        const { error: updErr } = await supabase
-          .from('configuracoes')
-          .update({ niveis_acesso: atualizados } as any)
-          .eq('condominio_id', targetCondo);
-        if (updErr) {
-          console.warn('Persistência remota de nível no Supabase:', updErr.message);
-        }
-      }
-    } catch (e) {
-      console.warn('Persistência remota de nível de acesso (graceful fallback):', e);
-    }
-  }
+  invalidarCacheTabela('configuracoes', targetCondo);
 }
 
 export async function excluirNivelAcesso(id: string, condominioId?: string): Promise<void> {
   const atuais = obterNiveisLocal();
   const atualizados = atuais.filter(n => n.id !== id);
-  salvarNiveisLocal(atualizados);
 
-  if (condominioId && isUUID(condominioId)) {
-    try {
-      const customizadosDoCondo = atualizados.filter(n => n.condominio_id === condominioId || !n.padrao_sistema);
-      const { error } = await supabase
-        .from('configuracoes')
-        .update({ niveis_acesso: customizadosDoCondo } as any)
-        .eq('condominio_id', condominioId);
-      if (error) {
-        console.warn('Exclusão remota de nível no Supabase:', error.message);
-      }
-    } catch (e) {
-      console.warn('Erro ao atualizar exclusão de nível remoto:', e);
-    }
+  if (!condominioId || !isUUID(condominioId)) {
+    throw new Error('Condomínio inválido para excluir nível de acesso no servidor.');
   }
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new Error('Exclusão de níveis de acesso exige conexão ativa com o servidor.');
+  }
+
+  const customizadosDoCondo = atualizados.filter(n => n.condominio_id === condominioId || !n.padrao_sistema);
+  const { error } = await supabase
+    .from('configuracoes')
+    .update({ niveis_acesso: customizadosDoCondo } as any)
+    .eq('condominio_id', condominioId);
+
+  if (error) {
+    throw new Error(formatarErroDetalhadoSupabase(error, 'Falha ao excluir nível de acesso no Supabase'));
+  }
+
+  salvarNiveisLocal(atualizados);
+  invalidarCacheTabela('configuracoes', condominioId);
 }
 
 /**
@@ -776,14 +777,44 @@ export function obterPermissoesOperador(operador: any): PermissoesModulo {
 export async function salvarPermissoesOperador(
   operadorId: string, 
   permissoes: PermissoesModulo,
-  loginOperador?: string
+  loginOperador?: string,
+  condominioId?: string
 ): Promise<boolean> {
-  if (!operadorId && !loginOperador) return false;
+  if (!operadorId && !loginOperador) {
+    throw new Error('Operador não identificado para atualização de permissões.');
+  }
 
-  const chavePrincipal = operadorId || loginOperador || '';
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new Error('Alteração de permissões exige conexão ativa com o servidor Supabase.');
+  }
 
-  try {
-    // 1. Salva localmente para resposta instantânea (por ID e por Login para máxima confiabilidade)
+  // 1. Persiste primeiro no servidor Supabase (fail-closed: nunca simula sucesso local em caso de rejeição RLS/trigger)
+  let query = supabase
+    .from('operadores')
+    .update({ permissoes } as any);
+
+  if (operadorId && isUUID(operadorId)) {
+    query = query.eq('id', operadorId);
+  } else if (loginOperador) {
+    query = query.eq('login', loginOperador.toLowerCase());
+  } else {
+    query = query.eq('login', operadorId.toLowerCase());
+  }
+
+  const updateRes = await query.select('id, condominio_id');
+
+  if (updateRes.error) {
+    throw new Error(formatarErroDetalhadoSupabase(updateRes.error, 'Falha ao persistir permissões do operador no Supabase'));
+  }
+
+  if (!Array.isArray(updateRes.data) || updateRes.data.length === 0) {
+    throw new Error('Nenhum operador autorizado foi atualizado no servidor (ação bloqueada por RLS ou operador não encontrado).');
+  }
+
+  const atualizadoRow = updateRes.data[0];
+
+  // 2. Somente após confirmação do servidor, sincroniza caches locais e notifica o app
+  if (typeof localStorage !== 'undefined') {
     if (operadorId) {
       localStorage.setItem(`porttohub_operador_permissoes_${operadorId}`, JSON.stringify(permissoes));
     }
@@ -791,7 +822,6 @@ export async function salvarPermissoesOperador(
       localStorage.setItem(`porttohub_operador_permissoes_${loginOperador.toLowerCase()}`, JSON.stringify(permissoes));
     }
 
-    // 2. Atualiza no cache de operadores do localStorage se existir
     try {
       const chavesCache = ['infport_cache_global_operadores', 'infport_cache_local_operadores'];
       for (const k of chavesCache) {
@@ -810,50 +840,19 @@ export async function salvarPermissoesOperador(
         }
       }
     } catch {
-      // ignore
+      // ignore cache parsing errors
     }
-    
-    // 3. Notifica componentes e o App para atualizar operador logado instantaneamente se for ele
+  }
+
+  invalidarCacheTabela('operadores', condominioId || atualizadoRow?.condominio_id);
+
+  if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('permissoes_operador_atualizadas', {
       detail: { operadorId, login: loginOperador, permissoes }
     }));
-
-    // 4. Persiste no banco Supabase se a coluna 'permissoes' estiver disponível
-    try {
-      let updateRes;
-      if (operadorId && isUUID(operadorId)) {
-        updateRes = await supabase
-          .from('operadores')
-          .update({ permissoes } as any)
-          .eq('id', operadorId);
-      } else if (loginOperador) {
-        updateRes = await supabase
-          .from('operadores')
-          .update({ permissoes } as any)
-          .eq('login', loginOperador.toLowerCase());
-      } else if (operadorId) {
-        updateRes = await supabase
-          .from('operadores')
-          .update({ permissoes } as any)
-          .eq('login', operadorId.toLowerCase());
-      }
-
-      if (updateRes && updateRes.error) {
-        if (updateRes.error.code === 'PGRST204' || updateRes.error.message?.includes('permissoes')) {
-          console.warn('Aviso: Coluna "permissoes" ainda não existe na tabela operadores no Supabase. Execute o script SQL no Supabase para persistência remota.');
-        } else {
-          console.warn('Persistindo permissões no Supabase:', updateRes.error.message);
-        }
-      }
-    } catch (errSupabase) {
-      console.warn('Persistindo permissões no Supabase (fallback ativo):', errSupabase);
-    }
-
-    return true;
-  } catch (err) {
-    console.error('Erro ao salvar permissões do operador:', err);
-    return false;
   }
+
+  return true;
 }
 
 /**

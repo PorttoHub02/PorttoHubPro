@@ -6,8 +6,8 @@
 --      encomendas, moradores, acessos e auditoria.
 --   2. Adiciona coluna de idempotência operation_id em encomendas_itens para
 --      evitar duplicações na sincronização offline/online.
---   3. Valida presença de dados órfãos ANTES de sugerir FKs rígidas (NOT VALID
---      ou após conferir 01_DIAGNOSTICO_DESTINO.sql).
+--   3. Garante a constraint `chk_passes_qr_usos_limite` em `passes_virtuais_qr`
+--      e executa `VALIDATE CONSTRAINT` automaticamente quando houver 0 violações.
 --
 -- ONDE EXECUTAR:
 --   Supabase Dashboard do DESTINO -> SQL Editor -> New query -> Run.
@@ -36,6 +36,8 @@ BEGIN
 END $$;
 
 DO $$
+DECLARE
+  v_violacoes BIGINT := 0;
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'moradores') THEN
     CREATE INDEX IF NOT EXISTS idx_moradores_condo_unidade_bloco
@@ -65,6 +67,21 @@ BEGIN
       ALTER TABLE public.passes_virtuais_qr
         ADD CONSTRAINT chk_passes_qr_usos_limite
         CHECK (usos_realizados >= 0 AND usos_realizados <= GREATEST(1, COALESCE(max_usos, limite_usos, 1))) NOT VALID;
+    END IF;
+
+    -- Valida a constraint sem apagar nem modificar registros existentes
+    SELECT COUNT(*)
+    INTO v_violacoes
+    FROM public.passes_virtuais_qr
+    WHERE usos_realizados IS NULL
+       OR usos_realizados < 0
+       OR usos_realizados > GREATEST(1, COALESCE(max_usos, limite_usos, 1));
+
+    IF v_violacoes = 0 THEN
+      ALTER TABLE public.passes_virtuais_qr
+        VALIDATE CONSTRAINT chk_passes_qr_usos_limite;
+    ELSE
+      RAISE NOTICE 'ATENCAO: chk_passes_qr_usos_limite mantida NOT VALID porque ha % registro(s) fora do limite. Nenhum dado foi alterado.', v_violacoes;
     END IF;
   END IF;
 END $$;

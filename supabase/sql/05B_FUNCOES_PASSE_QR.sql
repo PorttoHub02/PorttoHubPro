@@ -5,8 +5,18 @@
 --   Cria a função PostgreSQL transacional `public.validar_e_consumir_passe_qr`
 --   para validar e consumir Passes Virtuais QR de forma atômica no banco,
 --   impedindo corrida concorrente (race condition) de `max_usos`, reutilização
---   após limite, acesso fora da janela de data/horário ou vazamento entre
---   condomínios.
+--   após limite, acesso fora da janela de data/horário, vazamento entre
+--   condomínios, bypass anônimo e falsificação (spoofing) de operador.
+--
+-- SEGURANÇA REFORÇADA:
+--   - Sem exceção baseada em `current_user` (que em SECURITY DEFINER vira
+--     o proprietário 'postgres'). Sem `auth.uid()`, aceita APENAS JWT
+--     comprovadamente `service_role`.
+--   - Usuário autenticado exige operador ativo, vínculo ao condomínio e
+--     permissão no módulo `controle_acesso` (`operador_tem_permissao_modulo`).
+--   - Define flag transacional interna `porttohub.rpc_passe_qr_consumo = '1'`
+--     apenas durante o UPDATE autorizado da RPC, permitindo que a trigger
+--     `proteger_campos_passe_qr` bloqueie alterações diretas do cliente.
 --
 -- PRE-REQUISITO OBRIGATORIO:
 --   Execute após 01_CRIAR_TABELAS_DO_ZERO.sql e 05_FUNCOES_AUTORIZACAO.sql.
@@ -19,7 +29,7 @@ CREATE OR REPLACE FUNCTION public.validar_e_consumir_passe_qr(
   p_token TEXT,
   p_consumir BOOLEAN DEFAULT FALSE,
   p_ponto_acesso TEXT DEFAULT 'Portaria Principal (Pedestres)',
-  p_operador_nome TEXT DEFAULT 'Portaria'
+  p_operador_nome TEXT DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -28,6 +38,10 @@ SET search_path = public, auth
 AS $$
 DECLARE
   v_passe RECORD;
+  v_operador RECORD;
+  v_operador_nome TEXT;
+  v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
+  v_jwt_claims JSONB;
   v_token_limpo TEXT := upper(trim(COALESCE(p_token, '')));
   v_raw_limpo TEXT := trim(COALESCE(p_token, ''));
   v_agora_br TIMESTAMP := NOW() AT TIME ZONE 'America/Sao_Paulo';
@@ -41,10 +55,70 @@ DECLARE
   v_hora_fim TIME;
   v_registro_id UUID;
 BEGIN
-  IF p_condominio_id IS NULL OR NOT public.operador_pode_acessar_condominio(p_condominio_id::text) THEN
+  IF v_jwt_role = '' THEN
+    BEGIN
+      v_jwt_claims := NULLIF(current_setting('request.jwt.claims', TRUE), '')::jsonb;
+      v_jwt_role := lower(trim(COALESCE(v_jwt_claims ->> 'role', '')));
+    EXCEPTION WHEN OTHERS THEN
+      v_jwt_role := '';
+    END;
+  END IF;
+
+  -- 1. Sem auth.uid(), aceita EXCLUSIVAMENTE papel JWT comprovadamente service_role (zero bypass por current_user)
+  IF auth.uid() IS NULL THEN
+    IF v_jwt_role <> 'service_role' THEN
+      RETURN jsonb_build_object(
+        'valido', FALSE,
+        'motivo', 'Autenticação obrigatória para validar ou consumir Passe Virtual.'
+      );
+    END IF;
+    v_operador_nome := COALESCE(NULLIF(trim(p_operador_nome), ''), 'Sistema');
+  ELSE
+    -- 2. Para qualquer usuário autenticado, deriva o operador EXCLUSIVAMENTE por auth.uid() (ignora p_operador_nome do cliente)
+    SELECT o.id, o.nome, o.login, o.email
+    INTO v_operador
+    FROM public.operadores o
+    WHERE o.auth_user_id = auth.uid()
+      AND COALESCE(o.ativo, TRUE) = TRUE
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object(
+        'valido', FALSE,
+        'motivo', 'Operador autenticado inativo ou sem vínculo válido.'
+      );
+    END IF;
+
+    IF p_condominio_id IS NULL OR NOT public.operador_pode_acessar_condominio(p_condominio_id::text) THEN
+      RETURN jsonb_build_object(
+        'valido', FALSE,
+        'motivo', 'Acesso negado: operador não autorizado para este condomínio.'
+      );
+    END IF;
+
+    IF NOT public.operador_tem_permissao_modulo(
+      p_condominio_id::text,
+      'controle_acesso',
+      CASE WHEN COALESCE(p_consumir, FALSE) THEN 'liberar_entrada' ELSE 'visualizar' END
+    ) THEN
+      RETURN jsonb_build_object(
+        'valido', FALSE,
+        'motivo', 'Acesso negado: operador sem permissão no módulo Controle de Acesso.'
+      );
+    END IF;
+
+    v_operador_nome := COALESCE(
+      NULLIF(trim(v_operador.nome), ''),
+      NULLIF(trim(v_operador.login), ''),
+      NULLIF(trim(v_operador.email), ''),
+      'Operador Autenticado'
+    );
+  END IF;
+
+  IF p_condominio_id IS NULL THEN
     RETURN jsonb_build_object(
       'valido', FALSE,
-      'motivo', 'Acesso negado: operador não autorizado para este condomínio.'
+      'motivo', 'Condomínio do Passe Virtual não informado.'
     );
   END IF;
 
@@ -80,9 +154,11 @@ BEGIN
   END IF;
 
   IF v_passe.data_validade IS NOT NULL AND v_passe.data_validade < v_hoje_br THEN
+    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
     UPDATE public.passes_virtuais_qr
     SET status = 'expirado', updated_at = NOW()
     WHERE id = v_passe.id;
+    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
     v_passe.status := 'expirado';
     RETURN jsonb_build_object(
       'valido', FALSE,
@@ -127,9 +203,11 @@ BEGIN
   v_usos_atuais := GREATEST(0, COALESCE(v_passe.usos_realizados, 0));
 
   IF v_usos_atuais >= v_max_usos THEN
+    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
     UPDATE public.passes_virtuais_qr
     SET status = 'utilizado', updated_at = NOW()
     WHERE id = v_passe.id;
+    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
     v_passe.status := 'utilizado';
     RETURN jsonb_build_object(
       'valido', FALSE,
@@ -148,6 +226,7 @@ BEGIN
   v_novos_usos := v_usos_atuais + 1;
   v_novo_status := CASE WHEN v_novos_usos >= v_max_usos THEN 'utilizado' ELSE 'valido' END;
 
+  PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
   UPDATE public.passes_virtuais_qr
   SET
     usos_realizados = v_novos_usos,
@@ -155,6 +234,7 @@ BEGIN
     updated_at = NOW()
   WHERE id = v_passe.id
   RETURNING * INTO v_passe;
+  PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
 
   INSERT INTO public.registros_acesso (
     condominio_id,
@@ -179,7 +259,7 @@ BEGIN
     COALESCE(NULLIF(trim(p_ponto_acesso), ''), 'Portaria Principal (Pedestres)'),
     NOW(),
     'presente',
-    COALESCE(NULLIF(trim(p_operador_nome), ''), 'Portaria'),
+    v_operador_nome,
     format('Liberado via Passe QR (%s) [Uso %s/%s] - %s', v_passe.token, v_novos_usos, v_max_usos, COALESCE(v_passe.observacoes, '')),
     v_passe.id
   )
@@ -195,7 +275,7 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.validar_e_consumir_passe_qr(UUID, TEXT, BOOLEAN, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.validar_e_consumir_passe_qr(UUID, TEXT, BOOLEAN, TEXT, TEXT) FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.validar_e_consumir_passe_qr(UUID, TEXT, BOOLEAN, TEXT, TEXT) TO authenticated, service_role;
 
 COMMIT;

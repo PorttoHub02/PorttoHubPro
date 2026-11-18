@@ -76,9 +76,14 @@ Execute no **SQL Editor** do projeto Supabase novo na ordem exata abaixo (todos 
 7. `05_FUNCOES_AUTORIZACAO.sql` — Funções `SECURITY DEFINER` de autorização (`operador_pode_acessar_condominio`, `operador_tem_acesso_global`, `operador_pode_gerenciar_operadores`, etc.)
 8. `05B_FUNCOES_PASSE_QR.sql` — RPC transacional `validar_e_consumir_passe_qr` com `FOR UPDATE`
 9. `06_RLS_TABELAS_MULTI_TENANT.sql` — Habilitação e políticas RLS por condomínio em todas as tabelas
-10. `07_STORAGE_PRIVADO_POLICIES.sql` — Bucket privado `encomendas` e políticas estritas por prefixo `condominios/{condominio_id}/...` (executado nesta etapa em banco novo antes de publicar o app)
-11. `08_INDICES_E_CONSTRAINTS.sql` — Índices compostos por `condominio_id` e constraints de integridade (`ux_passes_qr_condo_token`, `chk_passes_qr_usos_limite`, etc.)
-12. `09_VALIDACAO_SEGURANCA.sql` — Auditoria automatizada final (deve exibir `OK` nos 6 itens do resumo)
+10. `07_STORAGE_PRIVADO_POLICIES.sql` — Bucket privado `encomendas` e 8 políticas estritas (`condominios/{condominio_id}/...` e `operadores/{auth.uid()}/...`)
+11. `08_INDICES_E_CONSTRAINTS.sql` — Índices compostos por `condominio_id`, constraints de integridade e validação automática de `chk_passes_qr_usos_limite`
+12. `09_VALIDACAO_SEGURANCA.sql` — Auditoria automatizada (deve exibir `OK` nos 10 itens do resumo)
+
+### Atualização Incremental em Banco Já Implantado (Sem Reset)
+Se o projeto Supabase já possui tabelas, Admin Geral e registros operacionais em produção:
+1. Execute `11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql` — Migração idempotente e não destrutiva que aplica `SECURITY INVOKER` na trigger de operadores, proteção da coluna `permissoes`, vinculação de `auth.uid()` no Passe QR, revogação de `anon`/`PUBLIC`/`TRUNCATE`, políticas granulares nas 35 tabelas, 8 políticas de Storage e `VALIDATE CONSTRAINT` segura.
+2. Execute `12_AUDITORIA_FINAL_SEGURANCA.sql` — Auditoria final 100% somente leitura com classificação `OK`, `ATENCAO` ou `FALHA` nas 14 verificações de segurança.
 
 > **ATENÇÃO — NÃO EXECUTAR NA INSTALAÇÃO NORMAL:**
 > O arquivo `10_ROLLBACK_OU_RECUPERACAO.sql` é uma ferramenta manual de **contingência/emergência** (uso exclusivo de suporte caso um operador específico perca vínculo posteriormente). **NÃO execute `10_ROLLBACK_OU_RECUPERACAO.sql` durante a instalação normal.**

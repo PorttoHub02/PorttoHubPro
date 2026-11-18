@@ -738,9 +738,14 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
     setSalvandoPermissoesModal(true);
     try {
       const opId = operadorPermissoesModal.id || operadorPermissoesModal.login;
-      await salvarPermissoesOperador(opId, permissoesModalState, operadorPermissoesModal.login);
+      await salvarPermissoesOperador(
+        opId,
+        permissoesModalState,
+        operadorPermissoesModal.login,
+        operadorPermissoesModal.condominio_id || condoAtivoId
+      );
       
-      // Atualiza na lista de operadores
+      // Atualiza na lista de operadores após confirmação do servidor
       setOperadores(prev => prev.map(o => {
         if (o.id === operadorPermissoesModal.id || o.login === operadorPermissoesModal.login) {
           return { ...o, permissoes: permissoesModalState };
@@ -1553,11 +1558,12 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         .map((row: any) => row.condominio_id);
 
       if (idsParaRemover.length > 0) {
-        await supabase
+        const { error: errDel } = await supabase
           .from('operador_condominios')
           .delete()
           .eq('operador_id', operadorId)
           .in('condominio_id', idsParaRemover);
+        if (errDel) throw errDel;
       }
 
       const rows = listaLimpa.map(cid => ({
@@ -1567,11 +1573,16 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         ativo: true
       }));
 
-      await supabase
+      const { error: errUpsert } = await supabase
         .from('operador_condominios')
         .upsert(rows, { onConflict: 'operador_id,condominio_id' });
+      if (errUpsert) throw errUpsert;
+
+      for (const cid of listaLimpa) {
+        invalidarCacheTabela('operadores', cid);
+      }
     } catch (err) {
-      console.warn('[Cadastros] Aviso ao sincronizar operador_condominios:', err);
+      throw err;
     }
   };
 
@@ -1726,10 +1737,10 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
       };
 
       const fotoUrlNormalizada = normalizarCaminhoStorageParaBanco(fotoOperador) || null;
+      const emailOriginalLimpo = String(opOriginal?.email || '').trim().toLowerCase();
+      const emailMudou = Boolean(emailLimpo && emailLimpo !== emailOriginalLimpo);
 
-      // Provisiona / atualiza credencial no Supabase Auth via backend seguro quando e-mail ou senha informados
-      let authUserIdResolvido: string | null = authUserIdEdicao;
-      if (!idEdicao || senhaLimpa || (emailLimpo && !authUserIdEdicao)) {
+      const chamarProvisionamentoBackend = async (opIdAlvo: string) => {
         const token = await obterAccessTokenAtual();
         if (!token) {
           throw new Error('Sessão Auth expirada. Faça login novamente para provisionar credenciais.');
@@ -1741,7 +1752,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
             Authorization: `Bearer ${token}`
           },
           body: JSON.stringify({
-            operador_id: idEdicao || undefined,
+            operador_id: opIdAlvo,
             email: emailLimpo,
             password: senhaLimpa || undefined,
             nome: nomeOperador.trim(),
@@ -1755,17 +1766,20 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         if (!respProvision.ok) {
           throw new Error(provData?.error || 'Falha ao provisionar usuário no Supabase Auth.');
         }
-        if (provData?.auth_user_id) {
-          authUserIdResolvido = provData.auth_user_id;
-        }
-      }
+        return (provData?.auth_user_id as string | undefined) || null;
+      };
 
       if (idEdicao) {
+        const deveProvisionarAuth = Boolean(senhaLimpa || emailMudou || (emailLimpo && !authUserIdEdicao));
+        const atualizarEmailViaBackend = Boolean(
+          deveProvisionarAuth && !eAdminGlobal && opOriginal?.auth_user_id && emailMudou
+        );
+
+        // Nunca envia auth_user_id direto pelo navegador em edições; vínculo/troca Auth ocorre via backend service_role
         const dadosAtualizacao: any = {
           nome: nomeOperador.trim(),
           login: loginOperador.trim().toLowerCase(),
-          email: emailLimpo || null,
-          auth_user_id: authUserIdResolvido || null,
+          ...(atualizarEmailViaBackend ? {} : { email: emailLimpo || null }),
           nivel_acesso: nivelNum,
           nivel_acesso_custom_id: customId,
           perfil: perfilStr,
@@ -1786,41 +1800,22 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         if (!eAdminGlobal && isCondominioIdValido(targetCondominioId)) {
           updateQuery = updateQuery.eq('condominio_id', targetCondominioId);
         }
-        let { error } = await updateQuery;
-
-        if (error && (
-          error.message?.includes('permissoes') ||
-          error.message?.includes('nivel_acesso_custom_id') || 
-          error.message?.includes('perfil') || 
-          error.message?.includes('funcao') || 
-          error.message?.includes('cargo') || 
-          error.message?.includes('email') ||
-          error.message?.includes('auth_user_id') ||
-          error.message?.includes('acesso_global_condominios') ||
-          error.message?.includes('schema cache') || 
-          error.message?.includes('column') || 
-          (error as any).code === '42703' ||
-          (error as any).code === 'PGRST204'
-        )) {
-          console.warn('Fallback: salvando operador sem colunas extras...');
-          const fallback: any = {
-            nome: nomeOperador.trim(),
-            login: loginOperador.trim().toLowerCase(),
-            nivel_acesso: nivelNum,
-            foto_url: fotoUrlNormalizada,
-            condominio_id: targetCondominioId,
-            ativo: Boolean(ativoOperador)
-          };
-          const retry = await supabase.from('operadores').update(fallback).eq('id', idEdicao);
-          error = retry.error;
-        }
-
+        const { data: opAtualizadoRows, error } = await updateQuery.select('id');
         if (error) throw error;
+        if (!Array.isArray(opAtualizadoRows) || opAtualizadoRows.length === 0) {
+          throw new Error('Operador não atualizado no servidor (verifique permissões de acesso ou vínculo condominial).');
+        }
 
         await sincronizarVinculosOperadorCondominio(idEdicao, targetCondominioId, condominiosPermitidosFinais);
 
-        // Persiste as permissões no storage/estado instantâneo do operador (por ID e Login)
-        await salvarPermissoesOperador(idEdicao, permissoesFinais, loginOperador.trim().toLowerCase());
+        let authUserIdFinal = authUserIdEdicao;
+        if (deveProvisionarAuth && emailLimpo) {
+          const provisionadoId = await chamarProvisionamentoBackend(idEdicao);
+          if (provisionadoId) authUserIdFinal = provisionadoId;
+        }
+
+        // Persiste as permissões no storage/estado instantâneo do operador após sucesso no servidor
+        await salvarPermissoesOperador(idEdicao, permissoesFinais, loginOperador.trim().toLowerCase(), targetCondominioId);
         if (typeof localStorage !== 'undefined') {
           localStorage.setItem(`infport_sindica_unidade_${idEdicao}`, unidadeFinal);
           localStorage.setItem(`infport_sindica_unidade_${loginOperador.trim().toLowerCase()}`, unidadeFinal);
@@ -1832,6 +1827,8 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         setOperadores(prev => prev.map(o => o.id === idEdicao ? { 
           ...o, 
           ...dadosAtualizacao, 
+          email: emailLimpo || o.email || null,
+          auth_user_id: authUserIdFinal || o.auth_user_id || null,
           funcao: funcaoFinal,
           cargo: funcaoFinal,
           permissoes: permissoesFinais, 
@@ -1842,11 +1839,12 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
 
         setMensagem({ tipo: 'sucesso', texto: `Operador (${funcaoFinal}) atualizado com sucesso!` });
       } else {
+        // Novo operador é criado inicialmente com auth_user_id = null; o backend vincula via service_role após inserir
         const novoOp: any = {
           nome: nomeOperador.trim(),
           login: loginOperador.trim().toLowerCase(),
           email: emailLimpo,
-          auth_user_id: authUserIdResolvido || null,
+          auth_user_id: null,
           nivel_acesso: nivelNum,
           nivel_acesso_custom_id: customId,
           perfil: perfilStr,
@@ -1859,35 +1857,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           ativo: Boolean(ativoOperador)
         };
 
-        let { data: opCriado, error } = await supabase.from('operadores').insert([novoOp]).select(OPERADOR_SAFE_COLUMNS).single();
-
-        if (error && (
-          error.message?.includes('permissoes') ||
-          error.message?.includes('nivel_acesso_custom_id') || 
-          error.message?.includes('perfil') || 
-          error.message?.includes('funcao') || 
-          error.message?.includes('cargo') || 
-          error.message?.includes('email') ||
-          error.message?.includes('auth_user_id') ||
-          error.message?.includes('acesso_global_condominios') ||
-          error.message?.includes('schema cache') || 
-          error.message?.includes('column') || 
-          (error as any).code === '42703' ||
-          (error as any).code === 'PGRST204'
-        )) {
-          console.warn('Fallback: cadastrando operador sem colunas extras...');
-          const fallbackOp = {
-            nome: novoOp.nome,
-            login: novoOp.login,
-            nivel_acesso: novoOp.nivel_acesso,
-            condominio_id: novoOp.condominio_id,
-            ativo: Boolean(ativoOperador)
-          };
-          const retry = await supabase.from('operadores').insert([fallbackOp]).select(OPERADOR_SAFE_COLUMNS).single();
-          error = retry.error;
-          opCriado = retry.data;
-        }
-
+        const { data: opCriado, error } = await supabase.from('operadores').insert([novoOp]).select(OPERADOR_SAFE_COLUMNS).single();
         if (error) throw error;
 
         const opIdSalvo = opCriado?.id;
@@ -1895,13 +1865,25 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           await sincronizarVinculosOperadorCondominio(opIdSalvo, targetCondominioId, condominiosPermitidosFinais);
         }
 
-        await salvarPermissoesOperador(opIdSalvo || novoOp.login, permissoesOperador, novoOp.login);
+        await salvarPermissoesOperador(opIdSalvo || novoOp.login, permissoesFinais, novoOp.login, targetCondominioId);
         if (typeof localStorage !== 'undefined') {
           if (opIdSalvo) localStorage.setItem(`porttohub_operador_funcao_${opIdSalvo}`, funcaoFinal);
           if (novoOp.login) localStorage.setItem(`porttohub_operador_funcao_${novoOp.login.toLowerCase()}`, funcaoFinal);
         }
 
         invalidarCacheTabela('operadores', targetCondominioId);
+
+        if (opIdSalvo && (emailLimpo || senhaLimpa)) {
+          try {
+            await chamarProvisionamentoBackend(opIdSalvo);
+          } catch (provErr: any) {
+            await carregarDados();
+            throw new Error(
+              `Operador criado, mas houve falha ao provisionar login no Auth: ${provErr?.message || 'Erro desconhecido'}. Edite o operador para concluir o vínculo.`
+            );
+          }
+        }
+
         window.dispatchEvent(new CustomEvent('operadores_atualizados'));
         setMensagem({ tipo: 'sucesso', texto: `Operador (${funcaoFinal}) cadastrado e vinculado ao Auth com sucesso!` });
       }
