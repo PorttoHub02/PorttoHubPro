@@ -8,6 +8,7 @@ import {
 } from './services/supabase';
 
 import ModuloErrorBoundary from './components/ModuloErrorBoundary';
+import { TelaConfiguracaoPendente } from './components/TelaConfiguracaoPendente';
 
 // Carregador resiliente com retry automático para evitar falhas transitórias de dynamic import
 function lazyWithRetry<T extends React.ComponentType<any>>(
@@ -2055,27 +2056,7 @@ export default function App() {
   }
 
   if (!isSupabaseConfigurado()) {
-    return (
-      <div className="min-h-screen bg-slate-100 dark:bg-slate-950 flex flex-col items-center justify-center p-4 text-slate-900 dark:text-slate-100">
-        <div className="bg-white dark:bg-slate-900 rounded-3xl shadow-2xl w-full max-w-lg p-6 sm:p-8 border border-amber-300 dark:border-amber-800 space-y-4">
-          <div className="flex items-center gap-3">
-            <EmblemaInfport tamanho="lg" />
-            <div>
-              <h1 className="text-xl font-black text-slate-900 dark:text-white">{NOME_APLICACAO}</h1>
-              <p className="text-xs font-bold text-amber-600 dark:text-amber-400 uppercase tracking-wider">
-                Configuração de Ambiente Pendente
-              </p>
-            </div>
-          </div>
-          <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-xs sm:text-sm text-amber-900 dark:text-amber-200 space-y-2">
-            <p className="font-bold">{obterErroConfiguracaoSupabase()}</p>
-            <p>
-              Por segurança, o sistema não utiliza banco hardcoded no código-fonte. Defina <code className="font-mono font-bold">SUPABASE_URL</code> (ou <code className="font-mono font-bold">VITE_SUPABASE_URL</code>) e <code className="font-mono font-bold">SUPABASE_PUBLISHABLE_KEY</code> / <code className="font-mono font-bold">SUPABASE_ANON_KEY</code> (ou <code className="font-mono font-bold">VITE_SUPABASE_ANON_KEY</code>) nas <strong>Variables and Secrets</strong> do Cloudflare Worker (<code className="font-mono font-bold">porttohubpro</code>) ou no <code className="font-mono font-bold">.env</code> e recarregue a página. Consulte <code className="font-mono font-bold">/api/health</code> para verificar quais variáveis foram detectadas.
-            </p>
-          </div>
-        </div>
-      </div>
-    );
+    return <TelaConfiguracaoPendente nomeAplicacao={NOME_APLICACAO} />;
   }
 
   return (
