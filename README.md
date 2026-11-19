@@ -53,9 +53,9 @@ O Worker possui o endpoint dinâmico `GET /env-config.js`, que lê as variáveis
 
 #### Variáveis Públicas (cadastrar como **Text / Plaintext** em *Variables and Secrets*)
 - `SUPABASE_URL` — URL do projeto Supabase (ex.: `https://npqcrifwkfovrrsnktyb.supabase.co`)
-- `SUPABASE_ANON_KEY` — Chave pública `anon` do projeto Supabase
+- `SUPABASE_PUBLISHABLE_KEY` (prioritária) ou `SUPABASE_ANON_KEY` — Chave pública do projeto Supabase
 
-> *(Opcional em builds locais com `.env`: `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`. Em produção no Cloudflare Worker, `SUPABASE_URL` e `SUPABASE_ANON_KEY` já alimentam tanto o backend `/api/*` quanto o frontend via `/env-config.js`.)*
+> *(Opcional em builds locais com `.env`: `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`. Em produção no Cloudflare Worker, `SUPABASE_URL` + `SUPABASE_PUBLISHABLE_KEY` / `SUPABASE_ANON_KEY` alimentam tanto o backend `/api/*` quanto o frontend via `/env-config.js`, preservados automaticamente por `keep_vars: true` no `wrangler.jsonc`.)*
 
 #### Secrets Privados (cadastrar como **Secret / Encrypted** em *Variables and Secrets*)
 - `SUPABASE_SERVICE_ROLE_KEY` — Chave administrativa server-only (obrigatória para provisionamento de operadores; nunca exposta ao navegador)

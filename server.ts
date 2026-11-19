@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import {
   handleHealth,
+  handleEnvConfigJs,
   handleGithubVersao,
   handleOcrEtiqueta,
   handleAdminProvisionarOperador,
@@ -69,16 +70,9 @@ async function sendWebResponse(res: express.Response, webRes: Response): Promise
   res.send(text);
 }
 
-app.get('/env-config.js', (_req, res) => {
-  const publicUrl = String(process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
-  const publicAnonKey = String(process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
-  const payload = {
-    VITE_SUPABASE_URL: publicUrl && !publicUrl.includes('SEU_PROJETO') ? publicUrl : '',
-    VITE_SUPABASE_ANON_KEY: publicAnonKey && !publicAnonKey.includes('SUA_CHAVE') ? publicAnonKey : ''
-  };
-  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  res.send(`window.__PORTTOHUB_PUBLIC_ENV__ = ${JSON.stringify(payload)};`);
+app.get('/env-config.js', async (_req, res) => {
+  const webRes = handleEnvConfigJs(process.env as any);
+  await sendWebResponse(res, webRes);
 });
 
 app.get('/api/health', async (_req, res) => {

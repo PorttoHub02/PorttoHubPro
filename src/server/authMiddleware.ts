@@ -16,21 +16,137 @@ export function isValidUuid(value?: string | null): boolean {
   return Boolean(value && typeof value === 'string' && UUID_REGEX.test(value.trim()));
 }
 
+const URL_PLACEHOLDER_MARKERS = ['SEU_PROJETO', 'configuracao-pendente', 'seu-projeto'];
+const KEY_PLACEHOLDER_MARKERS = ['SUA_CHAVE', 'configuracao-pendente', 'sua-chave'];
+
+function isSecretSupabaseKeyValue(value: string): boolean {
+  const clean = value.trim();
+  if (!clean) return false;
+  if (/^sb_secret_/i.test(clean)) return true;
+
+  const parts = clean.split('.');
+  if (parts.length === 3 && parts[0].startsWith('eyJ')) {
+    try {
+      const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+      const jsonStr =
+        typeof atob === 'function'
+          ? atob(padded)
+          : Buffer.from(padded, 'base64').toString('utf8');
+      const payload = JSON.parse(jsonStr);
+      if (String(payload?.role || '').toLowerCase() === 'service_role') {
+        return true;
+      }
+    } catch {
+      // Ignora payload não-JWT
+    }
+  }
+  return false;
+}
+
+export function isValidSupabaseUrlValue(raw?: string | null): boolean {
+  const clean = String(raw || '').trim();
+  if (!clean) return false;
+  if (URL_PLACEHOLDER_MARKERS.some(marker => clean.includes(marker))) return false;
+  try {
+    const parsed = new URL(clean);
+    return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isValidPublicSupabaseKeyValue(raw?: string | null): boolean {
+  const clean = String(raw || '').trim();
+  if (!clean || clean.length <= 20) return false;
+  if (KEY_PLACEHOLDER_MARKERS.some(marker => clean.includes(marker))) return false;
+  if (isSecretSupabaseKeyValue(clean)) return false;
+  return true;
+}
+
+export interface PublicSupabaseConfig {
+  url: string;
+  publicKey: string;
+  urlSource: 'SUPABASE_URL' | 'VITE_SUPABASE_URL' | null;
+  keySource: 'SUPABASE_PUBLISHABLE_KEY' | 'SUPABASE_ANON_KEY' | 'VITE_SUPABASE_ANON_KEY' | null;
+  urlPresent: boolean;
+  urlValid: boolean;
+  keyPresent: boolean;
+  publicKeyValid: boolean;
+  configured: boolean;
+}
+
+export function resolvePublicSupabaseConfig(env: RuntimeEnv): PublicSupabaseConfig {
+  const urlCandidates: Array<{ name: 'SUPABASE_URL' | 'VITE_SUPABASE_URL'; value: string }> = [
+    { name: 'SUPABASE_URL', value: String(env?.SUPABASE_URL || '').trim() },
+    { name: 'VITE_SUPABASE_URL', value: String(env?.VITE_SUPABASE_URL || '').trim() }
+  ];
+
+  const keyCandidates: Array<{
+    name: 'SUPABASE_PUBLISHABLE_KEY' | 'SUPABASE_ANON_KEY' | 'VITE_SUPABASE_ANON_KEY';
+    value: string;
+  }> = [
+    { name: 'SUPABASE_PUBLISHABLE_KEY', value: String(env?.SUPABASE_PUBLISHABLE_KEY || '').trim() },
+    { name: 'SUPABASE_ANON_KEY', value: String(env?.SUPABASE_ANON_KEY || '').trim() },
+    { name: 'VITE_SUPABASE_ANON_KEY', value: String(env?.VITE_SUPABASE_ANON_KEY || '').trim() }
+  ];
+
+  let url = '';
+  let urlSource: PublicSupabaseConfig['urlSource'] = null;
+  let urlPresent = false;
+  for (const c of urlCandidates) {
+    if (c.value && !URL_PLACEHOLDER_MARKERS.some(m => c.value.includes(m))) {
+      urlPresent = true;
+    }
+    if (!url && isValidSupabaseUrlValue(c.value)) {
+      url = c.value.replace(/\/+$/, '');
+      urlSource = c.name;
+    }
+  }
+
+  let publicKey = '';
+  let keySource: PublicSupabaseConfig['keySource'] = null;
+  let keyPresent = false;
+  for (const c of keyCandidates) {
+    if (c.value && !KEY_PLACEHOLDER_MARKERS.some(m => c.value.includes(m))) {
+      keyPresent = true;
+    }
+    if (!publicKey && isValidPublicSupabaseKeyValue(c.value)) {
+      publicKey = c.value;
+      keySource = c.name;
+    }
+  }
+
+  const urlValid = Boolean(url);
+  const publicKeyValid = Boolean(publicKey);
+
+  return {
+    url,
+    publicKey,
+    urlSource,
+    keySource,
+    urlPresent,
+    urlValid,
+    keyPresent,
+    publicKeyValid,
+    configured: urlValid && publicKeyValid
+  };
+}
+
 export function getSupabaseServerConfig(env: RuntimeEnv): {
   url: string;
   anonKey: string;
   serviceRoleKey: string;
   configured: boolean;
 } {
-  const url = String(env.SUPABASE_URL || env.VITE_SUPABASE_URL || '').trim().replace(/\/+$/, '');
-  const anonKey = String(env.SUPABASE_ANON_KEY || env.VITE_SUPABASE_ANON_KEY || '').trim();
-  const serviceRoleKey = String(env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const pub = resolvePublicSupabaseConfig(env);
+  const serviceRoleKey = String(env?.SUPABASE_SERVICE_ROLE_KEY || env?.SUPABASE_SECRET_KEY || '').trim();
 
   return {
-    url,
-    anonKey,
+    url: pub.url,
+    anonKey: pub.publicKey,
     serviceRoleKey,
-    configured: Boolean(url && anonKey && url.startsWith('http'))
+    configured: pub.configured
   };
 }
 

@@ -841,7 +841,9 @@ export default function App() {
 
     try {
       if (!isSupabaseConfigurado()) {
-        const msgCfg = obterErroConfiguracaoSupabase() || 'Supabase não configurado (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).';
+        const msgCfg =
+          obterErroConfiguracaoSupabase() ||
+          'Supabase não configurado (SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY ou SUPABASE_ANON_KEY).';
         console.error('[PorttoHub][Login] Configuração ausente:', msgCfg);
         setErro(msgCfg);
         setLoading(false);
@@ -2068,7 +2070,7 @@ export default function App() {
           <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-xs sm:text-sm text-amber-900 dark:text-amber-200 space-y-2">
             <p className="font-bold">{obterErroConfiguracaoSupabase()}</p>
             <p>
-              Por segurança, o sistema não utiliza banco hardcoded no código-fonte. Defina <code className="font-mono font-bold">VITE_SUPABASE_URL</code> e <code className="font-mono font-bold">VITE_SUPABASE_ANON_KEY</code> (ou <code className="font-mono font-bold">SUPABASE_URL</code> e <code className="font-mono font-bold">SUPABASE_ANON_KEY</code>) nos <strong>Secrets</strong> do ambiente ou no arquivo <code className="font-mono font-bold">.env</code> e recarregue a página.
+              Por segurança, o sistema não utiliza banco hardcoded no código-fonte. Defina <code className="font-mono font-bold">SUPABASE_URL</code> (ou <code className="font-mono font-bold">VITE_SUPABASE_URL</code>) e <code className="font-mono font-bold">SUPABASE_PUBLISHABLE_KEY</code> / <code className="font-mono font-bold">SUPABASE_ANON_KEY</code> (ou <code className="font-mono font-bold">VITE_SUPABASE_ANON_KEY</code>) nas <strong>Variables and Secrets</strong> do Cloudflare Worker (<code className="font-mono font-bold">porttohubpro</code>) ou no <code className="font-mono font-bold">.env</code> e recarregue a página. Consulte <code className="font-mono font-bold">/api/health</code> para verificar quais variáveis foram detectadas.
             </p>
           </div>
         </div>

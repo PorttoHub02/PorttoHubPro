@@ -6,6 +6,7 @@
 
 import {
   handleHealth,
+  handleEnvConfigJs,
   handleGithubVersao,
   handleOcrEtiqueta,
   handleAdminProvisionarOperador,
@@ -26,20 +27,8 @@ export default {
     const { pathname } = url;
     const method = request.method.toUpperCase();
 
-    if (pathname === '/env-config.js' && method === 'GET') {
-      const publicUrl = String(env.VITE_SUPABASE_URL || env.SUPABASE_URL || '').trim();
-      const publicAnonKey = String(env.VITE_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY || '').trim();
-      const payload = {
-        VITE_SUPABASE_URL: publicUrl && !publicUrl.includes('SEU_PROJETO') ? publicUrl : '',
-        VITE_SUPABASE_ANON_KEY: publicAnonKey && !publicAnonKey.includes('SUA_CHAVE') ? publicAnonKey : ''
-      };
-      return new Response(`window.__PORTTOHUB_PUBLIC_ENV__ = ${JSON.stringify(payload)};`, {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/javascript; charset=utf-8',
-          'Cache-Control': 'no-store'
-        }
-      });
+    if (pathname === '/env-config.js' && (method === 'GET' || method === 'HEAD')) {
+      return handleEnvConfigJs(env);
     }
 
     if (pathname.startsWith('/api/')) {

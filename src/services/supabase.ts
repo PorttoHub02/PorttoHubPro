@@ -21,14 +21,18 @@ function limparValorEnv(val: unknown): string {
   return typeof val === 'string' ? val.trim() : '';
 }
 
-function lerProcessEnv(nome: 'VITE_SUPABASE_URL' | 'SUPABASE_URL' | 'VITE_SUPABASE_ANON_KEY' | 'SUPABASE_ANON_KEY'): string {
+function lerProcessEnv(
+  nome: 'VITE_SUPABASE_URL' | 'SUPABASE_URL' | 'VITE_SUPABASE_ANON_KEY' | 'SUPABASE_ANON_KEY' | 'SUPABASE_PUBLISHABLE_KEY'
+): string {
   if (typeof process !== 'undefined' && process.env && typeof process.env[nome] === 'string') {
     return process.env[nome]!.trim();
   }
   return '';
 }
 
-function lerRuntimePublicEnv(nome: 'VITE_SUPABASE_URL' | 'VITE_SUPABASE_ANON_KEY'): string {
+function lerRuntimePublicEnv(
+  nome: 'SUPABASE_URL' | 'VITE_SUPABASE_URL' | 'SUPABASE_PUBLISHABLE_KEY' | 'SUPABASE_ANON_KEY' | 'VITE_SUPABASE_ANON_KEY'
+): string {
   if (typeof window !== 'undefined') {
     const publicEnv = (window as any).__PORTTOHUB_PUBLIC_ENV__;
     if (publicEnv && typeof publicEnv[nome] === 'string') {
@@ -38,42 +42,118 @@ function lerRuntimePublicEnv(nome: 'VITE_SUPABASE_URL' | 'VITE_SUPABASE_ANON_KEY
   return '';
 }
 
+function ehChaveSecreta(valor: string): boolean {
+  const clean = valor.trim();
+  if (!clean) return false;
+  if (/^sb_secret_/i.test(clean)) return true;
+  const partes = clean.split('.');
+  if (partes.length === 3 && partes[0].startsWith('eyJ')) {
+    try {
+      const b64 = partes[1].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+      const jsonStr =
+        typeof atob === 'function'
+          ? atob(padded)
+          : typeof Buffer !== 'undefined'
+            ? Buffer.from(padded, 'base64').toString('utf8')
+            : '';
+      if (jsonStr) {
+        const payload = JSON.parse(jsonStr);
+        if (String(payload?.role || '').toLowerCase() === 'service_role') {
+          return true;
+        }
+      }
+    } catch {
+      // Ignora payload não-JWT
+    }
+  }
+  return false;
+}
+
+function ehUrlSupabaseValida(envUrl: string): boolean {
+  if (!envUrl || envUrl.includes('configuracao-pendente') || envUrl.includes('SEU_PROJETO')) {
+    return false;
+  }
+  try {
+    const parsed = new URL(envUrl);
+    return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function ehChavePublicaValida(envKey: string): boolean {
+  if (!envKey || envKey.length <= 20 || envKey.includes('configuracao-pendente') || envKey.includes('SUA_CHAVE')) {
+    return false;
+  }
+  if (ehChaveSecreta(envKey)) {
+    return false;
+  }
+  return true;
+}
+
 function mascararChaveAnon(chave: string): string {
   if (!chave) return '(não definida)';
   if (chave.length <= 16) return '*** (inválida / curta demais)';
   return `${chave.slice(0, 12)}...${chave.slice(-6)} (${chave.length} caracteres)`;
 }
 
-/**
- * Resolve a URL do Supabase exclusivamente via variáveis de ambiente.
- * Prioriza acesso estático a import.meta.env.VITE_SUPABASE_URL, depois runtime público do servidor e process.env.
- */
-export function obterSupabaseUrl(): string {
-  const envUrl =
-    limparValorEnv(VITE_SUPABASE_URL_STATIC) ||
-    lerRuntimePublicEnv('VITE_SUPABASE_URL') ||
-    lerProcessEnv('VITE_SUPABASE_URL') ||
-    lerProcessEnv('SUPABASE_URL');
-  if (envUrl && envUrl.startsWith('http') && !envUrl.includes('configuracao-pendente') && !envUrl.includes('SEU_PROJETO')) {
-    return envUrl.replace(/\/+$/, '');
+function resolverUrlComOrigem(): { valor: string; origem: string } {
+  const candidatos: Array<{ valor: string; origem: string }> = [
+    { valor: lerRuntimePublicEnv('SUPABASE_URL'), origem: 'window.__PORTTOHUB_PUBLIC_ENV__.SUPABASE_URL' },
+    { valor: lerRuntimePublicEnv('VITE_SUPABASE_URL'), origem: 'window.__PORTTOHUB_PUBLIC_ENV__.VITE_SUPABASE_URL' },
+    { valor: limparValorEnv(VITE_SUPABASE_URL_STATIC), origem: 'import.meta.env.VITE_SUPABASE_URL' },
+    { valor: lerProcessEnv('SUPABASE_URL'), origem: 'process.env.SUPABASE_URL' },
+    { valor: lerProcessEnv('VITE_SUPABASE_URL'), origem: 'process.env.VITE_SUPABASE_URL' }
+  ];
+
+  for (const c of candidatos) {
+    if (ehUrlSupabaseValida(c.valor)) {
+      return { valor: c.valor.replace(/\/+$/, ''), origem: c.origem };
+    }
   }
-  return '';
+  return { valor: '', origem: 'ausente' };
+}
+
+function resolverKeyComOrigem(): { valor: string; origem: string } {
+  const candidatos: Array<{ valor: string; origem: string }> = [
+    {
+      valor: lerRuntimePublicEnv('SUPABASE_PUBLISHABLE_KEY'),
+      origem: 'window.__PORTTOHUB_PUBLIC_ENV__.SUPABASE_PUBLISHABLE_KEY'
+    },
+    { valor: lerRuntimePublicEnv('SUPABASE_ANON_KEY'), origem: 'window.__PORTTOHUB_PUBLIC_ENV__.SUPABASE_ANON_KEY' },
+    {
+      valor: lerRuntimePublicEnv('VITE_SUPABASE_ANON_KEY'),
+      origem: 'window.__PORTTOHUB_PUBLIC_ENV__.VITE_SUPABASE_ANON_KEY'
+    },
+    { valor: limparValorEnv(VITE_SUPABASE_ANON_KEY_STATIC), origem: 'import.meta.env.VITE_SUPABASE_ANON_KEY' },
+    { valor: lerProcessEnv('SUPABASE_PUBLISHABLE_KEY'), origem: 'process.env.SUPABASE_PUBLISHABLE_KEY' },
+    { valor: lerProcessEnv('SUPABASE_ANON_KEY'), origem: 'process.env.SUPABASE_ANON_KEY' },
+    { valor: lerProcessEnv('VITE_SUPABASE_ANON_KEY'), origem: 'process.env.VITE_SUPABASE_ANON_KEY' }
+  ];
+
+  for (const c of candidatos) {
+    if (ehChavePublicaValida(c.valor)) {
+      return { valor: c.valor, origem: c.origem };
+    }
+  }
+  return { valor: '', origem: 'ausente' };
 }
 
 /**
- * Resolve a Chave Pública (anon/publishable) do Supabase exclusivamente via variáveis de ambiente.
- * Prioriza acesso estático a import.meta.env.VITE_SUPABASE_ANON_KEY, depois runtime público do servidor e process.env.
+ * Resolve a URL do Supabase exclusivamente via variáveis de ambiente.
+ * Prioriza o runtime público injetado pelo Worker (/env-config.js), depois import.meta.env e process.env.
+ */
+export function obterSupabaseUrl(): string {
+  return resolverUrlComOrigem().valor;
+}
+
+/**
+ * Resolve a Chave Pública (Publishable / anon) do Supabase exclusivamente via variáveis de ambiente.
+ * Prioriza o runtime público injetado pelo Worker (/env-config.js), depois import.meta.env e process.env.
  */
 export function obterSupabaseKey(): string {
-  const envKey =
-    limparValorEnv(VITE_SUPABASE_ANON_KEY_STATIC) ||
-    lerRuntimePublicEnv('VITE_SUPABASE_ANON_KEY') ||
-    lerProcessEnv('VITE_SUPABASE_ANON_KEY') ||
-    lerProcessEnv('SUPABASE_ANON_KEY');
-  if (envKey && envKey.length > 20 && !envKey.includes('configuracao-pendente') && !envKey.includes('SUA_CHAVE')) {
-    return envKey;
-  }
-  return '';
+  return resolverKeyComOrigem().valor;
 }
 
 export function isSupabaseConfigurado(): boolean {
@@ -82,10 +162,10 @@ export function isSupabaseConfigurado(): boolean {
 
 export function obterErroConfiguracaoSupabase(): string | null {
   if (!obterSupabaseUrl()) {
-    return 'Variável VITE_SUPABASE_URL não configurada ou inválida neste ambiente.';
+    return 'Variável SUPABASE_URL (ou VITE_SUPABASE_URL) não configurada ou inválida neste ambiente.';
   }
   if (!obterSupabaseKey()) {
-    return 'Variável VITE_SUPABASE_ANON_KEY não configurada ou inválida neste ambiente.';
+    return 'Chave pública do Supabase não configurada ou inválida (defina SUPABASE_PUBLISHABLE_KEY, SUPABASE_ANON_KEY ou VITE_SUPABASE_ANON_KEY).';
   }
   return null;
 }
@@ -171,38 +251,26 @@ export function obterConfiguracaoPooler() {
   };
 }
 
-const urlResolvida = obterSupabaseUrl();
-const keyResolvida = obterSupabaseKey();
+const { valor: urlResolvida, origem: origemUrl } = resolverUrlComOrigem();
+const { valor: keyResolvida, origem: origemKey } = resolverKeyComOrigem();
 const urlInicial = urlResolvida || PLACEHOLDER_URL;
 const keyInicial = keyResolvida || PLACEHOLDER_KEY;
 
-// Log de depuração na inicialização para confirmar carregamento de VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY
+// Log de depuração na inicialização para confirmar carregamento da configuração pública (sem expor segredos)
 if (typeof window !== 'undefined') {
   console.log('[PorttoHub][Supabase Init] Diagnóstico de inicialização:', {
-    viteSupabaseUrlCarregada: Boolean(urlResolvida),
+    supabaseUrlCarregada: Boolean(urlResolvida),
     supabaseUrl: urlResolvida || '(NÃO CONFIGURADA — usando placeholder)',
-    viteSupabaseAnonKeyCarregada: Boolean(keyResolvida),
-    supabaseAnonKeyPreview: mascararChaveAnon(keyResolvida),
-    origemUrl: limparValorEnv(VITE_SUPABASE_URL_STATIC)
-      ? 'import.meta.env.VITE_SUPABASE_URL'
-      : lerRuntimePublicEnv('VITE_SUPABASE_URL')
-        ? 'window.__PORTTOHUB_PUBLIC_ENV__'
-        : lerProcessEnv('VITE_SUPABASE_URL') || lerProcessEnv('SUPABASE_URL')
-          ? 'process.env'
-          : 'ausente',
-    origemKey: limparValorEnv(VITE_SUPABASE_ANON_KEY_STATIC)
-      ? 'import.meta.env.VITE_SUPABASE_ANON_KEY'
-      : lerRuntimePublicEnv('VITE_SUPABASE_ANON_KEY')
-        ? 'window.__PORTTOHUB_PUBLIC_ENV__'
-        : lerProcessEnv('VITE_SUPABASE_ANON_KEY') || lerProcessEnv('SUPABASE_ANON_KEY')
-          ? 'process.env'
-          : 'ausente',
+    supabasePublicKeyCarregada: Boolean(keyResolvida),
+    supabasePublicKeyPreview: mascararChaveAnon(keyResolvida),
+    origemUrl,
+    origemKey,
     clientePronto: Boolean(urlResolvida && keyResolvida)
   });
 
   if (!urlResolvida || !keyResolvida) {
     console.warn(
-      '[PorttoHub][Supabase Init] Configuração pendente: defina VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY (ou SUPABASE_URL e SUPABASE_ANON_KEY) nas variáveis/Secrets do ambiente.'
+      '[PorttoHub][Supabase Init] Configuração pendente: defina SUPABASE_URL e SUPABASE_PUBLISHABLE_KEY (ou SUPABASE_ANON_KEY / VITE_SUPABASE_*) nas variáveis do Cloudflare Worker ou no .env.'
     );
   }
 }

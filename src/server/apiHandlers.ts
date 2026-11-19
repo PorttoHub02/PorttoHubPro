@@ -10,6 +10,7 @@ import {
   isCondominioAutorizado,
   isValidUuid,
   podeGerenciarOperadores,
+  resolvePublicSupabaseConfig,
   temPermissaoModuloBackend,
   type AuthContext
 } from './authMiddleware';
@@ -142,20 +143,81 @@ let cachedVersaoData: any = null;
 let cachedVersaoTimestamp = 0;
 const VERSAO_CACHE_TTL_MS = 15 * 60 * 1000;
 
+export function handleEnvConfigJs(env: RuntimeEnv): Response {
+  const pub = resolvePublicSupabaseConfig(env);
+  const payload: Record<string, any> = {
+    SUPABASE_URL: pub.url,
+    SUPABASE_ANON_KEY: pub.publicKey,
+    VITE_SUPABASE_URL: pub.url,
+    VITE_SUPABASE_ANON_KEY: pub.publicKey,
+    configured: pub.configured
+  };
+  if (pub.keySource === 'SUPABASE_PUBLISHABLE_KEY' && pub.publicKey) {
+    payload.SUPABASE_PUBLISHABLE_KEY = pub.publicKey;
+  }
+
+  return new Response(`window.__PORTTOHUB_PUBLIC_ENV__ = ${JSON.stringify(payload)};`, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+      Pragma: 'no-cache',
+      'X-Content-Type-Options': 'nosniff'
+    }
+  });
+}
+
 export async function handleHealth(env: RuntimeEnv, runtimeName: 'node' | 'cloudflare-worker'): Promise<Response> {
+  const pub = resolvePublicSupabaseConfig(env);
   const sb = getSupabaseServerConfig(env);
   const cache = createUpstashCache(env);
 
+  const missingVariables: string[] = [];
+  if (!pub.urlValid) {
+    missingVariables.push('SUPABASE_URL (ou VITE_SUPABASE_URL)');
+  }
+  if (!pub.publicKeyValid) {
+    missingVariables.push('SUPABASE_PUBLISHABLE_KEY (ou SUPABASE_ANON_KEY / VITE_SUPABASE_ANON_KEY)');
+  }
+
   return jsonResponse({
     ok: true,
+    workerWorking: true,
     service: 'porttohub-api',
     runtime: runtimeName,
     timestamp: new Date().toISOString(),
     configured: {
       supabase: sb.configured,
+      supabaseUrlValid: pub.urlValid,
+      supabasePublicKey: pub.publicKeyValid,
       supabaseAdmin: Boolean(sb.configured && sb.serviceRoleKey),
+      frontendConfigReady: pub.configured,
       upstashRedis: cache.isConfigured(),
       geminiOcr: Boolean(env.GEMINI_API_KEY)
+    },
+    diagnostics: {
+      workerStatus: 'ok',
+      supabaseUrl: {
+        configured: pub.urlPresent,
+        valid: pub.urlValid,
+        source: pub.urlSource,
+        acceptedVariables: ['SUPABASE_URL', 'VITE_SUPABASE_URL'],
+        missing: pub.urlValid ? null : 'SUPABASE_URL (ou VITE_SUPABASE_URL)'
+      },
+      supabasePublicKey: {
+        configured: pub.publicKeyValid,
+        source: pub.keySource,
+        acceptedVariables: ['SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_ANON_KEY', 'VITE_SUPABASE_ANON_KEY'],
+        missing: pub.publicKeyValid
+          ? null
+          : 'SUPABASE_PUBLISHABLE_KEY (ou SUPABASE_ANON_KEY / VITE_SUPABASE_ANON_KEY)'
+      },
+      frontendEnvConfig: {
+        endpoint: '/env-config.js',
+        loaded: pub.configured,
+        ready: pub.configured
+      },
+      missingVariables
     }
   });
 }

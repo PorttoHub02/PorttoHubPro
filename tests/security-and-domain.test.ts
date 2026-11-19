@@ -14,7 +14,8 @@ import {
   verificarCredenciaisOperadorSupabaseAuth
 } from '../src/services/autorizacaoService.ts';
 import {
-  podeGerenciarOperadores as podeGerenciarOperadoresServidor
+  podeGerenciarOperadores as podeGerenciarOperadoresServidor,
+  resolvePublicSupabaseConfig
 } from '../src/server/authMiddleware.ts';
 import {
   buscarMoradoresDaUnidadeExata,
@@ -32,10 +33,17 @@ import {
   validarRegraPasseQR
 } from '../src/services/passeQrValidation.ts';
 import { PORTTOHUB_DB_VERSION } from '../src/services/porttoHubDb.ts';
-import { formatarErroDetalhadoSupabase } from '../src/services/supabase.ts';
+import {
+  formatarErroDetalhadoSupabase,
+  obterSupabaseUrl,
+  obterSupabaseKey,
+  isSupabaseConfigurado,
+  obterErroConfiguracaoSupabase
+} from '../src/services/supabase.ts';
 import { buildTenantCacheKey } from '../src/server/upstashClient.ts';
 import {
   handleHealth,
+  handleEnvConfigJs,
   handleOcrEtiqueta,
   handleAdminProvisionarOperador,
   handleValidarPasseQR,
@@ -44,6 +52,7 @@ import {
   handleCacheStats,
   handleCacheClear
 } from '../src/server/apiHandlers.ts';
+import worker from '../src/worker.ts';
 
 const CONDO_A = '11111111-1111-4111-8111-111111111111';
 const CONDO_B = '22222222-2222-4222-8222-222222222222';
@@ -787,11 +796,17 @@ test('Infraestrutura oficial: diagnóstico seguro em banco vazio, Worker porttoh
   assert.equal(sql07.includes('somente DEPOIS que a versão atualizada'), false);
   assert.ok(sql09.includes('RESUMO CONSOLIDADO'));
 
-  // Worker existente porttohubpro + /env-config.js antes de assets
+  // Worker existente porttohubpro + keep_vars + /env-config.js antes de assets
   assert.equal(wranglerCfg.name, 'porttohubpro');
+  assert.equal(wranglerCfg.keep_vars, true);
   assert.ok(Array.isArray(wranglerCfg.assets?.run_worker_first));
   assert.ok(wranglerCfg.assets.run_worker_first.includes('/api/*'));
   assert.ok(wranglerCfg.assets.run_worker_first.includes('/env-config.js'));
+
+  // index.html carrega /env-config.js dentro de <head> com data-cfasync="false" antes do módulo principal
+  const indexHtml = fs.readFileSync(path.resolve('index.html'), 'utf8');
+  const headSection = indexHtml.split('</head>')[0] || '';
+  assert.ok(headSection.includes('<script src="/env-config.js" data-cfasync="false"></script>'));
 
   // Service worker não pode cachear /env-config.js
   assert.ok(swCode.includes("url.pathname === '/env-config.js'"));
@@ -2444,6 +2459,163 @@ test('[Classificação Administrativa Estrita] Apenas admin_geral (ativo + globa
     (globalThis as any).localStorage = origStorage;
   }
 });
+
+test('[Runtime Cloudflare Worker] Configuração ausente, válida, aliases SUPABASE_/VITE_/Publishable, /env-config.js, /api/health e proteção contra exposição de segredos', async () => {
+  const SECRET_ROLE_JWT =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UifQ.secret_signature_12345';
+  const SECRET_NEW_KEY = 'sb_secret_super_privado_nao_expor_1234567890';
+  const PUBLISHABLE_KEY = 'sb_publishable_publica_producao_1234567890';
+  const ANON_KEY = 'anon_publica_producao_abcdef1234567890';
+  const VITE_ANON_KEY = 'vite_anon_publica_abcdef1234567890';
+
+  // 1. Configuração ausente ou URL inválida -> /api/health informa nomes ausentes sem valores e /env-config.js retorna vazio
+  const emptyHealthRes = await worker.fetch(new Request('https://porttohubpro.example/api/health'), {});
+  assert.equal(emptyHealthRes.status, 200);
+  const emptyHealth: any = await emptyHealthRes.json();
+  assert.equal(emptyHealth.ok, true);
+  assert.equal(emptyHealth.workerWorking, true);
+  assert.equal(emptyHealth.runtime, 'cloudflare-worker');
+  assert.equal(emptyHealth.configured.supabase, false);
+  assert.equal(emptyHealth.configured.supabaseUrlValid, false);
+  assert.equal(emptyHealth.configured.supabasePublicKey, false);
+  assert.equal(emptyHealth.configured.frontendConfigReady, false);
+  assert.ok(emptyHealth.diagnostics.missingVariables.some((v: string) => v.includes('SUPABASE_URL')));
+  assert.ok(emptyHealth.diagnostics.missingVariables.some((v: string) => v.includes('SUPABASE_PUBLISHABLE_KEY')));
+
+  const invalidUrlHealthRes = await worker.fetch(new Request('https://porttohubpro.example/api/health'), {
+    SUPABASE_URL: 'https://SEU_PROJETO.supabase.co',
+    VITE_SUPABASE_URL: 'nota-url-invalida',
+    SUPABASE_ANON_KEY: 'SUA_CHAVE'
+  });
+  const invalidUrlHealth: any = await invalidUrlHealthRes.json();
+  assert.equal(invalidUrlHealth.configured.supabaseUrlValid, false);
+  assert.equal(invalidUrlHealth.configured.supabasePublicKey, false);
+  assert.equal(JSON.stringify(invalidUrlHealth).includes('nota-url-invalida'), false);
+
+  const emptyEnvRes = await worker.fetch(new Request('https://porttohubpro.example/env-config.js'), {});
+  assert.equal(emptyEnvRes.status, 200);
+  assert.ok(String(emptyEnvRes.headers.get('Content-Type') || '').includes('application/javascript'));
+  assert.ok(String(emptyEnvRes.headers.get('Cache-Control') || '').includes('no-store'));
+  const emptyEnvJs = await emptyEnvRes.text();
+  assert.ok(emptyEnvJs.includes('window.__PORTTOHUB_PUBLIC_ENV__ = '));
+
+  // 2. Prioridade de aliases: SUPABASE_URL > VITE_SUPABASE_URL e SUPABASE_PUBLISHABLE_KEY > SUPABASE_ANON_KEY > VITE_SUPABASE_ANON_KEY
+  const prioEnv = {
+    VITE_SUPABASE_URL: 'https://vite-fallback.supabase.co/',
+    SUPABASE_URL: 'https://oficial-prod.supabase.co/',
+    VITE_SUPABASE_ANON_KEY: VITE_ANON_KEY,
+    SUPABASE_ANON_KEY: ANON_KEY,
+    SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_KEY,
+    SUPABASE_SERVICE_ROLE_KEY: SECRET_ROLE_JWT,
+    SUPABASE_SECRET_KEY: SECRET_NEW_KEY,
+    UPSTASH_REDIS_REST_TOKEN: 'upstash_token_privado_xyz',
+    GEMINI_API_KEY: 'AIza_privado_gemini',
+    GITHUB_TOKEN: 'ghp_privado_github'
+  };
+
+  const resolvedPrio = resolvePublicSupabaseConfig(prioEnv);
+  assert.equal(resolvedPrio.url, 'https://oficial-prod.supabase.co');
+  assert.equal(resolvedPrio.urlSource, 'SUPABASE_URL');
+  assert.equal(resolvedPrio.publicKey, PUBLISHABLE_KEY);
+  assert.equal(resolvedPrio.keySource, 'SUPABASE_PUBLISHABLE_KEY');
+  assert.equal(resolvedPrio.configured, true);
+
+  // 3. /env-config.js gerado dinamicamente em runtime pelo Worker e sem exposição de segredos
+  const envConfigRes = await worker.fetch(new Request('https://porttohubpro.example/env-config.js'), prioEnv);
+  assert.equal(envConfigRes.status, 200);
+  const envConfigJs = await envConfigRes.text();
+  assert.ok(envConfigJs.includes('https://oficial-prod.supabase.co'));
+  assert.ok(envConfigJs.includes(PUBLISHABLE_KEY));
+  assert.equal(envConfigJs.includes(SECRET_ROLE_JWT), false, 'Nunca pode expor SUPABASE_SERVICE_ROLE_KEY');
+  assert.equal(envConfigJs.includes(SECRET_NEW_KEY), false, 'Nunca pode expor SUPABASE_SECRET_KEY');
+  assert.equal(envConfigJs.includes('upstash_token_privado_xyz'), false, 'Nunca pode expor UPSTASH_REDIS_REST_TOKEN');
+  assert.equal(envConfigJs.includes('AIza_privado_gemini'), false, 'Nunca pode expor GEMINI_API_KEY');
+  assert.equal(envConfigJs.includes('ghp_privado_github'), false, 'Nunca pode expor GITHUB_TOKEN');
+
+  // Executa o JavaScript gerado e valida leitura no frontend (supabase.ts)
+  const fakeWindow: any = {};
+  const fnExec = new Function('window', envConfigJs);
+  fnExec(fakeWindow);
+  assert.equal(fakeWindow.__PORTTOHUB_PUBLIC_ENV__.SUPABASE_URL, 'https://oficial-prod.supabase.co');
+  assert.equal(fakeWindow.__PORTTOHUB_PUBLIC_ENV__.VITE_SUPABASE_URL, 'https://oficial-prod.supabase.co');
+  assert.equal(fakeWindow.__PORTTOHUB_PUBLIC_ENV__.SUPABASE_PUBLISHABLE_KEY, PUBLISHABLE_KEY);
+  assert.equal(fakeWindow.__PORTTOHUB_PUBLIC_ENV__.VITE_SUPABASE_ANON_KEY, PUBLISHABLE_KEY);
+  assert.equal('SUPABASE_SERVICE_ROLE_KEY' in fakeWindow.__PORTTOHUB_PUBLIC_ENV__, false);
+  assert.equal('SUPABASE_SECRET_KEY' in fakeWindow.__PORTTOHUB_PUBLIC_ENV__, false);
+
+  const origWindow = (globalThis as any).window;
+  const origEnvUrl = process.env.SUPABASE_URL;
+  const origEnvViteUrl = process.env.VITE_SUPABASE_URL;
+  const origEnvKey = process.env.SUPABASE_ANON_KEY;
+  const origEnvViteKey = process.env.VITE_SUPABASE_ANON_KEY;
+  const origEnvPubKey = process.env.SUPABASE_PUBLISHABLE_KEY;
+
+  try {
+    delete process.env.SUPABASE_URL;
+    delete process.env.VITE_SUPABASE_URL;
+    delete process.env.SUPABASE_ANON_KEY;
+    delete process.env.VITE_SUPABASE_ANON_KEY;
+    delete process.env.SUPABASE_PUBLISHABLE_KEY;
+
+    (globalThis as any).window = fakeWindow;
+    assert.equal(obterSupabaseUrl(), 'https://oficial-prod.supabase.co');
+    assert.equal(obterSupabaseKey(), PUBLISHABLE_KEY);
+    assert.equal(isSupabaseConfigurado(), true);
+    assert.equal(obterErroConfiguracaoSupabase(), null);
+
+    // Fallback para aliases VITE_* quando somente VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY existem
+    const viteOnlyEnv = {
+      VITE_SUPABASE_URL: 'https://somente-vite.supabase.co',
+      VITE_SUPABASE_ANON_KEY: VITE_ANON_KEY
+    };
+    const viteRes = await handleEnvConfigJs(viteOnlyEnv);
+    const viteJs = await viteRes.text();
+    const viteWin: any = {};
+    new Function('window', viteJs)(viteWin);
+    (globalThis as any).window = viteWin;
+    assert.equal(obterSupabaseUrl(), 'https://somente-vite.supabase.co');
+    assert.equal(obterSupabaseKey(), VITE_ANON_KEY);
+    assert.equal(isSupabaseConfigurado(), true);
+
+    // Chave secreta colocada acidentalmente em SUPABASE_ANON_KEY deve ser bloqueada e nunca exposta
+    const leakedSecretInAnonEnv = {
+      SUPABASE_URL: 'https://oficial-prod.supabase.co',
+      SUPABASE_ANON_KEY: SECRET_NEW_KEY,
+      VITE_SUPABASE_ANON_KEY: SECRET_ROLE_JWT
+    };
+    const blockedRes = await handleEnvConfigJs(leakedSecretInAnonEnv);
+    const blockedText = await blockedRes.text();
+    assert.equal(blockedText.includes(SECRET_NEW_KEY), false);
+    assert.equal(blockedText.includes(SECRET_ROLE_JWT), false);
+
+    // /api/health com configuração válida completa
+    const okHealthRes = await worker.fetch(new Request('https://porttohubpro.example/api/health'), prioEnv);
+    assert.equal(okHealthRes.status, 200);
+    const okHealth: any = await okHealthRes.json();
+    assert.equal(okHealth.ok, true);
+    assert.equal(okHealth.workerWorking, true);
+    assert.equal(okHealth.configured.supabase, true);
+    assert.equal(okHealth.configured.supabaseUrlValid, true);
+    assert.equal(okHealth.configured.supabasePublicKey, true);
+    assert.equal(okHealth.configured.frontendConfigReady, true);
+    assert.deepEqual(okHealth.diagnostics.missingVariables, []);
+    assert.equal(okHealth.diagnostics.supabaseUrl.source, 'SUPABASE_URL');
+    assert.equal(okHealth.diagnostics.supabasePublicKey.source, 'SUPABASE_PUBLISHABLE_KEY');
+    const healthRaw = JSON.stringify(okHealth);
+    assert.equal(healthRaw.includes('https://oficial-prod.supabase.co'), false, '/api/health não deve expor URL nem valores');
+    assert.equal(healthRaw.includes(PUBLISHABLE_KEY), false, '/api/health não deve expor chave pública');
+    assert.equal(healthRaw.includes(SECRET_ROLE_JWT), false, '/api/health não deve expor service_role');
+    assert.equal(healthRaw.includes(SECRET_NEW_KEY), false, '/api/health não deve expor secret key');
+  } finally {
+    (globalThis as any).window = origWindow;
+    if (origEnvUrl !== undefined) process.env.SUPABASE_URL = origEnvUrl;
+    if (origEnvViteUrl !== undefined) process.env.VITE_SUPABASE_URL = origEnvViteUrl;
+    if (origEnvKey !== undefined) process.env.SUPABASE_ANON_KEY = origEnvKey;
+    if (origEnvViteKey !== undefined) process.env.VITE_SUPABASE_ANON_KEY = origEnvViteKey;
+    if (origEnvPubKey !== undefined) process.env.SUPABASE_PUBLISHABLE_KEY = origEnvPubKey;
+  }
+});
+
 
 
 
