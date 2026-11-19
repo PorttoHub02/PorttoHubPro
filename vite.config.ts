@@ -2,10 +2,66 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
-import {defineConfig} from 'vite';
+import {defineConfig, loadEnv} from 'vite';
 
-export default defineConfig(() => {
+function isSecretBuildKey(val: string): boolean {
+  const clean = val.trim();
+  if (!clean) return false;
+  if (/^sb_secret_/i.test(clean)) return true;
+  const parts = clean.split('.');
+  if (parts.length === 3 && parts[0].startsWith('eyJ')) {
+    try {
+      const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+      const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+      if (String(payload?.role || '').toLowerCase() === 'service_role') return true;
+    } catch {
+      // ignore non-JWT
+    }
+  }
+  return false;
+}
+
+function isValidBuildSupabaseUrl(val: string): boolean {
+  const clean = val.trim();
+  if (!clean || clean.includes('SEU_PROJETO') || clean.includes('configuracao-pendente')) return false;
+  try {
+    const parsed = new URL(clean);
+    return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export default defineConfig(({mode}) => {
+  const loadedEnv = loadEnv(mode, __dirname, '');
+  const mergedEnv = {...loadedEnv, ...process.env};
+
+  const viteUrl = String(mergedEnv.VITE_SUPABASE_URL || '').trim();
+  const supaUrl = String(mergedEnv.SUPABASE_URL || '').trim();
+  const buildFallbackUrl = !viteUrl && isValidBuildSupabaseUrl(supaUrl) ? supaUrl.replace(/\/+$/, '') : '';
+
+  const viteAnon = String(mergedEnv.VITE_SUPABASE_ANON_KEY || '').trim();
+  const supaPub = String(mergedEnv.SUPABASE_PUBLISHABLE_KEY || mergedEnv.SUPABASE_ANON_KEY || '').trim();
+  const buildFallbackKey =
+    !viteAnon &&
+    supaPub.length > 20 &&
+    !supaPub.includes('SUA_CHAVE') &&
+    !supaPub.includes('configuracao-pendente') &&
+    !isSecretBuildKey(supaPub)
+      ? supaPub
+      : '';
+
+  const buildDefine: Record<string, string> = {};
+  if (buildFallbackUrl) {
+    buildDefine['import.meta.env.VITE_SUPABASE_URL'] = JSON.stringify(buildFallbackUrl);
+  }
+  if (buildFallbackKey) {
+    buildDefine['import.meta.env.VITE_SUPABASE_ANON_KEY'] = JSON.stringify(buildFallbackKey);
+  }
+
   return {
+    define: Object.keys(buildDefine).length > 0 ? buildDefine : undefined,
     plugins: [
       react(),
       tailwindcss(),
