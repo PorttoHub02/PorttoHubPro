@@ -12,7 +12,9 @@
     "lint": "tsc --noEmit",
     "test": "tsx --test tests/security-and-domain.test.ts",
     "test:integration": "tsx --test tests/supabase-live-integration.test.ts",
-    "deploy": "npm run build && wrangler deploy"
+    "build:check": "npm test && npm run lint && npm run build",
+    "deploy": "npm test && npm run lint && npm run build && wrangler deploy --keep-vars",
+    "deploy:only": "wrangler deploy --keep-vars"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
