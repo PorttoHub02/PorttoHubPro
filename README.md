@@ -24,12 +24,17 @@ Aplicação web/PWA multi-condomínio (multi-tenant) para operação de portaria
   - Todas as rotas `/api/*` protegidas exigem `Authorization: Bearer <jwt>` verificado diretamente no Supabase Auth.
   - `POST /api/admin/operadores/provisionar` valida no servidor a identidade real do solicitante, impede gestores locais de alterar contas de outros condomínios, contas globais (`acesso_global_condominios = true`) ou fornecer `auth_user_id` arbitrário sem vínculo de `operador_id`.
   - `SUPABASE_SERVICE_ROLE_KEY` nunca é exposta ao frontend nem retornada em respostas HTTP.
-- **PostgreSQL RLS & Storage (`supabase/sql/`)**: políticas baseadas em `auth.uid()` e vínculos em `operadores` / `operador_condominios`, com Storage privado estritamente segregado nos prefixos `condominios/{condominio_id}/...` e `operadores/{auth.uid()}/...` (avatares pessoais privados).
+- **PostgreSQL RLS, Autoria & Storage (`supabase/sql/`)**:
+  - Políticas granulares baseadas em `auth.uid()` e vínculos em `operadores` / `operador_condominios`, com Storage privado estritamente segregado nos prefixos `condominios/{condominio_id}/...` e `operadores/{auth.uid()}/...`.
+  - **Fonte única de permissões personalizadas**: `public.operador_tem_permissao_modulo()` no PostgreSQL, `src/server/authMiddleware.ts` no backend e `src/services/permissoesService.ts` no frontend consultam a matriz `configuracoes.niveis_acesso` do condomínio alvo (com `operadores.permissoes` como camada de override e falha fechada para `nivel_acesso_custom_id` ausente).
+  - **Escopo estrito às 35 tabelas oficiais e preservação de tabelas extras**: Os scripts `06_RLS_TABELAS_MULTI_TENANT.sql` e `11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql` aplicam revogação de privilégios, `GRANT`s, políticas RLS e ajuste de sequências (`pg_depend`) **exclusivamente** sobre a lista canônica das 35 tabelas oficiais do PorttoHub Pro. Caso existam tabelas ou sequências extras no schema `public`, a pré-auditoria as reporta claramente via `RAISE NOTICE` e **preserva integralmente** seus privilégios, políticas e configurações sem alterações silenciosas.
+  - **Proteção de autoria (`historico_absoluto` e `registros_acesso`)**: Triggers `SECURITY INVOKER` gravam automaticamente `operador_id` (e `operador_nome` / `operador_login` / `operador_registro` no caso de auditoria e acessos normais) a partir de `auth.uid()`, impedindo falsificação de identidade pelo cliente (com exceção controlada apenas para `service_role`, SQL Editor administrativo e consumo transacional de Passe QR).
 
 ### 1.3 Controle de Acesso, QR Code e Offline-First
 - **Passes Virtuais QR (`src/services/passeQrValidation.ts`, `src/server/apiHandlers.ts`, `supabase/sql/05B_FUNCOES_PASSE_QR.sql`)**:
   - Tokens gerados com Web Crypto CSPRNG (`crypto.getRandomValues`, formato `PASS-XXXX-XXXX`).
   - Validação e consumo atômico via `POST /api/controle-acesso/validar-passe` e RPC PostgreSQL `validar_e_consumir_passe_qr` (`FOR UPDATE` + controle de fuso `America/Sao_Paulo` + limite `max_usos`).
+  - Autorização via marcador transacional interno em `porttohub_internal.passe_qr_tx_autorizacao` (schema privado inacessível a `PUBLIC`, `anon` e `authenticated`, em substituição ao antigo GUC de sessão), somado a trigger bloqueando alteração direta de campos protegidos em `passes_virtuais_qr`.
   - Modo offline bloqueia validação/consumo de Passes QR para impedir reutilização indevida.
 - **Sincronização Offline (`src/services/offlineSyncEngine.ts`, `src/services/porttoHubDb.ts`)**:
   - Fila persistente com `operation_id` idempotente, `condominio_id` e `operador_id` validados antes do replay no Supabase.
@@ -73,17 +78,17 @@ Execute no **SQL Editor** do projeto Supabase novo na ordem exata abaixo (todos 
    - Informe o e-mail e senha forte do 1º Administrador Geral e mantenha **Auto Confirm User** marcado
 5. `03_VINCULAR_OPERADORES_A_AUTH.sql` — Edite os 3 campos (`v_email_admin`, `v_nome_admin`, `v_nome_condominio`) e execute para criar o 1º condomínio e vincular o Administrador Geral
 6. `04_VINCULOS_OPERADOR_CONDOMINIO.sql` — Tabela oficial multi-vínculo `operador_condominios`
-7. `05_FUNCOES_AUTORIZACAO.sql` — Funções `SECURITY DEFINER` de autorização (`operador_pode_acessar_condominio`, `operador_tem_acesso_global`, `operador_pode_gerenciar_operadores`, etc.)
-8. `05B_FUNCOES_PASSE_QR.sql` — RPC transacional `validar_e_consumir_passe_qr` com `FOR UPDATE`
-9. `06_RLS_TABELAS_MULTI_TENANT.sql` — Habilitação e políticas RLS por condomínio em todas as tabelas
+7. `05_FUNCOES_AUTORIZACAO.sql` — Funções `SECURITY DEFINER` de autorização (`operador_pode_acessar_condominio`, `operador_tem_acesso_global`, `operador_pode_gerenciar_operadores`, `operador_tem_permissao_modulo` unificada com `configuracoes.niveis_acesso`, etc.)
+8. `05B_FUNCOES_PASSE_QR.sql` — Schema privado `porttohub_internal.passe_qr_tx_autorizacao` e RPC transacional `validar_e_consumir_passe_qr` com `FOR UPDATE`
+9. `06_RLS_TABELAS_MULTI_TENANT.sql` — Revogação/grants/RLS estritamente nas 35 tabelas oficiais e sequências vinculadas (preservando eventuais tabelas extras intactas), além de triggers de autoria e proteção de Passe QR
 10. `07_STORAGE_PRIVADO_POLICIES.sql` — Bucket privado `encomendas` e 8 políticas estritas (`condominios/{condominio_id}/...` e `operadores/{auth.uid()}/...`)
 11. `08_INDICES_E_CONSTRAINTS.sql` — Índices compostos por `condominio_id`, constraints de integridade e validação automática de `chk_passes_qr_usos_limite`
 12. `09_VALIDACAO_SEGURANCA.sql` — Auditoria automatizada (deve exibir `OK` nos 10 itens do resumo)
 
 ### Atualização Incremental em Banco Já Implantado (Sem Reset)
 Se o projeto Supabase já possui tabelas, Admin Geral e registros operacionais em produção:
-1. Execute `11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql` — Migração idempotente e não destrutiva que aplica `SECURITY INVOKER` na trigger de operadores, proteção da coluna `permissoes`, vinculação de `auth.uid()` no Passe QR, revogação de `anon`/`PUBLIC`/`TRUNCATE`, políticas granulares nas 35 tabelas, 8 políticas de Storage e `VALIDATE CONSTRAINT` segura.
-2. Execute `12_AUDITORIA_FINAL_SEGURANCA.sql` — Auditoria final 100% somente leitura com classificação `OK`, `ATENCAO` ou `FALHA` nas 14 verificações de segurança.
+1. Execute `11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql` — Migração idempotente e não destrutiva atuando **exclusivamente nas 35 tabelas oficiais** e suas sequências vinculadas (`pg_depend`), preservando qualquer tabela extra existente no schema `public`. Aplica `SECURITY INVOKER` na trigger de operadores e nas triggers de autoria (`historico_absoluto`, `registros_acesso`), unificação de `configuracoes.niveis_acesso`, proteção da coluna `permissoes`, marcador transacional `porttohub_internal.passe_qr_tx_autorizacao`, revogação de `anon`/`PUBLIC`/`TRUNCATE`, políticas granulares nas 35 tabelas, 8 políticas de Storage e `VALIDATE CONSTRAINT` segura.
+2. Execute `12_AUDITORIA_FINAL_SEGURANCA.sql` — Auditoria final 100% somente leitura (4 quadros) com status padronizados (`OK`, `ATENÇÃO`, `FALHA` e `NÃO TESTADO`). As checagens de corpo de função são marcadas explicitamente como `VERIFICAÇÃO ESTRUTURAL`, e testes dinâmicos de `/api/*` ou integração multi-tenant real ficam em `NÃO TESTADO` para execução via `npm run test:integration`.
 
 > **ATENÇÃO — NÃO EXECUTAR NA INSTALAÇÃO NORMAL:**
 > O arquivo `10_ROLLBACK_OU_RECUPERACAO.sql` é uma ferramenta manual de **contingência/emergência** (uso exclusivo de suporte caso um operador específico perca vínculo posteriormente). **NÃO execute `10_ROLLBACK_OU_RECUPERACAO.sql` durante a instalação normal.**

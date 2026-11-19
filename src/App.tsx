@@ -89,7 +89,7 @@ import { limparCacheUrlsAssinadas } from './services/imageUtils';
 import { atualizarCacheAutonomia3Horas } from './services/offlineSyncEngine';
 import { carregarEPreaquecerEncomendas, inicializarRealtimeEncomendas } from './services/encomendasService';
 import { registrarAtividade } from './services/auditoriaService';
-import { carregarNiveisAcesso, verificarPermissao, obterPermissoesOperador } from './services/permissoesService';
+import { carregarNiveisAcesso, limparCacheNiveisAcesso, verificarPermissao } from './services/permissoesService';
 import { isUUID } from './services/condominioService';
 import { aquecerCacheCondominio, invalidarCacheCondominio, limparTodoCache } from './services/redisCacheService';
 import { ImagemOtimizada } from './components/ImagemOtimizada';
@@ -262,9 +262,9 @@ export default function App() {
     const opData = {
       ...opBase,
       permissoes:
-        opBase.permissoes && typeof opBase.permissoes === 'object' && Object.keys(opBase.permissoes).length > 0
+        opBase.permissoes && typeof opBase.permissoes === 'object'
           ? opBase.permissoes
-          : obterPermissoesOperador(opBase)
+          : {}
     };
 
     const [{ data: condosDb, error: condosErr }, vinculosRes] = await Promise.all([
@@ -451,6 +451,7 @@ export default function App() {
 
     const { data: authListener } = supabase.auth.onAuthStateChange((event) => {
       if (event === 'SIGNED_OUT' && montado) {
+        limparCacheNiveisAcesso();
         setOperador(null);
         setCondominio(null);
         setCondominioAtivoId('');
@@ -484,6 +485,7 @@ export default function App() {
   // Garante a autonomia de 3 horas em cache local e pré-carrega encomendas para ZERO DELAY ao abrir o menu
   useEffect(() => {
     if (condominioAtivoId && condominioAtivoId !== 'todos' && condominioAtivoId !== 'global') {
+      carregarNiveisAcesso(condominioAtivoId).catch(() => {});
       atualizarCacheAutonomia3Horas(condominioAtivoId);
       carregarEPreaquecerEncomendas(condominioAtivoId).catch(() => {});
       const desinscreverRealtime = inicializarRealtimeEncomendas(condominioAtivoId);
@@ -1012,6 +1014,7 @@ export default function App() {
     } catch {}
 
     // Limpa cache em memória, URLs assinadas e caches de leitura, preservando fila de ações offline no IndexedDB
+    limparCacheNiveisAcesso();
     limparCacheUrlsAssinadas();
     limparCacheRamCondominio();
     limparCachesLeituraPorLogout();

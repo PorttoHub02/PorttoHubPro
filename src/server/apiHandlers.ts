@@ -1128,6 +1128,9 @@ export async function handleCacheInvalidate(request: Request, env: RuntimeEnv): 
   if (condominioId) {
     if (table) {
       removidos += await cache.invalidateByPattern(`porttohub:v1:condo:${condominioId}:${table}:*`);
+      if (table === 'configuracoes') {
+        removidos += await cache.invalidateByPattern(`porttohub:v1:condo:${condominioId}:niveis_acesso:*`);
+      }
     } else {
       removidos += await cache.invalidateByTag(`condominio:${condominioId}`);
       removidos += await cache.invalidateByPattern(`porttohub:v1:condo:${condominioId}:*`);
@@ -1135,6 +1138,9 @@ export async function handleCacheInvalidate(request: Request, env: RuntimeEnv): 
   } else if (auth.context.eAdminGlobal) {
     if (table) {
       removidos += await cache.invalidateByTag(`table:${table}`);
+      if (table === 'configuracoes') {
+        removidos += await cache.invalidateByTag('table:niveis_acesso');
+      }
     }
     if (tag) {
       removidos += await cache.invalidateByTag(String(tag));
@@ -1142,6 +1148,9 @@ export async function handleCacheInvalidate(request: Request, env: RuntimeEnv): 
   } else if (table) {
     for (const allowedCondo of auth.context.allowedCondominioIds) {
       removidos += await cache.invalidateByPattern(`porttohub:v1:condo:${allowedCondo}:${table}:*`);
+      if (table === 'configuracoes') {
+        removidos += await cache.invalidateByPattern(`porttohub:v1:condo:${allowedCondo}:niveis_acesso:*`);
+      }
     }
   }
 

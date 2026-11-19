@@ -512,6 +512,17 @@ export function salvarNiveisLocal(niveis: NivelAcessoItem[]) {
   }
 }
 
+export function limparCacheNiveisAcesso(): void {
+  cacheNiveisMemoria = null;
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEY_NIVEIS);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 export async function carregarNiveisAcesso(condominioId?: string): Promise<NivelAcessoItem[]> {
   const locais = obterNiveisLocal();
 
@@ -524,24 +535,19 @@ export async function carregarNiveisAcesso(condominioId?: string): Promise<Nivel
     }
 
     if (targetCondo && isUUID(targetCondo)) {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from('configuracoes')
         .select('niveis_acesso')
         .eq('condominio_id', targetCondo)
         .maybeSingle();
 
-      if (data?.niveis_acesso && Array.isArray(data.niveis_acesso) && data.niveis_acesso.length > 0) {
+      if (!error && Array.isArray(data?.niveis_acesso)) {
+        // Fonte única: mescla somente NIVEIS_PADRAO + configuracoes.niveis_acesso do condomínio alvo
+        // (nunca preserva níveis personalizados antigos ou de outro condomínio em localStorage)
         const mapa = new Map<string, NivelAcessoItem>();
         NIVEIS_PADRAO.forEach(n => mapa.set(n.id, JSON.parse(JSON.stringify(n))));
-        locais.forEach(n => {
-          const padrao = mapa.get(n.id);
-          if (padrao) {
-            mapa.set(n.id, { ...padrao, ...n, permissoes: { ...padrao.permissoes, ...(n.permissoes || {}) } });
-          } else {
-            mapa.set(n.id, n);
-          }
-        });
         data.niveis_acesso.forEach((n: NivelAcessoItem) => {
+          if (!n || !n.id) return;
           const padrao = mapa.get(n.id);
           if (padrao) {
             mapa.set(n.id, { ...padrao, ...n, permissoes: { ...padrao.permissoes, ...(n.permissoes || {}) } });
@@ -708,74 +714,132 @@ export function clonarPermissoes(permissoesOrigem: PermissoesModulo): Permissoes
   return JSON.parse(JSON.stringify(permissoesOrigem || {}));
 }
 
-/**
- * Obtém permissões padrão para um nível específico (ex: 'nivel_0', 'nivel_1', 'nivel_2', 'nivel_3', 'nivel_4')
- */
-export function obterPermissoesPadraoNivel(nivel: string): PermissoesModulo {
-  const chave = nivel.startsWith('nivel_') ? nivel : `nivel_${nivel}`;
+function ehIdNivelCustomizado(nivelId: string): boolean {
+  const clean = String(nivelId || '').trim();
+  return Boolean(clean && !['nivel_0', 'nivel_1', 'nivel_2', 'nivel_3', 'nivel_4'].includes(clean));
+}
+
+function normalizarIdNivel(nivel: string): string {
+  const raw = String(nivel || '').trim();
+  if (!raw) return 'nivel_3';
+  if (raw.startsWith('nivel_') || raw.startsWith('custom_')) return raw;
+  if (/^\d+$/.test(raw)) return `nivel_${raw}`;
   const todos = obterNiveisLocal();
-  const nivelEncontrado = todos.find(n => n.id === chave) || NIVEIS_PADRAO.find(n => n.id === chave) || NIVEIS_PADRAO.find(n => n.id === 'nivel_3');
-  return JSON.parse(JSON.stringify(nivelEncontrado?.permissoes || NIVEIS_PADRAO[3].permissoes));
+  if (todos.some(n => n.id === raw)) return raw;
+  return `nivel_${raw}`;
 }
 
 /**
- * Obtém as permissões configuradas diretamente para um operador (no card dele)
+ * Obtém permissões configuradas para um nível específico ('nivel_0'..'nivel_4' ou 'custom_*').
+ * Nível personalizado inexistente falha fechado ({}).
+ */
+export function obterPermissoesPadraoNivel(nivel: string, niveis?: NivelAcessoItem[]): PermissoesModulo {
+  const todos = niveis || obterNiveisLocal();
+  const chave = normalizarIdNivel(nivel);
+  const nivelDireto = todos.find(n => n.id === nivel || n.id === chave);
+  if (nivelDireto) {
+    return JSON.parse(JSON.stringify(nivelDireto.permissoes || {}));
+  }
+  if (ehIdNivelCustomizado(chave) || String(nivel || '').startsWith('custom_')) {
+    return {};
+  }
+  const padrao = NIVEIS_PADRAO.find(n => n.id === chave) || NIVEIS_PADRAO.find(n => n.id === 'nivel_3');
+  return JSON.parse(JSON.stringify(padrao?.permissoes || NIVEIS_PADRAO[3].permissoes));
+}
+
+function mesclarPermissoesBaseEOverrides(
+  base: PermissoesModulo,
+  overrides: Record<string, any> | null | undefined
+): PermissoesModulo {
+  const resultado: any = JSON.parse(JSON.stringify(base || {}));
+  if (!overrides || typeof overrides !== 'object') return resultado;
+
+  for (const [k, v] of Object.entries(overrides)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      resultado[k] = {
+        ...(resultado[k] && typeof resultado[k] === 'object' ? resultado[k] : {}),
+        ...v
+      };
+    } else if (v !== undefined) {
+      resultado[k] = v;
+    }
+  }
+  return resultado;
+}
+
+/**
+ * Extrai somente os overrides em relação ao nível base em configuracoes.niveis_acesso
+ * para evitar congelar matrizes inteiras em operadores.permissoes.
+ */
+export function extrairOverridesOperador(
+  permissoesAtuais: PermissoesModulo,
+  nivelId: string,
+  niveis?: NivelAcessoItem[],
+  unidade?: string
+): Record<string, any> {
+  const base = obterPermissoesPadraoNivel(nivelId, niveis) as Record<string, any>;
+  const atuais = (permissoesAtuais || {}) as Record<string, any>;
+  const overrides: Record<string, any> = {};
+
+  for (const [modKey, modVal] of Object.entries(atuais)) {
+    if (modKey === 'unidade_acesso' || modKey === 'unidade') continue;
+    if (!modVal || typeof modVal !== 'object' || Array.isArray(modVal)) continue;
+
+    const baseMod = base[modKey] && typeof base[modKey] === 'object' ? base[modKey] : {};
+    const diffMod: Record<string, any> = {};
+
+    for (const [acaoKey, acaoVal] of Object.entries(modVal)) {
+      if (acaoVal === undefined) continue;
+      if (baseMod[acaoKey] === undefined || Boolean(acaoVal) !== Boolean(baseMod[acaoKey])) {
+        diffMod[acaoKey] = Boolean(acaoVal);
+      }
+    }
+
+    if (Object.keys(diffMod).length > 0) {
+      overrides[modKey] = diffMod;
+    }
+  }
+
+  const unidadeFinal = unidade || atuais.unidade_acesso || atuais.unidade;
+  if (unidadeFinal) {
+    overrides.unidade_acesso = unidadeFinal;
+    overrides.unidade = unidadeFinal;
+  }
+
+  return overrides;
+}
+
+/**
+ * Resolve as permissões efetivas de um operador:
+ * combina configuracoes.niveis_acesso (fonte única) + overrides granulares de operadores.permissoes.
+ * Sem fallback para localStorage legado de operadores.
  */
 export function obterPermissoesOperador(operador: any): PermissoesModulo {
-  if (!operador) return obterPermissoesPadraoNivel('nivel_3');
+  if (!operador) return {};
 
-  // 1. Se já está no objeto do operador (vindo diretamente do banco ou estado sincronizado)
+  const idNivel = extrairIdNivel(operador);
+  const todos = obterNiveisLocal();
+  const nivelEncontrado = todos.find(n => n.id === idNivel);
+  const ehCustom = ehIdNivelCustomizado(idNivel) && Boolean(operador.nivel_acesso_custom_id);
+
+  // Nível personalizado inexistente falha fechado ({})
+  if (ehCustom && !nivelEncontrado) {
+    return {};
+  }
+
+  const base = obterPermissoesPadraoNivel(idNivel, todos);
   if (operador.permissoes && typeof operador.permissoes === 'object' && Object.keys(operador.permissoes).length > 0) {
-    return JSON.parse(JSON.stringify(operador.permissoes));
+    return mesclarPermissoesBaseEOverrides(base, operador.permissoes);
   }
 
-  // 2. Se está armazenado no localStorage específico do operador por ID ou Login
-  const chavesIdentificadoras = [operador.id, operador.login].filter(Boolean);
-  for (const chave of chavesIdentificadoras) {
-    try {
-      const salvo = localStorage.getItem(`porttohub_operador_permissoes_${chave}`);
-      if (salvo) {
-        const parsed = JSON.parse(salvo);
-        if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
-          return parsed;
-        }
-      }
-    } catch {
-      // continua tentando demais chaves
-    }
-  }
-
-  // 3. Tenta localizar na lista cacheada de operadores locais
-  try {
-    const rawOps = localStorage.getItem('infport_cache_global_operadores') || localStorage.getItem('infport_cache_local_operadores');
-    if (rawOps) {
-      const parsedOps = JSON.parse(rawOps);
-      if (Array.isArray(parsedOps)) {
-        const opEncontrado = parsedOps.find(o => 
-          (operador.id && o.id === operador.id) || 
-          (operador.login && o.login?.toLowerCase() === operador.login?.toLowerCase())
-        );
-        if (opEncontrado?.permissoes && typeof opEncontrado.permissoes === 'object' && Object.keys(opEncontrado.permissoes).length > 0) {
-          return JSON.parse(JSON.stringify(opEncontrado.permissoes));
-        }
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  // 4. Fallback para as permissões do nível do operador
-  const nivelStr = operador.nivel_acesso_custom_id || 
-                  (operador.nivel_acesso !== undefined && operador.nivel_acesso !== null ? `nivel_${operador.nivel_acesso}` : null) ||
-                  (operador.perfil ? `nivel_${operador.perfil}` : 'nivel_3');
-  return obterPermissoesPadraoNivel(nivelStr);
+  return base;
 }
 
 /**
- * Salva as permissões granulares diretamente no card do operador
+ * Salva as permissões granulares diretamente no card do operador (somente no Supabase; fail-closed)
  */
 export async function salvarPermissoesOperador(
-  operadorId: string, 
+  operadorId: string,
   permissoes: PermissoesModulo,
   loginOperador?: string,
   condominioId?: string
@@ -788,7 +852,7 @@ export async function salvarPermissoesOperador(
     throw new Error('Alteração de permissões exige conexão ativa com o servidor Supabase.');
   }
 
-  // 1. Persiste primeiro no servidor Supabase (fail-closed: nunca simula sucesso local em caso de rejeição RLS/trigger)
+  // Persiste primeiro no servidor Supabase (fail-closed: nunca simula sucesso local em caso de rejeição RLS/trigger)
   let query = supabase
     .from('operadores')
     .update({ permissoes } as any);
@@ -813,37 +877,6 @@ export async function salvarPermissoesOperador(
 
   const atualizadoRow = updateRes.data[0];
 
-  // 2. Somente após confirmação do servidor, sincroniza caches locais e notifica o app
-  if (typeof localStorage !== 'undefined') {
-    if (operadorId) {
-      localStorage.setItem(`porttohub_operador_permissoes_${operadorId}`, JSON.stringify(permissoes));
-    }
-    if (loginOperador) {
-      localStorage.setItem(`porttohub_operador_permissoes_${loginOperador.toLowerCase()}`, JSON.stringify(permissoes));
-    }
-
-    try {
-      const chavesCache = ['infport_cache_global_operadores', 'infport_cache_local_operadores'];
-      for (const k of chavesCache) {
-        const raw = localStorage.getItem(k);
-        if (raw) {
-          const ops = JSON.parse(raw);
-          if (Array.isArray(ops)) {
-            const atualizados = ops.map(o => {
-              if ((operadorId && o.id === operadorId) || (loginOperador && o.login?.toLowerCase() === loginOperador.toLowerCase())) {
-                return { ...o, permissoes };
-              }
-              return o;
-            });
-            localStorage.setItem(k, JSON.stringify(atualizados));
-          }
-        }
-      }
-    } catch {
-      // ignore cache parsing errors
-    }
-  }
-
   invalidarCacheTabela('operadores', condominioId || atualizadoRow?.condominio_id);
 
   if (typeof window !== 'undefined') {
@@ -865,30 +898,43 @@ export function contarModulosHabilitados(permissoes: PermissoesModulo): number {
 
 export function extrairIdNivel(operador: any): string {
   if (!operador) return 'nivel_3';
+  const ehAdminGeral = temAcessoGlobalExplicito(operador);
+  if (ehAdminGeral) {
+    const customAdm = String(operador.nivel_acesso_custom_id || '').trim();
+    return customAdm || 'nivel_0';
+  }
+
+  const perfilPadrao = normalizarPerfilOperador(operador);
+  const rawPerfil = String(operador.perfil || '').trim().toLowerCase();
+  const ehSindicoPerfil = perfilPadrao === 'operador' && rawPerfil.includes('sind');
+  const perfilNivelId =
+    perfilPadrao === 'admin_condominio'
+      ? 'nivel_1'
+      : perfilPadrao === 'supervisor'
+        ? 'nivel_2'
+        : ehSindicoPerfil
+          ? 'nivel_4'
+          : 'nivel_3';
+
   if (operador.nivel_acesso_custom_id) {
-    return String(operador.nivel_acesso_custom_id).trim();
-  }
-  const rawNivel = operador.nivel_acesso ?? operador.nivel;
-  if (rawNivel !== undefined && rawNivel !== null && String(rawNivel).trim() !== '') {
-    const s = String(rawNivel).trim();
-    if (s.startsWith('nivel_')) return s;
-    if (s.startsWith('custom_')) return s;
-    if (s === '0' && !temAcessoGlobalExplicito(operador)) {
-      return 'nivel_1';
+    const customId = String(operador.nivel_acesso_custom_id).trim();
+    const customLower = customId.toLowerCase();
+    if (['0', '1', 'nivel_0', 'nivel_1'].includes(customLower)) {
+      return perfilNivelId;
     }
-    return `nivel_${s}`;
+    if (['2', 'nivel_2'].includes(customLower) && perfilPadrao !== 'admin_condominio' && perfilPadrao !== 'supervisor') {
+      return perfilNivelId;
+    }
+    if (['4', 'nivel_4'].includes(customLower) && perfilPadrao !== 'admin_condominio' && perfilPadrao !== 'supervisor' && !ehSindicoPerfil) {
+      return perfilNivelId;
+    }
+    if (['nivel_2', 'nivel_3', 'nivel_4'].includes(customLower)) {
+      return customLower;
+    }
+    return customId;
   }
-  const rawPerfil = operador.perfil ? String(operador.perfil).trim().toLowerCase() : '';
-  if (rawPerfil) {
-    if (rawPerfil === 'admin_geral' && temAcessoGlobalExplicito(operador)) return 'nivel_0';
-    if (rawPerfil === 'admin_condominio' || rawPerfil === 'admin_local' || rawPerfil === 'admin' || rawPerfil === 'master') return 'nivel_1';
-    if (rawPerfil === 'supervisor') return 'nivel_2';
-    if (rawPerfil === 'operador' || rawPerfil === 'porteiro') return 'nivel_3';
-    if (rawPerfil === 'sindico') return 'nivel_4';
-    if (rawPerfil.startsWith('nivel_')) return rawPerfil;
-    return `nivel_${rawPerfil}`;
-  }
-  return 'nivel_3';
+
+  return perfilNivelId;
 }
 
 export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: string, acao: string): boolean | undefined {
@@ -899,13 +945,13 @@ export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: st
     return Boolean(permissoesModulo[acao]);
   }
 
-  // 2. Aliases cruzados específicos por módulo
+  // 2. Aliases cruzados específicos por módulo (falha fechada, sem conceder acesso implícito)
   if (modKey === 'chaves') {
     if (acao === 'excluir') return permissoesModulo.excluir;
     if (acao === 'cadastrar' || acao === 'criar') return permissoesModulo.cadastrar ?? permissoesModulo.criar;
     if (acao === 'editar') return permissoesModulo.editar ?? permissoesModulo.cadastrar;
-    if (acao === 'emprestar') return permissoesModulo.emprestar ?? permissoesModulo.criar ?? true;
-    if (acao === 'devolver') return permissoesModulo.devolver ?? permissoesModulo.editar ?? true;
+    if (acao === 'emprestar') return permissoesModulo.emprestar ?? permissoesModulo.criar;
+    if (acao === 'devolver') return permissoesModulo.devolver ?? permissoesModulo.editar;
   }
 
   if (modKey === 'encomendas') {
@@ -920,8 +966,8 @@ export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: st
 
   if (modKey === 'autorizados' || modKey === 'prestadores') {
     if (acao === 'cadastrar' || acao === 'criar') return permissoesModulo.cadastrar ?? permissoesModulo.criar;
-    if (acao === 'dar_entrada') return permissoesModulo.dar_entrada ?? permissoesModulo.cadastrar ?? permissoesModulo.criar ?? true;
-    if (acao === 'dar_saida') return permissoesModulo.dar_saida ?? permissoesModulo.editar ?? true;
+    if (acao === 'dar_entrada') return permissoesModulo.dar_entrada ?? permissoesModulo.cadastrar ?? permissoesModulo.criar;
+    if (acao === 'dar_saida') return permissoesModulo.dar_saida ?? permissoesModulo.editar;
     if (acao === 'editar') return permissoesModulo.editar ?? permissoesModulo.cadastrar;
     if (acao === 'excluir') return permissoesModulo.excluir;
   }
@@ -938,31 +984,31 @@ export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: st
   }
 
   if (modKey === 'rondas') {
-    if (acao === 'iniciar_ronda') return permissoesModulo.iniciar_ronda ?? permissoesModulo.criar ?? true;
+    if (acao === 'iniciar_ronda') return permissoesModulo.iniciar_ronda ?? permissoesModulo.criar;
     if (acao === 'cadastrar_pontos' || acao === 'criar') return permissoesModulo.cadastrar_pontos ?? permissoesModulo.criar;
     if (acao === 'setores') return permissoesModulo.setores ?? permissoesModulo.editar;
   }
 
   if (modKey === 'passagem_posto' || modKey === 'passagem') {
-    if (acao === 'assumir_posto' || acao === 'criar') return permissoesModulo.assumir_posto ?? permissoesModulo.criar ?? true;
+    if (acao === 'assumir_posto' || acao === 'criar') return permissoesModulo.assumir_posto ?? permissoesModulo.criar;
     if (acao === 'relatorio') return permissoesModulo.relatorio ?? permissoesModulo.visualizar;
   }
 
   if (modKey === 'cadastros') {
     if (acao === 'operadores' || acao === 'cadastrar_operadores') return permissoesModulo.operadores ?? permissoesModulo.cadastrar_operadores ?? permissoesModulo.criar;
-    if (acao === 'visualizar_operadores') return permissoesModulo.visualizar_operadores ?? permissoesModulo.operadores ?? permissoesModulo.visualizar ?? true;
+    if (acao === 'visualizar_operadores') return permissoesModulo.visualizar_operadores ?? permissoesModulo.operadores ?? permissoesModulo.visualizar;
     if (acao === 'editar_operadores') return permissoesModulo.editar_operadores ?? permissoesModulo.operadores ?? permissoesModulo.editar;
     if (acao === 'alterar_senha_operador') return permissoesModulo.alterar_senha_operador ?? permissoesModulo.editar_operadores ?? permissoesModulo.operadores;
     if (acao === 'excluir_operadores') return permissoesModulo.excluir_operadores ?? permissoesModulo.excluir ?? false;
     if (acao === 'moradores' || acao === 'gerenciar_moradores') return permissoesModulo.moradores ?? permissoesModulo.criar;
-    if (acao === 'visualizar_moradores') return permissoesModulo.visualizar_moradores ?? permissoesModulo.moradores ?? permissoesModulo.visualizar ?? true;
+    if (acao === 'visualizar_moradores') return permissoesModulo.visualizar_moradores ?? permissoesModulo.moradores ?? permissoesModulo.visualizar;
     if (acao === 'cadastrar_morador') return permissoesModulo.cadastrar_morador ?? permissoesModulo.moradores ?? permissoesModulo.criar;
     if (acao === 'editar_morador') return permissoesModulo.editar_morador ?? permissoesModulo.moradores ?? permissoesModulo.editar;
     if (acao === 'excluir_morador') return permissoesModulo.excluir_morador ?? permissoesModulo.excluir ?? false;
-    if (acao === 'gerenciar_veiculos' || acao === 'veiculos') return permissoesModulo.gerenciar_veiculos ?? permissoesModulo.moradores ?? permissoesModulo.editar ?? true;
+    if (acao === 'gerenciar_veiculos' || acao === 'veiculos') return permissoesModulo.gerenciar_veiculos ?? permissoesModulo.moradores ?? permissoesModulo.editar;
     if (acao === 'vincular_tags' || acao === 'tags_rfid') return permissoesModulo.vincular_tags ?? permissoesModulo.moradores ?? permissoesModulo.editar;
     if (acao === 'status_acesso_morador') return permissoesModulo.status_acesso_morador ?? permissoesModulo.editar_morador ?? permissoesModulo.moradores;
-    if (acao === 'exportar_moradores') return permissoesModulo.exportar_moradores ?? permissoesModulo.visualizar_moradores ?? permissoesModulo.visualizar ?? true;
+    if (acao === 'exportar_moradores') return permissoesModulo.exportar_moradores ?? permissoesModulo.visualizar_moradores ?? permissoesModulo.visualizar;
     if (acao === 'configurar_condominio') return permissoesModulo.configurar_condominio ?? permissoesModulo.condominios ?? permissoesModulo.editar;
     if (acao === 'condominios') return permissoesModulo.condominios ?? permissoesModulo.criar;
     if (acao === 'gerenciar_niveis') return permissoesModulo.gerenciar_niveis ?? permissoesModulo.editar;
@@ -976,12 +1022,12 @@ export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: st
   }
 
   if (modKey === 'ocorrencias') {
-    if (acao === 'criar' || acao === 'cadastrar') return permissoesModulo.criar ?? permissoesModulo.cadastrar ?? true;
+    if (acao === 'criar' || acao === 'cadastrar') return permissoesModulo.criar ?? permissoesModulo.cadastrar;
     if (acao === 'resolver' || acao === 'editar') return permissoesModulo.resolver ?? permissoesModulo.editar;
   }
 
   if (modKey === 'bancada') {
-    if (acao === 'lancar' || acao === 'criar') return permissoesModulo.lancar ?? permissoesModulo.criar ?? true;
+    if (acao === 'lancar' || acao === 'criar') return permissoesModulo.lancar ?? permissoesModulo.criar;
     if (acao === 'baixa' || acao === 'editar') return permissoesModulo.baixa ?? permissoesModulo.editar;
     if (acao === 'zerar' || acao === 'excluir') return permissoesModulo.zerar ?? permissoesModulo.excluir;
     if (acao === 'historico') return permissoesModulo.historico ?? permissoesModulo.visualizar;
@@ -994,24 +1040,24 @@ export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: st
 
   if (modKey === 'materiais') {
     if (acao === 'cadastrar_equipamentos' || acao === 'criar' || acao === 'cadastrar') return permissoesModulo.cadastrar_equipamentos ?? permissoesModulo.criar;
-    if (acao === 'alterar_status') return permissoesModulo.alterar_status ?? permissoesModulo.editar ?? true;
+    if (acao === 'alterar_status') return permissoesModulo.alterar_status ?? permissoesModulo.editar;
     if (acao === 'editar') return permissoesModulo.editar;
     if (acao === 'excluir') return permissoesModulo.excluir;
   }
 
   if (modKey === 'reservas') {
-    if (acao === 'criar' || acao === 'solicitar') return permissoesModulo.criar ?? true;
+    if (acao === 'criar' || acao === 'solicitar') return permissoesModulo.criar;
     if (acao === 'aprovar' || acao === 'recusar') return permissoesModulo.aprovar ?? permissoesModulo.editar;
     if (acao === 'cancelar') return permissoesModulo.cancelar ?? permissoesModulo.excluir;
     if (acao === 'gerenciar_areas') return permissoesModulo.gerenciar_areas ?? permissoesModulo.editar;
-    if (acao === 'vistoria') return permissoesModulo.vistoria ?? permissoesModulo.editar ?? true;
+    if (acao === 'vistoria') return permissoesModulo.vistoria ?? permissoesModulo.editar;
   }
 
   if (modKey === 'controle_acesso') {
-    if (acao === 'liberar_entrada' || acao === 'entrada' || acao === 'criar') return permissoesModulo.liberar_entrada ?? permissoesModulo.criar ?? true;
-    if (acao === 'registrar_saida' || acao === 'saida') return permissoesModulo.registrar_saida ?? permissoesModulo.editar ?? true;
+    if (acao === 'liberar_entrada' || acao === 'entrada' || acao === 'criar') return permissoesModulo.liberar_entrada ?? permissoesModulo.criar;
+    if (acao === 'registrar_saida' || acao === 'saida') return permissoesModulo.registrar_saida ?? permissoesModulo.editar;
     if (acao === 'bloquear' || acao === 'blacklist') return permissoesModulo.bloquear ?? permissoesModulo.editar;
-    if (acao === 'gerar_passe_qr' || acao === 'passe_qr') return permissoesModulo.gerar_passe_qr ?? permissoesModulo.criar ?? true;
+    if (acao === 'gerar_passe_qr' || acao === 'passe_qr') return permissoesModulo.gerar_passe_qr ?? permissoesModulo.criar;
     if (acao === 'configurar_portoes' || acao === 'portoes') return permissoesModulo.configurar_portoes ?? permissoesModulo.editar;
   }
 
@@ -1030,28 +1076,29 @@ export function resolverAcaoEmPermissoesModulo(permissoesModulo: any, modKey: st
 
 /**
  * Verifica se um operador logado possui uma permissão específica.
+ * Fonte única sincronizada com public.operador_tem_permissao_modulo() e temPermissaoModuloBackend().
  */
 export function verificarPermissao(
   operador: any,
   modulo: keyof PermissoesModulo | string,
   acao: string
 ): boolean {
-  if (!operador) return false;
+  if (!operador || operador.ativo === false) return false;
 
-  const nivelNum = Number(operador.nivel_acesso ?? operador.nivel ?? 3);
-  const perfilStr = String(operador.perfil || '').toLowerCase();
+  const perfilStr = String(operador.perfil || '').trim().toLowerCase();
   const idNivel = extrairIdNivel(operador);
+  const ehAdminGeral = temAcessoGlobalExplicito(operador);
+  const ehNivelCustom = !ehAdminGeral && Boolean(operador.nivel_acesso_custom_id) && ehIdNivelCustomizado(idNivel);
+  const perfilPadrao = normalizarPerfilOperador(operador);
+  const ehAdminCondominioLocal = !ehAdminGeral && perfilPadrao === 'admin_condominio' && perfilStr === 'admin_condominio';
+  const ehSupervisor = !ehAdminGeral && !ehAdminCondominioLocal && perfilPadrao === 'supervisor';
 
-  // REGRA ESTRITA DE SEGURANÇA: Nível 3 (Operador/Porteiro) NUNCA pode excluir materiais do posto
+  // REGRA ESTRITA DE SEGURANÇA: Operador/Porteiro NUNCA pode excluir materiais do posto (independente de nivel_acesso=0/1 legado)
   if (modulo === 'materiais' && (acao === 'excluir' || acao === 'excluir_equipamento')) {
-    if (nivelNum >= 3 || idNivel === 'nivel_3' || perfilStr === 'operador' || perfilStr === 'porteiro') {
+    if (!ehAdminGeral && !ehAdminCondominioLocal && !ehSupervisor && !ehNivelCustom && (perfilStr === 'operador' || perfilStr === 'porteiro' || perfilStr === '')) {
       return false;
     }
   }
-
-  const ehAdminGeral = Boolean(operador.eSuperAdminGlobal || temAcessoGlobalExplicito(operador));
-  const perfilPadrao = normalizarPerfilOperador(operador);
-  const ehAdminCondominioLocal = !ehAdminGeral && perfilPadrao === 'admin_condominio';
 
   // Normalização de sinônimos de módulos
   let modKey = String(modulo).toLowerCase();
@@ -1063,7 +1110,7 @@ export function verificarPermissao(
     return ehAdminGeral;
   }
 
-  // REGRA ESTRITA DE SEGURANÇA: Operações administrativas globais e gestão de operadores seguem estritamente o banco
+  // REGRA ESTRITA DE SEGURANÇA: Operações administrativas globais e gestão administrativa seguem estritamente o perfil oficial
   if (modKey === 'cadastros') {
     if (acao === 'condominios' || acao === 'gerenciar_niveis') {
       return ehAdminGeral;
@@ -1073,7 +1120,8 @@ export function verificarPermissao(
       acao === 'cadastrar_operadores' ||
       acao === 'editar_operadores' ||
       acao === 'alterar_senha_operador' ||
-      acao === 'excluir_operadores'
+      acao === 'excluir_operadores' ||
+      acao === 'configurar_condominio'
     ) {
       if (!ehAdminGeral && !ehAdminCondominioLocal) {
         return false;
@@ -1081,118 +1129,103 @@ export function verificarPermissao(
     }
   }
 
+  if (modKey === 'historico_absoluto' && (acao === 'limpar_dados' || acao === 'excluir')) {
+    if (!ehAdminGeral && !ehAdminCondominioLocal) {
+      return false;
+    }
+  }
+
+  // Fail-closed imediato para Administrador Geral
+  if (ehAdminGeral) {
+    return true;
+  }
+
+  const todos = obterNiveisLocal();
+  let nivelObj = todos.find(n => n.id === idNivel);
+
+  // Nível personalizado inexistente em configuracoes.niveis_acesso falha fechado (nunca herda overrides nem NIVEIS_PADRAO)
+  if (ehNivelCustom && (!nivelObj || !nivelObj.permissoes || typeof nivelObj.permissoes !== 'object')) {
+    return false;
+  }
+
   // REGRA ESTRITA RBAC: Perfil de Síndico (Nível 4)
-  // Síndico visualiza e acessa os módulos ativos em seu login; não edita nem lança nada, EXCETO em ocorrências (onde pode criar e resolver)
-  const ehSindico = !ehAdminGeral && !ehAdminCondominioLocal && (idNivel === 'nivel_4' || perfilStr.includes('sind') || nivelNum === 4 || Boolean(operador.eSindico));
+  const ehSindico = !ehAdminCondominioLocal && !ehSupervisor && (perfilStr.includes('sind') || Boolean(operador.eSindico));
   if (ehSindico) {
     const permDiretas = obterPermissoesOperador(operador);
     const modCfg: any = permDiretas ? ((permDiretas as any)[modKey] || (permDiretas as any)[modulo]) : null;
 
-    // Se o módulo foi explicitamente desativado para este síndico pelo administrador, bloqueia
     if (modCfg && modCfg.visualizar === false) {
       return false;
     }
 
     if (modKey === 'ocorrencias') {
-      if (acao === 'visualizar' || acao === 'criar' || acao === 'resolver') {
-        return true;
-      }
-      return false; // Síndico não exclui ocorrências
+      return acao === 'visualizar' || acao === 'criar' || acao === 'resolver';
     }
 
-    // Em todos os outros módulos, o síndico apenas visualiza / consulta
-    if (acao === 'visualizar' || acao === 'relatorio' || acao === 'dossie' || acao === 'historico' || acao === 'ver_feed' || acao === 'ver_metricas' || acao === 'exportar_csv' || acao === 'visualizar_moradores') {
+    if (acao === 'visualizar' || acao === 'relatorio' || acao === 'dossie' || acao === 'historico' || acao === 'ver_feed' || acao === 'ver_metricas' || acao === 'exportar_csv' || acao === 'visualizar_moradores' || acao === 'visualizar_operadores' || acao === 'auditoria') {
       if (modCfg && modCfg.visualizar !== undefined) {
         return Boolean(modCfg.visualizar);
       }
       return true;
     }
 
-    // Bloqueia qualquer tentativa de editar, criar, excluir ou lançar fora de ocorrências
     return false;
   }
 
-  // 1. VERIFICAÇÃO PRIORITÁRIA: Permissões Granulares Específicas do Operador (Configuradas diretamente no Card)
-  const permissoesDiretas = obterPermissoesOperador(operador);
+  // 1. VERIFICAÇÃO PRIORITÁRIA: Overrides explícitos salvos em operadores.permissoes
+  const permissoesDiretas = (operador.permissoes && typeof operador.permissoes === 'object') ? operador.permissoes : null;
   if (permissoesDiretas) {
-    const modConfig: any = (permissoesDiretas as any)[modKey] || (permissoesDiretas as any)[modulo];
-    if (modConfig) {
+    const modConfig: any =
+      (permissoesDiretas as any)[modKey] ||
+      (permissoesDiretas as any)[modulo] ||
+      (modKey === 'autorizados' ? (permissoesDiretas as any).prestadores : undefined) ||
+      (modKey === 'passagem_posto' ? (permissoesDiretas as any).passagem : undefined);
+
+    if (modConfig && typeof modConfig === 'object') {
       if (modConfig.visualizar === false) {
-        if (ehAdminGeral && (modKey === 'configuracoes' || modKey === 'cadastros')) {
-          return true;
+        if (!(modKey === 'cadastros' && ['visualizar_moradores', 'cadastrar_morador', 'gerenciar_veiculos'].includes(acao))) {
+          return false;
         }
-        return false;
       }
-      if (acao === 'visualizar') {
-        return Boolean(modConfig.visualizar ?? true);
+      if (acao === 'visualizar' && modConfig.visualizar !== undefined) {
+        return Boolean(modConfig.visualizar);
       }
       const resAcaoDireta = resolverAcaoEmPermissoesModulo(modConfig, modKey, acao);
       if (resAcaoDireta !== undefined) {
-        return resAcaoDireta;
+        return Boolean(resAcaoDireta);
       }
     }
   }
 
-  // 2. VERIFICAÇÃO POR PERFIL / NÍVEL DE ACESSO (RBAC)
-  const todos = obterNiveisLocal();
-  let nivelObj = todos.find(n => n.id === idNivel);
-
-  if (!nivelObj && operador.nivel_acesso !== undefined && operador.nivel_acesso !== null) {
-    const chaveNivelAlt = String(operador.nivel_acesso).startsWith('nivel_') ? String(operador.nivel_acesso) : `nivel_${operador.nivel_acesso}`;
-    nivelObj = todos.find(n => n.id === chaveNivelAlt);
-  }
-
-  if (!nivelObj) {
-    if (ehAdminGeral) nivelObj = todos.find(n => n.id === 'nivel_0') || NIVEIS_PADRAO[0];
-    else if (ehAdminCondominioLocal) nivelObj = todos.find(n => n.id === 'nivel_1') || NIVEIS_PADRAO[1];
+  // 2. VERIFICAÇÃO POR PERFIL / NÍVEL DE ACESSO EM configuracoes.niveis_acesso
+  if (!nivelObj && !ehNivelCustom) {
+    if (ehAdminCondominioLocal) nivelObj = todos.find(n => n.id === 'nivel_1') || NIVEIS_PADRAO[1];
     else if (perfilPadrao === 'supervisor') nivelObj = todos.find(n => n.id === 'nivel_2') || NIVEIS_PADRAO[2];
-    else if (perfilStr.includes('sind') || nivelNum === 4) nivelObj = todos.find(n => n.id === 'nivel_4') || NIVEIS_PADRAO[4];
     else nivelObj = todos.find(n => n.id === 'nivel_3') || NIVEIS_PADRAO[3];
   }
 
   if (nivelObj && nivelObj.permissoes) {
-    let permissoesModulo: any = 
-      (nivelObj.permissoes as any)[modKey] || 
+    const permissoesModulo: any =
+      (nivelObj.permissoes as any)[modKey] ||
       (nivelObj.permissoes as any)[modulo] ||
-      (modKey === 'autorizados' ? (nivelObj.permissoes as any)['prestadores'] : undefined) ||
-      (modKey === 'passagem_posto' ? (nivelObj.permissoes as any)['passagem'] : undefined) ||
-      (modKey === 'bancada' ? (nivelObj.permissoes as any)['bancada'] : undefined);
+      (modKey === 'autorizados' ? (nivelObj.permissoes as any).prestadores : undefined) ||
+      (modKey === 'passagem_posto' ? (nivelObj.permissoes as any).passagem : undefined);
 
-    if (permissoesModulo) {
+    if (permissoesModulo && typeof permissoesModulo === 'object') {
       if (permissoesModulo.visualizar === false) {
-        if (ehAdminGeral && (modKey === 'configuracoes' || modKey === 'cadastros')) {
-          return true;
+        if (!(modKey === 'cadastros' && ['visualizar_moradores', 'cadastrar_morador', 'gerenciar_veiculos'].includes(acao))) {
+          return false;
         }
-        return false;
       }
-      if (acao === 'visualizar') {
-        return Boolean(permissoesModulo.visualizar ?? true);
+      if (acao === 'visualizar' && permissoesModulo.visualizar !== undefined) {
+        return Boolean(permissoesModulo.visualizar);
       }
       const resAcaoNivel = resolverAcaoEmPermissoesModulo(permissoesModulo, modKey, acao);
       if (resAcaoNivel !== undefined) {
-        return resAcaoNivel;
-      }
-    }
-
-    // Fallback de resiliência: se o módulo Bancada não constava no registro antigo do perfil,
-    // concede visualização e operações rotineiras para operadores de posto (Nível 0, 1, 2 e 3)
-    if (!permissoesModulo && (modKey === 'bancada' || modKey === 'mod11_bancada_conferencia')) {
-      if (nivelNum <= 3 || perfilStr.includes('operador') || perfilStr.includes('porteiro') || perfilStr.includes('guarita')) {
-        if (acao === 'visualizar' || acao === 'lancar' || acao === 'baixa' || acao === 'historico') {
-          return true;
-        }
-        if (acao === 'zerar' || acao === 'excluir') {
-          return ehAdminGeral || ehAdminCondominioLocal;
-        }
+        return Boolean(resAcaoNivel);
       }
     }
   }
 
-  // 3. Fallback exclusivo para Administrador Geral com acesso global explícito
-  if (ehAdminGeral) {
-    return true;
-  }
-
-  // Se não foi concedido por nenhuma regra:
   return false;
 }

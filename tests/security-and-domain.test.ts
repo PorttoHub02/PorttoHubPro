@@ -72,7 +72,7 @@ function createProvisioningMockEnv() {
       nome: 'Gestor Alpha',
       login: 'gestor.a',
       email: 'gestor.a@condo.test',
-      perfil: 'admin',
+      perfil: 'admin_condominio',
       nivel_acesso: 1,
       condominio_id: CONDO_A,
       acesso_global_condominios: false,
@@ -278,30 +278,36 @@ test('Regra B: Supervisor com 0, 1 e 2+ condomínios vinculados', () => {
   assert.deepEqual(supDois.condominiosPermitidos.map(c => c.id), [CONDO_A, CONDO_C]);
 });
 
-test('Regra C: Login "admin", perfil "master" ou nivel_acesso <= 1 SEM flag explícito NÃO ganham acesso global', () => {
-  const adminSemFlag = {
+test('Regra C: Somente perfil "admin_geral" ativo com flag global explícita ganha acesso global; "master", "admin", "admin_local" e desconhecidos NÃO ganham privilégios administrativos', () => {
+  const masterComFlag = {
     id: 'fake-global',
     login: 'admin',
     perfil: 'master',
-    nivel_acesso: 1,
+    nivel_acesso: 0,
     condominio_id: 'todos',
-    acesso_global_condominios: false
+    acesso_global_condominios: true,
+    ativo: true
   };
-  assert.equal(temAcessoGlobalExplicito(adminSemFlag), false);
+  assert.equal(temAcessoGlobalExplicito(masterComFlag), false);
+  assert.equal(ehAdminCondominio(masterComFlag), false);
 
-  const resSemVinculo = resolverContextoCondominiosOperador({
-    operador: adminSemFlag,
+  const resMaster = resolverContextoCondominiosOperador({
+    operador: masterComFlag,
     condominiosDisponiveis: CONDOS,
     vinculosExplicitosIds: [],
     tabelaVinculosDisponivel: true
   });
-  assert.equal(resSemVinculo.eAdminGeral, false);
-  assert.equal(resSemVinculo.bloqueado, true);
+  assert.equal(resMaster.eAdminGeral, false);
+  assert.equal(resMaster.eAdminCondominio, false);
+  assert.equal(resMaster.bloqueado, true);
 
-  const adminComFlag = { ...adminSemFlag, acesso_global_condominios: true };
-  assert.equal(temAcessoGlobalExplicito(adminComFlag), true);
+  const adminGeralSemFlag = { ...masterComFlag, perfil: 'admin_geral', acesso_global_condominios: false };
+  assert.equal(temAcessoGlobalExplicito(adminGeralSemFlag), false);
+
+  const adminGeralComFlag = { ...masterComFlag, perfil: 'admin_geral', acesso_global_condominios: true, ativo: true };
+  assert.equal(temAcessoGlobalExplicito(adminGeralComFlag), true);
   const resComFlag = resolverContextoCondominiosOperador({
-    operador: adminComFlag,
+    operador: adminGeralComFlag,
     condominiosDisponiveis: CONDOS,
     vinculosExplicitosIds: [],
     tabelaVinculosDisponivel: true
@@ -1005,7 +1011,10 @@ test('[Mock/Unit] Passe QR RPC retorna registro + registro_id e scripts SQL 05/0
   const trechoFnGerenciar = sql05.split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id TEXT)')[1]
     .split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id UUID)')[0];
   assert.equal(trechoFnGerenciar.includes('operador_condominios'), false);
-  assert.ok(trechoFnGerenciar.includes("lower(COALESCE(o.perfil, '')) IN ('admin_condominio'"));
+  assert.match(trechoFnGerenciar, /lower\((?:trim\()?COALESCE\(o\.perfil, ''\)\)?\) = 'admin_condominio'/);
+  assert.equal(trechoFnGerenciar.includes('admin_local'), false);
+  assert.equal(trechoFnGerenciar.includes("'master'"), false);
+  assert.equal(trechoFnGerenciar.includes("'admin'"), false);
 
   // 05B: retorna ambos registro_id e registro completo
   assert.ok(sql05b.includes("'registro_id', v_registro_id"));
@@ -1401,10 +1410,15 @@ test('[Auditoria SQL 05/05B/06/07/08/09/11/12] Trigger SECURITY INVOKER, proteç
   assert.equal(/\bDROP\s+TABLE\b/i.test(sql11SemComentarios), false);
   assert.equal(/\bTRUNCATE\b/i.test(sql11SemComentarios.replace(/REVOKE TRUNCATE[^\n]*/g, '')), false);
 
-  // 09 e 12 auditam privilégios de funções e classificam OK / ATENCAO / FALHA
+  // 09 e 12 auditam privilégios de funções e classificam OK / ATENÇÃO / FALHA / NÃO TESTADO
   assert.ok(sql09.includes('has_function_privilege'));
   assert.ok(sql12.includes('has_function_privilege'));
-  assert.ok(sql12.includes("'OK'") && sql12.includes("'ATENCAO'") && sql12.includes("'FALHA'"));
+  assert.ok(
+    sql12.includes("'OK'") &&
+    sql12.includes("'ATENÇÃO'") &&
+    sql12.includes("'FALHA'") &&
+    sql12.includes("'NÃO TESTADO'")
+  );
 });
 
 test('[Segunda Rodada] Provisionamento service_role vincula auth_user_id, OCR/QR/Cache bloqueiam por permissoes e Passe QR concorrente (2 chamadas) sem bypass', async () => {
@@ -1650,7 +1664,8 @@ test('[Segunda Rodada SQL & Frontend] Sem bypass current_user NOT IN, trigger QR
     assert.equal(/current_user\s+NOT\s+IN\s*\(\s*'postgres'/i.test(conteudo), false, `${nome}: não pode conter bypass current_user NOT IN`);
     assert.ok(/v_jwt_role\s*(?:=|<>)\s*'service_role'/.test(conteudo), `${nome}: deve validar service_role no JWT`);
     assert.ok(conteudo.includes('operador_tem_permissao_modulo'), `${nome}: validar_e_consumir_passe_qr deve exigir permissão funcional`);
-    assert.ok(conteudo.includes("set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE)"), `${nome}: RPC deve sinalizar consumo ao trigger`);
+    assert.ok(conteudo.includes('porttohub_internal.passe_qr_tx_autorizacao'), `${nome}: RPC deve usar tabela interna transacional`);
+    assert.equal(conteudo.includes("porttohub.rpc_passe_qr_consumo"), false, `${nome}: não deve mais usar GUC de sessão porttohub.rpc_passe_qr_consumo`);
   }
 
   // 2. 06 e 11 possuem proteger_campos_passe_qr SECURITY INVOKER, permissões por módulo e integridade cross-condo em tabelas filhas
@@ -1705,4 +1720,730 @@ test('[Segunda Rodada SQL & Frontend] Sem bypass current_user NOT IN, trigger QR
   assert.ok(cadastrosCode.includes('auth_user_id: null'));
   assert.ok(cadastrosCode.includes('chamarProvisionamentoBackend(opIdSalvo)'));
 });
+
+test('[Terceira Rodada SQL] Escopo restrito às 35 tabelas/sequências oficiais, autoria historico_absoluto/registros_acesso, schema interno QR e Auditoria 12 padronizada', () => {
+  const sql05 = fs.readFileSync(path.resolve('supabase/sql/05_FUNCOES_AUTORIZACAO.sql'), 'utf8');
+  const sql05b = fs.readFileSync(path.resolve('supabase/sql/05B_FUNCOES_PASSE_QR.sql'), 'utf8');
+  const sql06 = fs.readFileSync(path.resolve('supabase/sql/06_RLS_TABELAS_MULTI_TENANT.sql'), 'utf8');
+  const sql11 = fs.readFileSync(path.resolve('supabase/sql/11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql'), 'utf8');
+  const sql12 = fs.readFileSync(path.resolve('supabase/sql/12_AUDITORIA_FINAL_SEGURANCA.sql'), 'utf8');
+  const auditoriaTs = fs.readFileSync(path.resolve('src/services/auditoriaService.ts'), 'utf8');
+  const permissoesTs = fs.readFileSync(path.resolve('src/services/permissoesService.ts'), 'utf8');
+  const readmeMd = fs.readFileSync(path.resolve('README.md'), 'utf8');
+
+  // 1. 06 e 11 nunca iteram cegamente sobre todas as tabelas/sequências de public; filtram por todas_tabelas (35) e pg_depend
+  for (const [nome, conteudo] of [['06', sql06], ['11', sql11]] as const) {
+    assert.equal(/FOR\s+r\s+IN\s+SELECT\s+tablename\s+FROM\s+pg_tables\s+WHERE\s+schemaname\s*=\s*'public'\s+LOOP/i.test(conteudo), false, `${nome}: não pode iterar cegamente em pg_tables`);
+    assert.equal(/REVOKE\s+ALL\s+ON\s+ALL\s+TABLES\s+IN\s+SCHEMA\s+public/i.test(conteudo), false, `${nome}: não pode revogar ALL TABLES IN SCHEMA public (deve preservar tabelas extras)`);
+    assert.equal(/REVOKE\s+ALL\s+ON\s+ALL\s+SEQUENCES\s+IN\s+SCHEMA\s+public/i.test(conteudo), false, `${nome}: não pode revogar ALL SEQUENCES IN SCHEMA public (deve preservar sequências extras)`);
+    assert.ok(conteudo.includes('pg_depend'), `${nome}: deve identificar sequências oficiais via pg_depend`);
+    assert.ok(
+      conteudo.includes('NOT (c.relname = ANY(todas_tabelas))') ||
+      conteudo.includes('NOT (t.tablename = ANY(todas_tabelas))'),
+      `${nome}: pré-auditoria deve reportar tabelas extras preservadas`
+    );
+    assert.ok(conteudo.includes('trg_proteger_autoria_historico_absoluto'), `${nome}: trigger de autoria em historico_absoluto ausente`);
+    assert.ok(conteudo.includes('trg_proteger_autoria_registros_acesso'), `${nome}: trigger de autoria em registros_acesso ausente`);
+    assert.ok(conteudo.includes('porttohub_internal.passe_qr_tx_autorizacao'), `${nome}: marcador transacional interno QR ausente`);
+
+    // Triggers de autoria precisam ser SECURITY INVOKER
+    const trigHist = conteudo.split('CREATE OR REPLACE FUNCTION public.proteger_autoria_historico_absoluto()')[1]
+      .split('REVOKE ALL ON FUNCTION public.proteger_autoria_historico_absoluto()')[0]
+      .replace(/--[^\n]*/g, '');
+    const trigReg = conteudo.split('CREATE OR REPLACE FUNCTION public.proteger_autoria_registros_acesso()')[1]
+      .split('REVOKE ALL ON FUNCTION public.proteger_autoria_registros_acesso()')[0]
+      .replace(/--[^\n]*/g, '');
+    assert.ok(trigHist.includes('SECURITY INVOKER') && !trigHist.includes('SECURITY DEFINER'), `${nome}: proteger_autoria_historico_absoluto deve ser SECURITY INVOKER`);
+    assert.ok(trigReg.includes('SECURITY INVOKER') && !trigReg.includes('SECURITY DEFINER'), `${nome}: proteger_autoria_registros_acesso deve ser SECURITY INVOKER`);
+  }
+
+  // 2. Unificação configuracoes.niveis_acesso em 05 e 11
+  for (const [nome, conteudo] of [['05', sql05], ['11', sql11]] as const) {
+    assert.ok(conteudo.includes('FROM public.configuracoes c'), `${nome}: operador_tem_permissao_modulo deve consultar configuracoes.niveis_acesso`);
+    assert.ok(conteudo.includes('v_eh_nivel_custom'), `${nome}: operador_tem_permissao_modulo deve distinguir nível personalizado e falhar fechado`);
+  }
+
+  // 3. Schema privado porttohub_internal em 05B e 11 revogado de PUBLIC, anon e authenticated
+  for (const [nome, conteudo] of [['05B', sql05b], ['11', sql11]] as const) {
+    assert.ok(conteudo.includes('CREATE SCHEMA IF NOT EXISTS porttohub_internal'), `${nome}: deve criar schema privado porttohub_internal`);
+    assert.ok(conteudo.includes('REVOKE ALL ON SCHEMA porttohub_internal FROM PUBLIC, anon, authenticated'), `${nome}: deve isolar schema porttohub_internal`);
+    assert.ok(conteudo.includes('REVOKE ALL ON TABLE porttohub_internal.passe_qr_tx_autorizacao FROM PUBLIC, anon, authenticated'), `${nome}: deve isolar tabela passe_qr_tx_autorizacao`);
+  }
+
+  // 4. Auditoria 12: somente status oficiais ('OK', 'ATENÇÃO', 'FALHA', 'NÃO TESTADO') + VERIFICAÇÃO ESTRUTURAL
+  assert.equal(sql12.includes("'ATENCAO'"), false, '12 deve usar grafia oficial ATENÇÃO');
+  assert.ok(sql12.includes('VERIFICAÇÃO ESTRUTURAL'));
+  assert.ok(sql12.includes('EXTRA_PRESERVADA'));
+  assert.ok(sql12.includes('trg_proteger_autoria_historico_absoluto'));
+  assert.ok(sql12.includes('trg_proteger_autoria_registros_acesso'));
+  assert.ok(sql12.includes('passe_qr_tx_autorizacao'));
+
+  // 5. auditoriaService.ts não possui FOR ALL e permissoesService.ts não contém ?? true
+  assert.equal(/\bFOR\s+ALL\b/i.test(auditoriaTs), false, 'auditoriaService.ts não deve gerar política FOR ALL');
+  assert.equal(permissoesTs.includes('?? true'), false, 'permissoesService.ts não deve conter fallbacks permissivos ?? true');
+  assert.ok(readmeMd.includes('porttohub_internal.passe_qr_tx_autorizacao'));
+  assert.ok(readmeMd.includes('EXTRA') || readmeMd.includes('tabelas extras'));
+});
+
+test('[Terceira Rodada Matriz Unificada] Nível personalizado em configuracoes.niveis_acesso (Backend + Frontend) e fail-closed sem vazamento', async () => {
+  const { authenticateRequest, temPermissaoModuloBackend } = await import('../src/server/authMiddleware.ts');
+  const permissoesSvc = await import('../src/services/permissoesService.ts');
+
+  const customNiveis = [
+    {
+      id: 'custom_portaria_audit',
+      nome: 'Portaria Auditoria Restrita',
+      condominio_id: CONDO_A,
+      padrao_sistema: false,
+      permissoes: {
+        encomendas: { visualizar: true, criar: false, editar: false, excluir: false },
+        custodia: { visualizar: false, receber: false, baixar: false, excluir: false },
+        bancada: { visualizar: true, lancar: true, baixa: false, zerar: false }
+      }
+    }
+  ];
+
+  // A. Backend respeita configuracoes.niveis_acesso do condomínio alvo
+  const { env } = (() => {
+    const customFetch: typeof fetch = async (input: any) => {
+      const url = new URL(typeof input === 'string' ? input : input.url);
+      if (url.pathname === '/auth/v1/user') {
+        return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'custom.op@condo.test' }), { status: 200 });
+      }
+      if (url.pathname === '/rest/v1/operadores') {
+        return new Response(JSON.stringify([{
+          id: OP_ALVO_A,
+          nome: 'Operador Customizado',
+          login: 'custom.op',
+          email: 'custom.op@condo.test',
+          perfil: 'operador',
+          nivel_acesso: 3,
+          nivel_acesso_custom_id: 'custom_portaria_audit',
+          condominio_id: CONDO_A,
+          acesso_global_condominios: false,
+          ativo: true,
+          auth_user_id: AUTH_ALVO_A,
+          permissoes: { bancada: { baixa: true } }
+        }]), { status: 200 });
+      }
+      if (url.pathname === '/rest/v1/operador_condominios') {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.pathname === '/rest/v1/configuracoes') {
+        return new Response(JSON.stringify([{ condominio_id: CONDO_A, niveis_acesso: customNiveis }]), { status: 200 });
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    };
+    return {
+      env: {
+        SUPABASE_URL: 'https://mock.supabase.co',
+        SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+        __fetchImpl: customFetch
+      } as any
+    };
+  })();
+
+  const authRes = await authenticateRequest(
+    new Request('http://localhost/api/cache/stats', { headers: { Authorization: 'Bearer jwt-custom' } }),
+    env
+  );
+  assert.equal(authRes.ok, true);
+  if (authRes.ok) {
+    assert.equal(temPermissaoModuloBackend(authRes.context, 'encomendas', 'visualizar', CONDO_A), true);
+    assert.equal(temPermissaoModuloBackend(authRes.context, 'encomendas', 'criar', CONDO_A), false);
+    assert.equal(temPermissaoModuloBackend(authRes.context, 'custodia', 'visualizar', CONDO_A), false);
+    assert.equal(temPermissaoModuloBackend(authRes.context, 'chaves', 'visualizar', CONDO_A), false);
+    assert.equal(temPermissaoModuloBackend(authRes.context, 'bancada', 'baixa', CONDO_A), true); // override explícito
+
+    // Nível customizado inexistente falha fechado
+    const ctxInexistente = {
+      ...authRes.context,
+      operador: { ...authRes.context.operador, nivel_acesso_custom_id: 'custom_nao_existe', permissoes: {} }
+    };
+    assert.equal(temPermissaoModuloBackend(ctxInexistente, 'encomendas', 'visualizar', CONDO_A), false);
+    assert.equal(temPermissaoModuloBackend(ctxInexistente, 'bancada', 'baixa', CONDO_A), false);
+  }
+
+  // B. Frontend permissoesService.ts resolve custom level, overrides esparsos e falha fechado sem fallback localStorage
+  const origStorage = (globalThis as any).localStorage;
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    removeItem: (k: string) => { store.delete(k); }
+  };
+
+  try {
+    permissoesSvc.limparCacheNiveisAcesso();
+    permissoesSvc.salvarNiveisLocal([
+      ...permissoesSvc.NIVEIS_PADRAO,
+      customNiveis[0] as any
+    ]);
+
+    const opCustom = {
+      id: OP_ALVO_A,
+      login: 'custom.op',
+      perfil: 'operador',
+      nivel_acesso: 3,
+      nivel_acesso_custom_id: 'custom_portaria_audit',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      permissoes: { bancada: { baixa: true } }
+    };
+
+    assert.equal(permissoesSvc.verificarPermissao(opCustom, 'encomendas', 'visualizar'), true);
+    assert.equal(permissoesSvc.verificarPermissao(opCustom, 'encomendas', 'criar'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustom, 'custodia', 'visualizar'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustom, 'chaves', 'visualizar'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustom, 'bancada', 'baixa'), true);
+
+    // Extrai somente overrides esparsos sem congelar matriz inteira
+    const completas = permissoesSvc.obterPermissoesOperador(opCustom);
+    const overrides = permissoesSvc.extrairOverridesOperador(completas, 'custom_portaria_audit', undefined, 'TODAS');
+    assert.equal(overrides.encomendas, undefined);
+    assert.equal(overrides.bancada?.baixa, true);
+
+    // Chave legada em localStorage não pode conceder privilégios
+    store.set(`porttohub_operador_permissoes_${OP_ALVO_A}`, JSON.stringify({ custodia: { visualizar: true, excluir: true } }));
+    const opSemPermDb = { ...opCustom, permissoes: {} };
+    assert.equal(permissoesSvc.verificarPermissao(opSemPermDb, 'custodia', 'visualizar'), false);
+
+    // Nível customizado inexistente falha fechado mesmo para overrides parciais
+    const opCustomInexistente = { ...opCustom, nivel_acesso_custom_id: 'custom_removido' };
+    assert.equal(permissoesSvc.verificarPermissao(opCustomInexistente, 'bancada', 'baixa'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustomInexistente, 'encomendas', 'visualizar'), false);
+
+    permissoesSvc.limparCacheNiveisAcesso();
+  } finally {
+    (globalThis as any).localStorage = origStorage;
+  }
+});
+
+test('[Migração 11 Final - Regressão Classificação] Operadores com nivel_acesso 0/1 ou nivel_acesso_custom_id nivel_0/nivel_1 NUNCA viram administradores', async () => {
+  const { authenticateRequest, temPermissaoModuloBackend } = await import('../src/server/authMiddleware.ts');
+  const permissoesSvc = await import('../src/services/permissoesService.ts');
+
+  const casosOperador = [
+    { rotulo: 'operador + nivel_acesso: 0', perfil: 'operador', nivel_acesso: 0, nivel_acesso_custom_id: null, acesso_global_condominios: false },
+    { rotulo: 'operador + nivel_acesso: 1', perfil: 'operador', nivel_acesso: 1, nivel_acesso_custom_id: null, acesso_global_condominios: false },
+    { rotulo: 'operador + custom nivel_0', perfil: 'operador', nivel_acesso: 3, nivel_acesso_custom_id: 'nivel_0', acesso_global_condominios: false },
+    { rotulo: 'operador + custom nivel_1', perfil: 'operador', nivel_acesso: 3, nivel_acesso_custom_id: 'nivel_1', acesso_global_condominios: false },
+    { rotulo: 'operador + acesso_global_condominios=true indevido', perfil: 'operador', nivel_acesso: 1, nivel_acesso_custom_id: 'nivel_1', acesso_global_condominios: true },
+    { rotulo: 'supervisor + nivel_acesso: 0/1 + custom nivel_0', perfil: 'supervisor', nivel_acesso: 0, nivel_acesso_custom_id: 'nivel_0', acesso_global_condominios: true }
+  ];
+
+  const origStorage = (globalThis as any).localStorage;
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    removeItem: (k: string) => { store.delete(k); }
+  };
+
+  try {
+    permissoesSvc.limparCacheNiveisAcesso();
+
+    // Custom level tentando conceder ações administrativas a um operador comum
+    const nivelCustomMalicioso = {
+      id: 'custom_portaria_admin_tentativa',
+      nome: 'Tentativa Admin Custom',
+      condominio_id: CONDO_A,
+      padrao_sistema: false,
+      permissoes: {
+        encomendas: { visualizar: true, criar: true, editar: false, excluir: false },
+        cadastros: {
+          visualizar: true,
+          moradores: true,
+          operadores: true,
+          editar_operadores: true,
+          configurar_condominio: true,
+          condominios: true,
+          gerenciar_niveis: true
+        },
+        configuracoes: {
+          visualizar: true,
+          editar: true,
+          auditoria: true,
+          limpar_dados: true
+        },
+        historico_absoluto: {
+          visualizar: true,
+          exportar: true,
+          limpar_dados: true
+        }
+      }
+    };
+
+    permissoesSvc.salvarNiveisLocal([...permissoesSvc.NIVEIS_PADRAO, nivelCustomMalicioso as any]);
+
+    for (const c of casosOperador) {
+      const opMock = {
+        id: OP_ALVO_A,
+        nome: c.rotulo,
+        login: 'op.teste',
+        perfil: c.perfil,
+        nivel_acesso: c.nivel_acesso,
+        nivel_acesso_custom_id: c.nivel_acesso_custom_id,
+        condominio_id: CONDO_A,
+        acesso_global_condominios: c.acesso_global_condominios,
+        ativo: true,
+        permissoes: {
+          cadastros: { operadores: true, editar_operadores: true, configurar_condominio: true, condominios: true },
+          configuracoes: { visualizar: true, editar: true }
+        }
+      };
+
+      // 1. autorizacaoService.ts
+      assert.equal(temAcessoGlobalExplicito(opMock), false, `${c.rotulo}: não pode ter acesso global`);
+      assert.equal(ehAdminCondominio(opMock), false, `${c.rotulo}: não pode ser admin_condominio`);
+      assert.equal(podeGerenciarOperadoresNoCondominio(opMock, CONDO_A), false, `${c.rotulo}: não pode gerenciar operadores`);
+      assert.equal(normalizarPerfilOperador(opMock), c.perfil === 'supervisor' ? 'supervisor' : 'operador', `${c.rotulo}: perfil normalizado incorreto`);
+
+      // 2. permissoesService.ts (frontend)
+      const nivelEfetivo = permissoesSvc.extrairIdNivel(opMock);
+      assert.notEqual(nivelEfetivo, 'nivel_0', `${c.rotulo}: nivel efetivo não pode ser nivel_0`);
+      assert.notEqual(nivelEfetivo, 'nivel_1', `${c.rotulo}: nivel efetivo não pode ser nivel_1`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'operadores'), false, `${c.rotulo}: frontend não deve liberar cadastros.operadores`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'editar_operadores'), false, `${c.rotulo}: frontend não deve liberar cadastros.editar_operadores`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'configurar_condominio'), false, `${c.rotulo}: frontend não deve liberar cadastros.configurar_condominio`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'condominios'), false, `${c.rotulo}: frontend não deve liberar cadastros.condominios`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'gerenciar_niveis'), false, `${c.rotulo}: frontend não deve liberar cadastros.gerenciar_niveis`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'configuracoes', 'editar'), false, `${c.rotulo}: frontend não deve liberar configuracoes.editar`);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'encomendas', 'visualizar'), true, `${c.rotulo}: mantém permissões operacionais padrão`);
+
+      // 3. Backend authMiddleware.ts
+      const customFetch: typeof fetch = async (input: any) => {
+        const url = new URL(typeof input === 'string' ? input : input.url);
+        if (url.pathname === '/auth/v1/user') {
+          return new Response(JSON.stringify({ id: AUTH_ALVO_A, email: 'op.teste@condo.test' }), { status: 200 });
+        }
+        if (url.pathname === '/rest/v1/operadores') {
+          return new Response(JSON.stringify([{ ...opMock, auth_user_id: AUTH_ALVO_A }]), { status: 200 });
+        }
+        if (url.pathname === '/rest/v1/operador_condominios') {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url.pathname === '/rest/v1/configuracoes') {
+          return new Response(JSON.stringify([{ condominio_id: CONDO_A, niveis_acesso: [nivelCustomMalicioso] }]), { status: 200 });
+        }
+        return new Response(JSON.stringify([]), { status: 200 });
+      };
+
+      const authRes = await authenticateRequest(
+        new Request('http://localhost/api/cache/stats', { headers: { Authorization: 'Bearer jwt-op' } }),
+        {
+          SUPABASE_URL: 'https://mock.supabase.co',
+          SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+          __fetchImpl: customFetch
+        } as any
+      );
+      assert.equal(authRes.ok, true);
+      if (authRes.ok) {
+        assert.equal(authRes.context.eAdminGlobal, false, `${c.rotulo}: backend eAdminGlobal deve ser false`);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'operadores', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'editar_operadores', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'configurar_condominio', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'condominios', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'gerenciar_niveis', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'configuracoes', 'editar', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'encomendas', 'visualizar', CONDO_A), true);
+      }
+    }
+
+    // Operador com custom level malicioso continua bloqueado nas ações administrativas, mantendo encomendas.criar
+    const opCustomTentativa = {
+      id: OP_ALVO_A,
+      nome: 'Operador Custom Tentativa Admin',
+      login: 'op.custom.tentativa',
+      perfil: 'operador',
+      nivel_acesso: 3,
+      nivel_acesso_custom_id: 'custom_portaria_admin_tentativa',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      permissoes: {}
+    };
+    assert.equal(permissoesSvc.verificarPermissao(opCustomTentativa, 'encomendas', 'criar'), true);
+    assert.equal(permissoesSvc.verificarPermissao(opCustomTentativa, 'cadastros', 'operadores'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustomTentativa, 'cadastros', 'configurar_condominio'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustomTentativa, 'configuracoes', 'limpar_dados'), false);
+    assert.equal(permissoesSvc.verificarPermissao(opCustomTentativa, 'historico_absoluto', 'limpar_dados'), false);
+
+    // admin_condominio somente administra no condomínio principal (CONDO_A), não no secundário (CONDO_B)
+    const adminCondo = {
+      id: OP_GESTOR_A,
+      nome: 'Admin Condo A',
+      login: 'admin.condo.a',
+      perfil: 'admin_condominio',
+      nivel_acesso: 1,
+      nivel_acesso_custom_id: 'nivel_1',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      permissoes: {}
+    };
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminCondo, CONDO_A), true);
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminCondo, CONDO_B), false);
+
+    permissoesSvc.limparCacheNiveisAcesso();
+  } finally {
+    (globalThis as any).localStorage = origStorage;
+  }
+});
+
+test('[Migração 11 Final - Regressão Histórico Absoluto] Validação de permissão por (modulo, acao), bloqueio sem privilégio e rollback de cache', async () => {
+  const { validarPermissaoAuditoriaLocal, registrarAtividade, obterHistoricoCacheLocal } = await import('../src/services/auditoriaService.ts');
+  const permissoesSvc = await import('../src/services/permissoesService.ts');
+
+  const origStorage = (globalThis as any).localStorage;
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    removeItem: (k: string) => { store.delete(k); }
+  };
+
+  try {
+    permissoesSvc.limparCacheNiveisAcesso();
+
+    const operadorComum = {
+      id: OP_ALVO_A,
+      nome: 'Porteiro Padrão',
+      login: 'porteiro.a',
+      perfil: 'operador',
+      nivel_acesso: 1, // Mesmo com nível legado 1, continua operador comum!
+      nivel_acesso_custom_id: 'nivel_1',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      permissoes: {}
+    };
+
+    const sindicoMock = {
+      id: 'aaaa5555-5555-4555-8555-555555555555',
+      nome: 'Síndico A',
+      login: 'sindico.a',
+      perfil: 'sindico',
+      nivel_acesso: 4,
+      nivel_acesso_custom_id: 'nivel_4',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      permissoes: {}
+    };
+
+    // Pares operacionais legítimos do operador comum
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'Sistema', 'LOGIN', CONDO_A), true);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'encomendas', 'CRIAR', CONDO_A), true);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'custodia', 'receber', CONDO_A), true);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'Controle de Acesso', 'ENTRADA_REGISTRADA', CONDO_A), true);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'lembretes_portaria', 'LEMBRETE_CIENTE', CONDO_A), true);
+
+    // Pares administrativos/não autorizados/inventados devem ser bloqueados
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'Limpeza de Dados', 'LIMPEZA_PERIODO', CONDO_A), false);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'Sistema', 'MUTE_ALERTA', CONDO_A), false);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'custodia', 'excluir', CONDO_A), false);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'cadastros', 'operadores', CONDO_A), false);
+    assert.equal(validarPermissaoAuditoriaLocal(operadorComum, 'modulo_inventado', 'acao_fake', CONDO_A), false);
+
+    // Síndico pode registrar nova ocorrência de síndico, mas NÃO pode limpar dados ou registrar exclusão de custódia
+    assert.equal(validarPermissaoAuditoriaLocal(sindicoMock, 'Ocorrências', 'NOVA_OCORRENCIA_SINDICO', CONDO_A), true);
+    assert.equal(validarPermissaoAuditoriaLocal(sindicoMock, 'Limpeza de Dados', 'LIMPEZA_PERIODO', CONDO_A), false);
+    assert.equal(validarPermissaoAuditoriaLocal(sindicoMock, 'custodia', 'excluir', CONDO_A), false);
+
+    // registrarAtividade bloqueia antes de gravar no cache local quando sem permissão
+    await assert.rejects(
+      () => registrarAtividade({
+        modulo: 'Limpeza de Dados',
+        acao: 'LIMPEZA_PERIODO',
+        descricao: 'Tentativa indevida de limpeza por operador comum',
+        operador: operadorComum,
+        condominio_id: CONDO_A
+      }),
+      /Acesso negado/i
+    );
+    assert.equal(obterHistoricoCacheLocal().length, 0, 'Tentativa negada não pode persistir no cache local');
+
+    permissoesSvc.limparCacheNiveisAcesso();
+  } finally {
+    (globalThis as any).localStorage = origStorage;
+  }
+});
+
+test('[Migração 11 Final - SQL 05/06/11/12] Invariantes estáticos de classificação, proteção de autoria e Auditoria 12 read-only', () => {
+  const sql05 = fs.readFileSync(path.resolve('supabase/sql/05_FUNCOES_AUTORIZACAO.sql'), 'utf8');
+  const sql06 = fs.readFileSync(path.resolve('supabase/sql/06_RLS_TABELAS_MULTI_TENANT.sql'), 'utf8');
+  const sql11 = fs.readFileSync(path.resolve('supabase/sql/11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql'), 'utf8');
+  const sql12 = fs.readFileSync(path.resolve('supabase/sql/12_AUDITORIA_FINAL_SEGURANCA.sql'), 'utf8');
+
+  for (const [nome, sql] of [['05', sql05], ['11', sql11]] as const) {
+    assert.equal(sql.includes("OR v_nivel_id = 'nivel_1'"), false, `${nome}: não pode promover operador via v_nivel_id = 'nivel_1'`);
+    assert.equal(sql.includes('OR v_nivel = 2'), false, `${nome}: não pode promover operador via nivel_acesso = 2`);
+    assert.equal(sql.includes('OR v_nivel = 4'), false, `${nome}: não pode classificar síndico via nivel_acesso = 4`);
+    assert.ok(sql.includes("lower(trim(COALESCE(o.perfil, ''))) = 'admin_geral'"), `${nome}: acesso global deve exigir perfil = admin_geral`);
+    assert.ok(sql.includes('CREATE OR REPLACE FUNCTION public.operador_pode_registrar_auditoria('), `${nome}: deve definir operador_pode_registrar_auditoria`);
+    assert.ok(sql.includes('REVOKE ALL ON FUNCTION public.operador_pode_registrar_auditoria(TEXT, TEXT, TEXT) FROM PUBLIC, anon'), `${nome}: deve revogar PUBLIC e anon de operador_pode_registrar_auditoria`);
+  }
+
+  for (const [nome, sql] of [['06', sql06], ['11', sql11]] as const) {
+    assert.ok(sql.includes('public.operador_pode_registrar_auditoria(NEW.condominio_id::text, NEW.modulo, NEW.acao)'), `${nome}: trigger historico_absoluto deve exigir operador_pode_registrar_auditoria`);
+    assert.ok(sql.includes('public.operador_pode_registrar_auditoria(condominio_id::text, modulo, acao)'), `${nome}: RLS INSERT de historico_absoluto deve exigir operador_pode_registrar_auditoria`);
+    assert.ok(sql.includes('NEW.operador_id := v_op.id'), `${nome}: trigger deve preservar autoria preenchida pelo banco`);
+    assert.ok(sql.includes('NEW.criado_em := NOW()'), `${nome}: trigger deve preservar timestamp preenchido pelo banco`);
+  }
+
+  assert.ok(sql12.includes("'operador_pode_registrar_auditoria'"), '12 deve auditar função operador_pode_registrar_auditoria');
+  assert.ok(sql12.includes('Consistência de classificação em public.operadores'), '12 deve incluir check 18 de consistência em operadores');
+  assert.ok(sql12.includes('VERIFICAÇÃO ESTRUTURAL'));
+  // 12 deve ser 100% read-only (sem DDL/DML fora de comentários)
+  const sql12SemComentarios = sql12
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/--[^\n]*/g, '')
+    .replace(/'[^']*'/g, "''");
+  assert.equal(/\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|GRANT|REVOKE|TRUNCATE)\b/i.test(sql12SemComentarios), false, '12 deve ser 100% read-only');
+});
+
+test('[Classificação Administrativa Estrita] Apenas admin_geral (ativo + global=true) e admin_condominio (condomínio principal); admin_local/admin/master/desconhecidos bloqueados', async () => {
+  const { authenticateRequest, temPermissaoModuloBackend } = await import('../src/server/authMiddleware.ts');
+  const permissoesSvc = await import('../src/services/permissoesService.ts');
+
+  const origStorage = (globalThis as any).localStorage;
+  const store = new Map<string, string>();
+  (globalThis as any).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    removeItem: (k: string) => { store.delete(k); }
+  };
+
+  try {
+    permissoesSvc.limparCacheNiveisAcesso();
+
+    const testarNoBackend = async (opRow: any, links: string[] = []) => {
+      const customFetch: typeof fetch = async (input: any) => {
+        const url = new URL(typeof input === 'string' ? input : input.url);
+        if (url.pathname === '/auth/v1/user') {
+          return new Response(JSON.stringify({ id: opRow.auth_user_id, email: opRow.email }), { status: 200 });
+        }
+        if (url.pathname === '/rest/v1/operadores') {
+          return new Response(JSON.stringify([opRow]), { status: 200 });
+        }
+        if (url.pathname === '/rest/v1/operador_condominios') {
+          return new Response(
+            JSON.stringify(links.map(cid => ({ condominio_id: cid, ativo: true }))),
+            { status: 200 }
+          );
+        }
+        if (url.pathname === '/rest/v1/configuracoes') {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        return new Response(JSON.stringify([]), { status: 200 });
+      };
+
+      return authenticateRequest(
+        new Request('http://localhost/api/cache/stats', { headers: { Authorization: 'Bearer jwt-strict-test' } }),
+        {
+          SUPABASE_URL: 'https://mock.supabase.co',
+          SUPABASE_ANON_KEY: 'mock_anon_key_12345678901234567890',
+          __fetchImpl: customFetch
+        } as any
+      );
+    };
+
+    // 1. admin_local, admin, master e perfis desconhecidos (mesmo com acesso_global_condominios=true, nivel=0/1 e custom nivel_0/nivel_1)
+    for (const perfilInvalido of ['admin_local', 'admin', 'master', 'super_usuario', 'gerente_ti', '', null]) {
+      const opMock: any = {
+        id: OP_ALVO_A,
+        auth_user_id: AUTH_ALVO_A,
+        nome: `Teste ${String(perfilInvalido)}`,
+        login: 'admin',
+        email: 'op@condo.test',
+        perfil: perfilInvalido,
+        nivel_acesso: 0,
+        nivel_acesso_custom_id: 'nivel_0',
+        condominio_id: CONDO_A,
+        acesso_global_condominios: true,
+        eSuperAdminGlobal: true,
+        ativo: true,
+        permissoes: {
+          cadastros: { operadores: true, editar_operadores: true, configurar_condominio: true, condominios: true },
+          configuracoes: { visualizar: true, editar: true },
+          historico_absoluto: { limpar_dados: true }
+        }
+      };
+
+      assert.equal(temAcessoGlobalExplicito(opMock), false, `${String(perfilInvalido)} não pode ter acesso global`);
+      assert.equal(ehAdminCondominio(opMock), false, `${String(perfilInvalido)} não pode ser admin_condominio`);
+      assert.equal(podeGerenciarOperadoresNoCondominio(opMock, CONDO_A), false, `${String(perfilInvalido)} não pode gerenciar operadores`);
+      assert.equal(normalizarPerfilOperador(opMock), 'operador', `${String(perfilInvalido)} deve cair para operador`);
+
+      // Frontend permissoesService
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'configuracoes', 'visualizar'), false);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'operadores'), false);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'editar_operadores'), false);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'configurar_condominio'), false);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'cadastros', 'condominios'), false);
+      assert.equal(permissoesSvc.verificarPermissao(opMock, 'historico_absoluto', 'limpar_dados'), false);
+
+      // Backend authMiddleware
+      const authRes = await testarNoBackend(opMock);
+      assert.equal(authRes.ok, true);
+      if (authRes.ok) {
+        assert.equal(authRes.context.eAdminGlobal, false, `${String(perfilInvalido)} backend eAdminGlobal deve ser false`);
+        assert.equal(authRes.context.perfilNormalizado, 'operador');
+        assert.equal(podeGerenciarOperadoresServidor(authRes.context, CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'configuracoes', 'visualizar', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'operadores', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'cadastros', 'configurar_condominio', CONDO_A), false);
+        assert.equal(temPermissaoModuloBackend(authRes.context, 'historico_absoluto', 'limpar_dados', CONDO_A), false);
+      }
+    }
+
+    // 2. admin_condominio administra SOMENTE seu condomínio principal (CONDO_A), jamais secundário (CONDO_B) ou global
+    const adminCondoRow = {
+      id: OP_GESTOR_A,
+      auth_user_id: AUTH_GESTOR_A,
+      nome: 'Admin Condomínio A',
+      login: 'admin.condo.a',
+      email: 'admin.a@condo.test',
+      perfil: 'admin_condominio',
+      nivel_acesso: 1,
+      nivel_acesso_custom_id: 'nivel_1',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: true, // mesmo se marcada indevidamente, admin_condominio não tem acesso global
+      ativo: true,
+      permissoes: {}
+    };
+    assert.equal(temAcessoGlobalExplicito(adminCondoRow), false);
+    assert.equal(ehAdminCondominio(adminCondoRow), true);
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminCondoRow, CONDO_A), true);
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminCondoRow, CONDO_B), false);
+
+    const authLocal = await testarNoBackend(adminCondoRow, [CONDO_B]);
+    assert.equal(authLocal.ok, true);
+    if (authLocal.ok) {
+      assert.equal(authLocal.context.eAdminGlobal, false);
+      assert.equal(authLocal.context.perfilNormalizado, 'admin_condominio');
+      assert.equal(podeGerenciarOperadoresServidor(authLocal.context, CONDO_A), true);
+      assert.equal(podeGerenciarOperadoresServidor(authLocal.context, CONDO_B), false);
+      assert.equal(temPermissaoModuloBackend(authLocal.context, 'cadastros', 'operadores', CONDO_A), true);
+      assert.equal(temPermissaoModuloBackend(authLocal.context, 'cadastros', 'operadores', CONDO_B), false);
+      assert.equal(temPermissaoModuloBackend(authLocal.context, 'configuracoes', 'visualizar', CONDO_A), false);
+    }
+
+    // 3. admin_geral SEM flag global NÃO obtém acesso global nem privilégios administrativos
+    const adminGeralSemFlag = {
+      id: OP_GLOBAL,
+      auth_user_id: AUTH_GLOBAL,
+      nome: 'Admin Geral Sem Flag',
+      login: 'global.sem.flag',
+      email: 'global@porttohub.test',
+      perfil: 'admin_geral',
+      nivel_acesso: 0,
+      nivel_acesso_custom_id: 'nivel_0',
+      condominio_id: CONDO_A,
+      acesso_global_condominios: false,
+      ativo: true,
+      permissoes: {}
+    };
+    assert.equal(temAcessoGlobalExplicito(adminGeralSemFlag), false);
+    assert.equal(ehAdminCondominio(adminGeralSemFlag), false);
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminGeralSemFlag, CONDO_A), false);
+    assert.equal(permissoesSvc.verificarPermissao(adminGeralSemFlag, 'configuracoes', 'visualizar'), false);
+    assert.equal(permissoesSvc.verificarPermissao(adminGeralSemFlag, 'cadastros', 'operadores'), false);
+
+    const authSemFlag = await testarNoBackend(adminGeralSemFlag);
+    assert.equal(authSemFlag.ok, true);
+    if (authSemFlag.ok) {
+      assert.equal(authSemFlag.context.eAdminGlobal, false);
+      assert.notEqual(authSemFlag.context.perfilNormalizado, 'admin_geral');
+      assert.equal(podeGerenciarOperadoresServidor(authSemFlag.context, CONDO_A), false);
+      assert.equal(temPermissaoModuloBackend(authSemFlag.context, 'configuracoes', 'visualizar', CONDO_A), false);
+      assert.equal(temPermissaoModuloBackend(authSemFlag.context, 'cadastros', 'operadores', CONDO_A), false);
+    }
+
+    // 4. admin_geral INATIVO com flag global ligada NÃO obtém acesso global
+    const adminGeralInativo = { ...adminGeralSemFlag, acesso_global_condominios: true, ativo: false };
+    assert.equal(temAcessoGlobalExplicito(adminGeralInativo), false);
+    assert.equal(permissoesSvc.verificarPermissao(adminGeralInativo, 'configuracoes', 'visualizar'), false);
+    const authInativo = await testarNoBackend(adminGeralInativo);
+    assert.equal(authInativo.ok, false);
+
+    // 5. admin_geral ATIVO com flag global ligada MANTÉM acesso global completo
+    const adminGeralAtivo = { ...adminGeralSemFlag, acesso_global_condominios: true, ativo: true };
+    assert.equal(temAcessoGlobalExplicito(adminGeralAtivo), true);
+    assert.equal(normalizarPerfilOperador(adminGeralAtivo), 'admin_geral');
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminGeralAtivo, CONDO_A), true);
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminGeralAtivo, CONDO_B), true);
+    assert.equal(permissoesSvc.verificarPermissao(adminGeralAtivo, 'configuracoes', 'visualizar'), true);
+    assert.equal(permissoesSvc.verificarPermissao(adminGeralAtivo, 'cadastros', 'condominios'), true);
+
+    const authGlobal = await testarNoBackend(adminGeralAtivo);
+    assert.equal(authGlobal.ok, true);
+    if (authGlobal.ok) {
+      assert.equal(authGlobal.context.eAdminGlobal, true);
+      assert.equal(authGlobal.context.perfilNormalizado, 'admin_geral');
+      assert.equal(podeGerenciarOperadoresServidor(authGlobal.context, CONDO_B), true);
+      assert.equal(temPermissaoModuloBackend(authGlobal.context, 'configuracoes', 'visualizar', CONDO_A), true);
+      assert.equal(temPermissaoModuloBackend(authGlobal.context, 'cadastros', 'condominios', CONDO_C), true);
+    }
+
+    // 6. Verificação estática SQL 05/11/12: ausência de admin_local / 'admin' / 'master' e Auditoria 12 detectando classificações indevidas
+    const sql05 = fs.readFileSync(path.resolve('supabase/sql/05_FUNCOES_AUTORIZACAO.sql'), 'utf8');
+    const sql11 = fs.readFileSync(path.resolve('supabase/sql/11_CORRECOES_SEGURANCA_E_ALINHAMENTO.sql'), 'utf8');
+    const sql12 = fs.readFileSync(path.resolve('supabase/sql/12_AUDITORIA_FINAL_SEGURANCA.sql'), 'utf8');
+
+    for (const [nome, sql] of [['05', sql05], ['11', sql11]] as const) {
+      assert.equal(sql.includes('admin_local'), false, `${nome}: não deve conter admin_local`);
+      assert.equal(sql.includes("'master'"), false, `${nome}: não deve conter perfil master`);
+      assert.equal(sql.includes("'admin'"), false, `${nome}: não deve conter perfil admin`);
+
+      const trechoGerenciar = sql.split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id TEXT)')[1]
+        .split('CREATE OR REPLACE FUNCTION public.operador_pode_gerenciar_operadores(p_condominio_id UUID)')[0];
+      assert.ok(trechoGerenciar.includes("lower(trim(COALESCE(o.perfil, ''))) = 'admin_condominio'"), `${nome}: operador_pode_gerenciar_operadores deve exigir perfil = 'admin_condominio'`);
+
+      const trechoPermMod = sql.split('CREATE OR REPLACE FUNCTION public.operador_tem_permissao_modulo(')[1]
+        .split('CREATE OR REPLACE FUNCTION public.operador_tem_permissao_modulo(')[0];
+      assert.ok(trechoPermMod.includes("v_perfil = 'admin_condominio'"), `${nome}: operador_tem_permissao_modulo deve exigir v_perfil = 'admin_condominio'`);
+    }
+
+    assert.ok(sql12.includes("pg_get_functiondef(p.oid) ILIKE '%v_perfil = ''admin_condominio''%'"));
+    assert.ok(sql12.includes("pg_get_functiondef(p.oid) NOT ILIKE '%admin_local%'"));
+    assert.ok(sql12.includes("pg_get_functiondef(p.oid) NOT ILIKE '%''master''%'"));
+    assert.ok(sql12.includes("pg_get_functiondef(p.oid) NOT ILIKE '%''admin''%'"));
+    assert.ok(sql12.includes("IN ('admin_local', 'admin', 'master')"));
+    assert.ok(sql12.includes("coalesce\\([^,]*acesso_global_condominios,\\s*false\\)\\s*=\\s*true"));
+    assert.ok(sql12.includes("coalesce\\([^,]*ativo,\\s*true\\)\\s*=\\s*true"));
+
+    // 7. admin_condominio INATIVO não é reconhecido como admin local nem pode gerenciar operadores
+    const adminCondoInativo = {
+      ...adminCondoRow,
+      acesso_global_condominios: false,
+      ativo: false
+    };
+    assert.equal(ehAdminCondominio(adminCondoInativo), false, 'admin_condominio inativo não pode ser reconhecido por ehAdminCondominio()');
+    assert.equal(podeGerenciarOperadoresNoCondominio(adminCondoInativo, CONDO_A), false, 'admin_condominio inativo não pode gerenciar operadores');
+    assert.equal(temAcessoGlobalExplicito(adminCondoInativo), false);
+    assert.equal(permissoesSvc.verificarPermissao(adminCondoInativo, 'cadastros', 'operadores'), false);
+    assert.equal(permissoesSvc.verificarPermissao(adminCondoInativo, 'cadastros', 'editar_operadores'), false);
+
+    const authLocalInativo = await testarNoBackend(adminCondoInativo);
+    assert.equal(authLocalInativo.ok, false, 'Backend deve bloquear admin_condominio inativo');
+
+    const ctxLocalInativoFake: any = {
+      eAdminGlobal: false,
+      perfilNormalizado: 'admin_condominio',
+      operador: adminCondoInativo,
+      allowedCondominioIds: new Set([CONDO_A])
+    };
+    assert.equal(podeGerenciarOperadoresServidor(ctxLocalInativoFake, CONDO_A), false);
+    assert.equal(temPermissaoModuloBackend(ctxLocalInativoFake, 'cadastros', 'operadores', CONDO_A), false);
+
+    permissoesSvc.limparCacheNiveisAcesso();
+  } finally {
+    (globalThis as any).localStorage = origStorage;
+  }
+});
+
+
 

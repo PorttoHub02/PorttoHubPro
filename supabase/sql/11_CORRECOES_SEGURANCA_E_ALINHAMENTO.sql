@@ -13,17 +13,16 @@
 --      + `operador_pode_editar_alvo_local`.
 --   3. Corrige o bypass em `validar_e_consumir_passe_qr` (remove exceção via
 --      `current_user NOT IN`), exige `v_jwt_role = 'service_role'` quando
---      `auth.uid() IS NULL`, exige permissão `controle_acesso` e define a flag
---      transacional `porttohub.rpc_passe_qr_consumo = '1'`.
+--      `auth.uid() IS NULL`, exige permissão `controle_acesso` e registra
+--      marcador transacional na tabela privada `porttohub_internal.passe_qr_tx_autorizacao`.
 --   4. Mantém `proteger_campos_operador()` em SECURITY INVOKER + cria
---      `proteger_campos_passe_qr()` em SECURITY INVOKER na tabela
---      `passes_virtuais_qr` bloqueando adulteração direta de usos/status/token.
---   5. Revoga privilégios excessivos (`PUBLIC`, `anon` e `TRUNCATE`, `TRIGGER`,
---      `REFERENCES` de `authenticated`) em todas as tabelas e sequences.
---   6. Remove políticas antigas APENAS das 35 tabelas canônicas (`todas_tabelas`),
---      sem tocar cegamente em tabelas extras, e recria políticas granulares
---      (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) exigindo permissões por módulo
---      e consistência relacional entre tabelas filhas e pais.
+--      `proteger_campos_passe_qr()`, `proteger_autoria_historico_absoluto()` e
+--      `proteger_autoria_registros_acesso()` em SECURITY INVOKER.
+--   5. Pré-audita tabelas e sequences extras fora das 35 canônicas sem
+--      modificá-las, e restringe revogação/concessão de privilégios e RLS
+--      exclusivamente às 35 tabelas oficiais e suas sequences vinculadas.
+--   6. Unifica `operador_tem_permissao_modulo()` com `configuracoes.niveis_acesso`
+--      e `nivel_acesso_custom_id` (fail-closed) em sintonia com backend/frontend.
 --   7. Garante todas as 8 políticas privadas de Storage (`condominios/{uuid}/...`
 --      com `operador_atual_id() IS NOT NULL` e `operadores/{auth.uid()}/...`).
 --   8. Valida `chk_passes_qr_usos_limite` (`VALIDATE CONSTRAINT`) quando houver
@@ -47,6 +46,7 @@ DECLARE
   v_pol_for_all_count INTEGER := 0;
   v_pol_permissive_count INTEGER := 0;
   v_extra_tables TEXT := '';
+  v_extra_sequences TEXT := '';
   todas_tabelas TEXT[] := ARRAY[
     'condominios', 'operadores', 'operador_condominios',
     'configuracoes', 'templates_whatsapp', 'locais_armazenamento', 'pontos_acesso',
@@ -70,7 +70,8 @@ BEGIN
   SELECT COUNT(*)
   INTO v_admin_count
   FROM public.operadores
-  WHERE COALESCE(acesso_global_condominios, FALSE) = TRUE
+  WHERE lower(trim(COALESCE(perfil, ''))) = 'admin_geral'
+    AND COALESCE(acesso_global_condominios, FALSE) = TRUE
     AND COALESCE(ativo, TRUE) = TRUE
     AND auth_user_id IS NOT NULL;
 
@@ -87,16 +88,17 @@ BEGIN
     RAISE NOTICE 'Aviso: bucket encomendas sera criado como privado pelo bloco de Storage desta migracao.';
   END IF;
 
-  -- Pré-auditoria explícita em pg_policies antes de qualquer alteração
+  -- Pré-auditoria explícita em pg_policies (restrita às 35 tabelas canônicas) antes de qualquer alteração
   SELECT
     COUNT(*),
     COUNT(*) FILTER (WHERE cmd = 'ALL'),
     COUNT(*) FILTER (WHERE COALESCE(qual, '') IN ('true', '(true)') OR COALESCE(with_check, '') IN ('true', '(true)'))
   INTO v_pol_public_count, v_pol_for_all_count, v_pol_permissive_count
   FROM pg_policies
-  WHERE schemaname = 'public';
+  WHERE schemaname = 'public'
+    AND tablename = ANY(todas_tabelas);
 
-  RAISE NOTICE 'Pre-auditoria pg_policies (public): total=%, FOR_ALL=%, permissivas_true=%',
+  RAISE NOTICE 'Pre-auditoria pg_policies (35 tabelas oficiais): total=%, FOR_ALL=%, permissivas_true=%',
     v_pol_public_count, v_pol_for_all_count, v_pol_permissive_count;
 
   SELECT COALESCE(string_agg(c.relname, ', ' ORDER BY c.relname), '')
@@ -108,7 +110,29 @@ BEGIN
     AND NOT (c.relname = ANY(todas_tabelas));
 
   IF v_extra_tables <> '' THEN
-    RAISE NOTICE 'AVISO: Existem tabelas fora da lista canonica das 35 tabelas (suas politicas NAO serao removidas cegamente): %', v_extra_tables;
+    RAISE NOTICE 'AVISO: Tabelas extras fora das 35 oficiais detectadas e PRESERVADAS intactas (privilegios, RLS e politicas NAO alterados): %', v_extra_tables;
+  END IF;
+
+  SELECT COALESCE(string_agg(s.relname, ', ' ORDER BY s.relname), '')
+  INTO v_extra_sequences
+  FROM pg_class s
+  JOIN pg_namespace ns ON ns.oid = s.relnamespace
+  WHERE ns.nspname = 'public'
+    AND s.relkind = 'S'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_depend d
+      JOIN pg_class t ON t.oid = d.refobjid
+      JOIN pg_namespace nt ON nt.oid = t.relnamespace
+      WHERE d.objid = s.oid
+        AND d.deptype IN ('a', 'i')
+        AND nt.nspname = 'public'
+        AND t.relkind = 'r'
+        AND t.relname = ANY(todas_tabelas)
+    );
+
+  IF v_extra_sequences <> '' THEN
+    RAISE NOTICE 'AVISO: Sequences fora da lista vinculada as 35 tabelas oficiais serao PRESERVADAS intactas: %', v_extra_sequences;
   END IF;
 END $$;
 
@@ -144,6 +168,7 @@ AS $$
       WHERE o.auth_user_id = auth.uid()
         AND COALESCE(o.ativo, TRUE) = TRUE
         AND COALESCE(o.acesso_global_condominios, FALSE) = TRUE
+        AND lower(trim(COALESCE(o.perfil, ''))) = 'admin_geral'
     );
 $$;
 
@@ -175,9 +200,12 @@ AS $$
       WHERE o.auth_user_id = auth.uid()
         AND COALESCE(o.ativo, TRUE) = TRUE
         AND (
-          COALESCE(o.acesso_global_condominios, FALSE) = TRUE
+          (
+            COALESCE(o.acesso_global_condominios, FALSE) = TRUE
+            AND lower(trim(COALESCE(o.perfil, ''))) = 'admin_geral'
+          )
           OR (
-            lower(COALESCE(o.perfil, '')) IN ('admin_condominio', 'admin_local', 'admin', 'master')
+            lower(trim(COALESCE(o.perfil, ''))) = 'admin_condominio'
             AND o.condominio_id IS NOT NULL
             AND o.condominio_id::text = trim(p_condominio_id)
           )
@@ -213,7 +241,10 @@ AS $$
       WHERE o.auth_user_id = auth.uid()
         AND COALESCE(o.ativo, TRUE) = TRUE
         AND (
-          COALESCE(o.acesso_global_condominios, FALSE) = TRUE
+          (
+            COALESCE(o.acesso_global_condominios, FALSE) = TRUE
+            AND lower(trim(COALESCE(o.perfil, ''))) = 'admin_geral'
+          )
           OR o.condominio_id::text = trim(p_condominio_id)
           OR EXISTS (
             SELECT 1
@@ -279,7 +310,7 @@ BEGIN
 END;
 $$;
 
--- Verificação funcional real de módulo e ação (espelha src/services/permissoesService.ts)
+-- Verificação funcional real de módulo e ação (fonte única da verdade com configuracoes.niveis_acesso)
 CREATE OR REPLACE FUNCTION public.operador_tem_permissao_modulo(
   p_condominio_id TEXT,
   p_modulo TEXT,
@@ -298,13 +329,22 @@ DECLARE
   v_op RECORD;
   v_perfil TEXT;
   v_nivel INTEGER;
+  v_custom_id TEXT;
+  v_custom_lower TEXT;
+  v_perfil_nivel_id TEXT;
+  v_nivel_id TEXT;
+  v_eh_nivel_custom BOOLEAN := FALSE;
   v_eh_admin_condo BOOLEAN := FALSE;
   v_eh_supervisor BOOLEAN := FALSE;
   v_eh_sindico BOOLEAN := FALSE;
   v_perm JSONB;
+  v_nivel_perm JSONB := NULL;
+  v_fonte JSONB;
+  v_passo INTEGER;
   v_mod_obj JSONB;
   v_cad_obj JSONB;
   v_fallback_acao TEXT := NULL;
+  v_mod_definido_no_nivel BOOLEAN := FALSE;
 BEGIN
   IF auth.uid() IS NULL OR v_condo = '' OR v_mod = '' OR v_acao = '' THEN
     RETURN FALSE;
@@ -319,6 +359,7 @@ BEGIN
     o.condominio_id,
     o.perfil,
     o.nivel_acesso,
+    o.nivel_acesso_custom_id,
     o.acesso_global_condominios,
     o.permissoes,
     o.ativo
@@ -332,27 +373,66 @@ BEGIN
     RETURN FALSE;
   END IF;
 
-  IF COALESCE(v_op.acesso_global_condominios, FALSE) = TRUE THEN
+  v_perfil := lower(trim(COALESCE(v_op.perfil, '')));
+
+  IF COALESCE(v_op.acesso_global_condominios, FALSE) = TRUE AND v_perfil = 'admin_geral' THEN
     RETURN TRUE;
   END IF;
 
   IF v_mod = 'prestadores' THEN v_mod := 'autorizados'; END IF;
   IF v_mod = 'passagem' THEN v_mod := 'passagem_posto'; END IF;
 
-  v_perfil := lower(trim(COALESCE(v_op.perfil, '')));
   v_nivel := v_op.nivel_acesso;
+  v_custom_id := NULLIF(trim(COALESCE(v_op.nivel_acesso_custom_id, '')), '');
+  v_custom_lower := lower(COALESCE(v_custom_id, ''));
 
-  v_eh_admin_condo := (v_perfil IN ('admin_condominio', 'admin_local', 'admin', 'master'));
-  v_eh_supervisor := (NOT v_eh_admin_condo AND (v_perfil = 'supervisor' OR v_nivel = 2));
-  v_eh_sindico := (NOT v_eh_admin_condo AND NOT v_eh_supervisor AND (v_perfil LIKE '%sind%' OR v_nivel = 4));
+  -- Classificação estritamente pelo perfil oficial (somente perfil = 'admin_condominio'; sem perfis legados nem promoção por nivel_acesso)
+  v_eh_admin_condo := (
+    v_perfil = 'admin_condominio'
+    AND v_op.condominio_id IS NOT NULL
+    AND v_op.condominio_id::text = v_condo
+  );
+  v_eh_supervisor := (NOT v_eh_admin_condo AND v_perfil = 'supervisor');
+  v_eh_sindico := (NOT v_eh_admin_condo AND NOT v_eh_supervisor AND (v_perfil IN ('sindico', 'síndico') OR v_perfil LIKE '%sind%'));
+
+  v_perfil_nivel_id := CASE
+    WHEN v_eh_admin_condo THEN 'nivel_1'
+    WHEN v_eh_supervisor THEN 'nivel_2'
+    WHEN v_eh_sindico THEN 'nivel_4'
+    ELSE 'nivel_3'
+  END;
+
+  -- Nível personalizado controla funcionalidades operacionais permitidas, mas nunca eleva perfil inferior para nível administrativo
+  IF v_custom_id IS NOT NULL THEN
+    IF v_custom_lower IN ('0', '1', 'nivel_0', 'nivel_1') THEN
+      v_nivel_id := v_perfil_nivel_id;
+      v_eh_nivel_custom := FALSE;
+    ELSIF v_custom_lower IN ('2', 'nivel_2') AND NOT v_eh_admin_condo AND NOT v_eh_supervisor THEN
+      v_nivel_id := v_perfil_nivel_id;
+      v_eh_nivel_custom := FALSE;
+    ELSIF v_custom_lower IN ('4', 'nivel_4') AND NOT v_eh_admin_condo AND NOT v_eh_supervisor AND NOT v_eh_sindico THEN
+      v_nivel_id := v_perfil_nivel_id;
+      v_eh_nivel_custom := FALSE;
+    ELSIF v_custom_lower IN ('nivel_2', 'nivel_3', 'nivel_4') THEN
+      v_nivel_id := v_custom_lower;
+      v_eh_nivel_custom := FALSE;
+    ELSE
+      v_nivel_id := v_custom_id;
+      v_eh_nivel_custom := TRUE;
+    END IF;
+  ELSE
+    v_nivel_id := v_perfil_nivel_id;
+    v_eh_nivel_custom := FALSE;
+  END IF;
 
   IF v_mod = 'materiais' AND v_acao IN ('excluir', 'excluir_equipamento') THEN
-    IF NOT v_eh_admin_condo AND NOT v_eh_supervisor AND (COALESCE(v_nivel, 3) >= 3 OR v_perfil IN ('operador', 'porteiro')) THEN
+    IF NOT v_eh_admin_condo AND NOT v_eh_supervisor AND NOT v_eh_nivel_custom
+       AND v_perfil IN ('operador', 'porteiro', '') THEN
       RETURN FALSE;
     END IF;
   END IF;
 
-  IF v_mod = 'configuracoes' AND v_acao <> 'visualizar' THEN
+  IF v_mod = 'configuracoes' THEN
     RETURN FALSE;
   END IF;
 
@@ -360,11 +440,37 @@ BEGIN
     IF v_acao IN ('condominios', 'gerenciar_niveis') THEN
       RETURN FALSE;
     END IF;
-    IF v_acao IN ('operadores', 'cadastrar_operadores', 'editar_operadores', 'alterar_senha_operador', 'excluir_operadores') THEN
+    IF v_acao IN ('operadores', 'cadastrar_operadores', 'editar_operadores', 'alterar_senha_operador', 'excluir_operadores', 'configurar_condominio') THEN
       IF NOT v_eh_admin_condo OR v_op.condominio_id IS NULL OR v_op.condominio_id::text <> v_condo THEN
         RETURN FALSE;
       END IF;
     END IF;
+  END IF;
+
+  IF v_mod = 'historico_absoluto' AND v_acao IN ('limpar_dados', 'excluir') THEN
+    IF NOT v_eh_admin_condo OR v_op.condominio_id IS NULL OR v_op.condominio_id::text <> v_condo THEN
+      RETURN FALSE;
+    END IF;
+  END IF;
+
+  -- Busca matriz do nível em configuracoes.niveis_acesso do condomínio alvo
+  SELECT elem -> 'permissoes'
+  INTO v_nivel_perm
+  FROM public.configuracoes c
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN c.niveis_acesso IS NOT NULL AND jsonb_typeof(c.niveis_acesso) = 'array'
+      THEN c.niveis_acesso
+      ELSE '[]'::jsonb
+    END
+  ) AS elem
+  WHERE c.condominio_id::text = v_condo
+    AND elem ->> 'id' = v_nivel_id
+  LIMIT 1;
+
+  -- Fail-closed: nivel_acesso_custom_id inexistente em configuracoes.niveis_acesso nega acesso
+  IF v_eh_nivel_custom AND (v_nivel_perm IS NULL OR jsonb_typeof(v_nivel_perm) <> 'object') THEN
+    RETURN FALSE;
   END IF;
 
   v_perm := COALESCE(v_op.permissoes, '{}'::jsonb);
@@ -377,7 +483,18 @@ BEGIN
         WHEN v_mod = 'passagem_posto' THEN v_perm -> 'passagem'
         WHEN v_mod = 'moradores' THEN COALESCE(v_perm -> 'moradores', v_perm -> 'cadastros')
         ELSE NULL
-      END
+      END,
+      CASE WHEN v_nivel_perm IS NOT NULL AND jsonb_typeof(v_nivel_perm) = 'object' THEN
+        COALESCE(
+          v_nivel_perm -> v_mod,
+          CASE
+            WHEN v_mod = 'autorizados' THEN v_nivel_perm -> 'prestadores'
+            WHEN v_mod = 'passagem_posto' THEN v_nivel_perm -> 'passagem'
+            WHEN v_mod = 'moradores' THEN COALESCE(v_nivel_perm -> 'moradores', v_nivel_perm -> 'cadastros')
+            ELSE NULL
+          END
+        )
+      ELSE NULL END
     );
 
     IF v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object' AND lower(COALESCE(v_mod_obj ->> 'visualizar', '')) = 'false' THEN
@@ -389,133 +506,169 @@ BEGIN
     END IF;
 
     IF v_acao IN ('visualizar', 'relatorio', 'dossie', 'historico', 'ver_feed', 'ver_metricas', 'exportar_csv', 'visualizar_moradores', 'visualizar_operadores', 'auditoria') THEN
+      IF v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object' AND (v_mod_obj ? 'visualizar') THEN
+        RETURN lower(v_mod_obj ->> 'visualizar') = 'true';
+      END IF;
       RETURN TRUE;
     END IF;
 
     RETURN FALSE;
   END IF;
 
-  IF v_mod = 'moradores' THEN
-    v_mod_obj := v_perm -> 'moradores';
-    v_cad_obj := v_perm -> 'cadastros';
-
-    IF v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object' THEN
-      IF lower(COALESCE(v_mod_obj ->> 'visualizar', '')) = 'false' THEN
-        RETURN FALSE;
-      END IF;
-      IF v_acao = 'visualizar' AND v_mod_obj ? 'visualizar' THEN
-        RETURN lower(v_mod_obj ->> 'visualizar') = 'true';
-      END IF;
-      IF v_mod_obj ? v_acao THEN
-        RETURN lower(v_mod_obj ->> v_acao) = 'true';
-      END IF;
-      IF v_acao IN ('adicionar', 'cadastrar', 'criar') THEN
-        IF v_mod_obj ? 'adicionar' THEN RETURN lower(v_mod_obj ->> 'adicionar') = 'true'; END IF;
-        IF v_mod_obj ? 'criar' THEN RETURN lower(v_mod_obj ->> 'criar') = 'true'; END IF;
-        IF v_mod_obj ? 'cadastrar' THEN RETURN lower(v_mod_obj ->> 'cadastrar') = 'true'; END IF;
-      END IF;
+  FOR v_passo IN 1..2 LOOP
+    v_fonte := CASE WHEN v_passo = 1 THEN v_perm ELSE v_nivel_perm END;
+    IF v_fonte IS NULL OR jsonb_typeof(v_fonte) <> 'object' THEN
+      CONTINUE;
     END IF;
 
-    IF v_cad_obj IS NOT NULL AND jsonb_typeof(v_cad_obj) = 'object' THEN
-      IF lower(COALESCE(v_cad_obj ->> 'visualizar', '')) = 'false' THEN
-        RETURN FALSE;
-      END IF;
-      IF v_acao = 'visualizar' AND v_cad_obj ? 'visualizar_moradores' THEN
-        RETURN lower(v_cad_obj ->> 'visualizar_moradores') = 'true';
-      END IF;
-      IF v_acao IN ('criar', 'adicionar', 'cadastrar') AND (v_cad_obj ? 'cadastrar_morador' OR v_cad_obj ? 'moradores') THEN
-        RETURN lower(COALESCE(v_cad_obj ->> 'cadastrar_morador', v_cad_obj ->> 'moradores', 'false')) = 'true';
-      END IF;
-      IF v_acao = 'editar' AND (v_cad_obj ? 'editar_morador' OR v_cad_obj ? 'moradores') THEN
-        RETURN lower(COALESCE(v_cad_obj ->> 'editar_morador', v_cad_obj ->> 'moradores', 'false')) = 'true';
-      END IF;
-      IF v_acao = 'excluir' AND v_cad_obj ? 'excluir_morador' THEN
-        RETURN lower(v_cad_obj ->> 'excluir_morador') = 'true';
-      END IF;
-    END IF;
-  ELSE
-    v_mod_obj := COALESCE(
-      v_perm -> v_mod,
-      CASE
-        WHEN v_mod = 'autorizados' THEN v_perm -> 'prestadores'
-        WHEN v_mod = 'passagem_posto' THEN v_perm -> 'passagem'
-        ELSE NULL
-      END
-    );
+    IF v_mod = 'moradores' THEN
+      v_mod_obj := v_fonte -> 'moradores';
+      v_cad_obj := v_fonte -> 'cadastros';
 
-    IF v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object' THEN
-      IF lower(COALESCE(v_mod_obj ->> 'visualizar', '')) = 'false' THEN
-        RETURN FALSE;
+      IF v_passo = 2 AND ((v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object') OR (v_cad_obj IS NOT NULL AND jsonb_typeof(v_cad_obj) = 'object')) THEN
+        v_mod_definido_no_nivel := TRUE;
       END IF;
 
-      IF v_acao = 'visualizar' THEN
-        IF v_mod_obj ? 'visualizar' THEN
+      IF v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object' THEN
+        IF lower(COALESCE(v_mod_obj ->> 'visualizar', '')) = 'false' THEN
+          RETURN FALSE;
+        END IF;
+        IF v_acao = 'visualizar' AND v_mod_obj ? 'visualizar' THEN
           RETURN lower(v_mod_obj ->> 'visualizar') = 'true';
         END IF;
-        RETURN TRUE;
+        IF v_mod_obj ? v_acao THEN
+          RETURN lower(v_mod_obj ->> v_acao) = 'true';
+        END IF;
+        IF v_acao IN ('adicionar', 'cadastrar', 'criar') THEN
+          IF v_mod_obj ? 'adicionar' THEN RETURN lower(v_mod_obj ->> 'adicionar') = 'true'; END IF;
+          IF v_mod_obj ? 'criar' THEN RETURN lower(v_mod_obj ->> 'criar') = 'true'; END IF;
+          IF v_mod_obj ? 'cadastrar' THEN RETURN lower(v_mod_obj ->> 'cadastrar') = 'true'; END IF;
+        END IF;
       END IF;
 
-      IF v_mod_obj ? v_acao THEN
-        RETURN lower(v_mod_obj ->> v_acao) = 'true';
+      IF v_cad_obj IS NOT NULL AND jsonb_typeof(v_cad_obj) = 'object' THEN
+        IF lower(COALESCE(v_cad_obj ->> 'visualizar', '')) = 'false' AND lower(COALESCE(v_cad_obj ->> 'visualizar_moradores', '')) <> 'true' THEN
+          RETURN FALSE;
+        END IF;
+        IF v_acao = 'visualizar' AND v_cad_obj ? 'visualizar_moradores' THEN
+          RETURN lower(v_cad_obj ->> 'visualizar_moradores') = 'true';
+        END IF;
+        IF v_acao IN ('criar', 'adicionar', 'cadastrar') AND (v_cad_obj ? 'cadastrar_morador' OR v_cad_obj ? 'moradores') THEN
+          RETURN lower(COALESCE(v_cad_obj ->> 'cadastrar_morador', v_cad_obj ->> 'moradores', 'false')) = 'true';
+        END IF;
+        IF v_acao = 'editar' AND (v_cad_obj ? 'editar_morador' OR v_cad_obj ? 'moradores') THEN
+          RETURN lower(COALESCE(v_cad_obj ->> 'editar_morador', v_cad_obj ->> 'moradores', 'false')) = 'true';
+        END IF;
+        IF v_acao = 'excluir' AND v_cad_obj ? 'excluir_morador' THEN
+          RETURN lower(v_cad_obj ->> 'excluir_morador') = 'true';
+        END IF;
       END IF;
+    ELSE
+      v_mod_obj := COALESCE(
+        v_fonte -> v_mod,
+        CASE
+          WHEN v_mod = 'autorizados' THEN v_fonte -> 'prestadores'
+          WHEN v_mod = 'passagem_posto' THEN v_fonte -> 'passagem'
+          ELSE NULL
+        END
+      );
 
-      v_fallback_acao := CASE
-        WHEN v_mod = 'encomendas' AND v_acao IN ('entrada_lote', 'criar_lote', 'triagem', 'baixa', 'cadastrar_entregador') THEN 'criar'
-        WHEN v_mod = 'encomendas' AND v_acao IN ('editar_pacote', 'editar_lotes') THEN 'editar'
-        WHEN v_mod = 'encomendas' AND v_acao IN ('excluir_pacote', 'excluir_lotes') THEN 'excluir'
-        WHEN v_mod = 'encomendas' AND v_acao IN ('dossie', 'historico') THEN 'visualizar'
-        WHEN v_mod = 'custodia' AND v_acao = 'receber' THEN 'criar'
-        WHEN v_mod = 'custodia' AND v_acao = 'baixa' THEN 'editar'
-        WHEN v_mod = 'custodia' AND v_acao = 'auditoria' THEN 'visualizar'
-        WHEN v_mod = 'chaves' AND v_acao IN ('cadastrar', 'emprestar') THEN 'criar'
-        WHEN v_mod = 'chaves' AND v_acao = 'devolver' THEN 'editar'
-        WHEN v_mod = 'rondas' AND v_acao IN ('iniciar_ronda', 'cadastrar_pontos') THEN 'criar'
-        WHEN v_mod = 'rondas' AND v_acao = 'setores' THEN 'editar'
-        WHEN v_mod = 'autorizados' AND v_acao IN ('cadastrar', 'dar_entrada') THEN 'criar'
-        WHEN v_mod = 'autorizados' AND v_acao = 'dar_saida' THEN 'editar'
-        WHEN v_mod = 'materiais' AND v_acao = 'cadastrar_equipamentos' THEN 'criar'
-        WHEN v_mod = 'materiais' AND v_acao = 'alterar_status' THEN 'editar'
-        WHEN v_mod = 'manutencao' AND v_acao = 'abrir_os' THEN 'criar'
-        WHEN v_mod = 'manutencao' AND v_acao = 'concluir' THEN 'editar'
-        WHEN v_mod = 'ocorrencias' AND v_acao = 'resolver' THEN 'editar'
-        WHEN v_mod = 'passagem_posto' AND v_acao = 'assumir_posto' THEN 'criar'
-        WHEN v_mod = 'passagem_posto' AND v_acao = 'relatorio' THEN 'visualizar'
-        WHEN v_mod = 'cadastros' AND v_acao IN ('operadores', 'cadastrar_operadores', 'cadastrar_morador') THEN 'criar'
-        WHEN v_mod = 'cadastros' AND v_acao IN ('editar_operadores', 'editar_morador', 'configurar_condominio') THEN 'editar'
-        WHEN v_mod = 'cadastros' AND v_acao IN ('excluir_operadores', 'excluir_morador') THEN 'excluir'
-        WHEN v_mod = 'cadastros' AND v_acao IN ('visualizar_moradores', 'visualizar_operadores', 'exportar_moradores') THEN 'visualizar'
-        WHEN v_mod = 'historico_absoluto' AND v_acao IN ('ver_feed', 'ver_metricas', 'exportar_csv') THEN 'visualizar'
-        WHEN v_mod = 'historico_absoluto' AND v_acao = 'limpar_dados' THEN 'excluir'
-        WHEN v_mod = 'bancada' AND v_acao = 'lancar' THEN 'criar'
-        WHEN v_mod = 'bancada' AND v_acao = 'baixa' THEN 'editar'
-        WHEN v_mod = 'bancada' AND v_acao = 'zerar' THEN 'excluir'
-        WHEN v_mod = 'bancada' AND v_acao = 'historico' THEN 'visualizar'
-        WHEN v_mod = 'reservas' AND v_acao IN ('aprovar', 'gerenciar_areas', 'vistoria') THEN 'editar'
-        WHEN v_mod = 'reservas' AND v_acao = 'cancelar' THEN 'excluir'
-        WHEN v_mod = 'controle_acesso' AND v_acao IN ('liberar_entrada', 'gerar_passe_qr') THEN 'criar'
-        WHEN v_mod = 'controle_acesso' AND v_acao IN ('registrar_saida', 'bloquear', 'configurar_portoes') THEN 'editar'
-        ELSE NULL
-      END;
+      IF v_mod_obj IS NOT NULL AND jsonb_typeof(v_mod_obj) = 'object' THEN
+        IF v_passo = 2 THEN
+          v_mod_definido_no_nivel := TRUE;
+        END IF;
 
-      IF v_fallback_acao IS NOT NULL AND v_mod_obj ? v_fallback_acao THEN
-        RETURN lower(v_mod_obj ->> v_fallback_acao) = 'true';
+        IF lower(COALESCE(v_mod_obj ->> 'visualizar', '')) = 'false' THEN
+          IF NOT (
+            v_mod = 'cadastros'
+            AND v_acao IN ('visualizar_moradores', 'cadastrar_morador', 'gerenciar_veiculos')
+          ) THEN
+            RETURN FALSE;
+          END IF;
+        END IF;
+
+        IF v_acao = 'visualizar' AND (v_mod_obj ? 'visualizar') THEN
+          RETURN lower(v_mod_obj ->> 'visualizar') = 'true';
+        END IF;
+
+        IF v_mod_obj ? v_acao THEN
+          RETURN lower(v_mod_obj ->> v_acao) = 'true';
+        END IF;
+
+        v_fallback_acao := CASE
+          WHEN v_mod = 'encomendas' AND v_acao IN ('entrada_lote', 'criar_lote', 'triagem', 'baixa', 'cadastrar_entregador') THEN 'criar'
+          WHEN v_mod = 'encomendas' AND v_acao IN ('editar_pacote', 'editar_lotes') THEN 'editar'
+          WHEN v_mod = 'encomendas' AND v_acao IN ('excluir_pacote', 'excluir_lotes') THEN 'excluir'
+          WHEN v_mod = 'encomendas' AND v_acao IN ('dossie', 'historico') THEN 'visualizar'
+          WHEN v_mod = 'custodia' AND v_acao = 'receber' THEN 'criar'
+          WHEN v_mod = 'custodia' AND v_acao = 'baixa' THEN 'editar'
+          WHEN v_mod = 'custodia' AND v_acao = 'auditoria' THEN 'visualizar'
+          WHEN v_mod = 'chaves' AND v_acao IN ('cadastrar', 'emprestar') THEN 'criar'
+          WHEN v_mod = 'chaves' AND v_acao = 'devolver' THEN 'editar'
+          WHEN v_mod = 'rondas' AND v_acao IN ('iniciar_ronda', 'cadastrar_pontos') THEN 'criar'
+          WHEN v_mod = 'rondas' AND v_acao = 'setores' THEN 'editar'
+          WHEN v_mod = 'autorizados' AND v_acao IN ('cadastrar', 'dar_entrada') THEN 'criar'
+          WHEN v_mod = 'autorizados' AND v_acao = 'dar_saida' THEN 'editar'
+          WHEN v_mod = 'materiais' AND v_acao = 'cadastrar_equipamentos' THEN 'criar'
+          WHEN v_mod = 'materiais' AND v_acao = 'alterar_status' THEN 'editar'
+          WHEN v_mod = 'manutencao' AND v_acao = 'abrir_os' THEN 'criar'
+          WHEN v_mod = 'manutencao' AND v_acao = 'concluir' THEN 'editar'
+          WHEN v_mod = 'ocorrencias' AND v_acao = 'resolver' THEN 'editar'
+          WHEN v_mod = 'passagem_posto' AND v_acao = 'assumir_posto' THEN 'criar'
+          WHEN v_mod = 'passagem_posto' AND v_acao = 'relatorio' THEN 'visualizar'
+          WHEN v_mod = 'cadastros' AND v_acao IN ('operadores', 'cadastrar_operadores', 'cadastrar_morador') THEN 'criar'
+          WHEN v_mod = 'cadastros' AND v_acao IN ('editar_operadores', 'editar_morador', 'configurar_condominio') THEN 'editar'
+          WHEN v_mod = 'cadastros' AND v_acao IN ('excluir_operadores', 'excluir_morador') THEN 'excluir'
+          WHEN v_mod = 'cadastros' AND v_acao IN ('visualizar_moradores', 'visualizar_operadores', 'exportar_moradores') THEN 'visualizar'
+          WHEN v_mod = 'historico_absoluto' AND v_acao IN ('ver_feed', 'ver_metricas', 'exportar_csv') THEN 'visualizar'
+          WHEN v_mod = 'historico_absoluto' AND v_acao = 'limpar_dados' THEN 'excluir'
+          WHEN v_mod = 'bancada' AND v_acao = 'lancar' THEN 'criar'
+          WHEN v_mod = 'bancada' AND v_acao = 'baixa' THEN 'editar'
+          WHEN v_mod = 'bancada' AND v_acao = 'zerar' THEN 'excluir'
+          WHEN v_mod = 'bancada' AND v_acao = 'historico' THEN 'visualizar'
+          WHEN v_mod = 'reservas' AND v_acao IN ('aprovar', 'gerenciar_areas', 'vistoria') THEN 'editar'
+          WHEN v_mod = 'reservas' AND v_acao = 'cancelar' THEN 'excluir'
+          WHEN v_mod = 'controle_acesso' AND v_acao IN ('liberar_entrada', 'gerar_passe_qr') THEN 'criar'
+          WHEN v_mod = 'controle_acesso' AND v_acao IN ('registrar_saida', 'bloquear', 'configurar_portoes') THEN 'editar'
+          ELSE NULL
+        END;
+
+        IF v_fallback_acao IS NOT NULL AND v_mod_obj ? v_fallback_acao THEN
+          RETURN lower(v_mod_obj ->> v_fallback_acao) = 'true';
+        END IF;
       END IF;
     END IF;
+  END LOOP;
+
+  IF v_eh_nivel_custom THEN
+    RETURN FALSE;
   END IF;
 
-  IF v_acao IN ('visualizar', 'historico', 'relatorio', 'ver_feed', 'auditoria', 'visualizar_moradores') THEN
-    IF v_mod = 'encomendas' AND v_acao = 'dossie' AND NOT v_eh_admin_condo AND NOT v_eh_supervisor THEN
-      RETURN FALSE;
-    END IF;
-    RETURN TRUE;
+  IF v_mod_definido_no_nivel THEN
+    RETURN FALSE;
   END IF;
 
   IF v_eh_admin_condo THEN
-    IF v_mod = 'historico_absoluto' THEN RETURN FALSE; END IF;
-    IF v_mod = 'cadastros' AND v_acao IN ('excluir', 'excluir_morador', 'excluir_operadores', 'condominios', 'gerenciar_niveis') THEN
-      RETURN FALSE;
+    IF v_mod = 'historico_absoluto' THEN
+      RETURN v_acao IN ('visualizar', 'ver_feed', 'ver_metricas', 'exportar_csv');
     END IF;
-    IF v_mod = 'reservas' AND v_acao = 'cancelar' THEN RETURN TRUE; END IF;
+    IF v_mod = 'cadastros' THEN
+      IF v_acao IN ('excluir', 'excluir_morador', 'excluir_operadores', 'condominios', 'gerenciar_niveis') THEN
+        RETURN FALSE;
+      END IF;
+      RETURN v_acao IN (
+        'visualizar', 'criar', 'editar', 'moradores', 'visualizar_moradores', 'cadastrar_morador',
+        'editar_morador', 'gerenciar_veiculos', 'vincular_tags', 'status_acesso_morador', 'exportar_moradores',
+        'visualizar_operadores', 'operadores', 'cadastrar_operadores', 'editar_operadores',
+        'alterar_senha_operador', 'configurar_condominio'
+      );
+    END IF;
+    IF v_mod = 'bancada' THEN
+      RETURN v_acao <> 'excluir';
+    END IF;
+    IF v_mod = 'reservas' THEN
+      RETURN v_acao <> 'excluir';
+    END IF;
     IF v_acao IN ('excluir', 'excluir_pacote', 'excluir_lotes') THEN
       RETURN v_mod = 'encomendas';
     END IF;
@@ -523,14 +676,20 @@ BEGIN
   END IF;
 
   IF v_eh_supervisor THEN
-    IF v_mod = 'historico_absoluto' THEN RETURN FALSE; END IF;
+    IF v_mod = 'historico_absoluto' THEN
+      RETURN v_acao IN ('visualizar', 'ver_feed', 'ver_metricas');
+    END IF;
     IF v_mod = 'custodia' AND v_acao IN ('editar', 'excluir') THEN RETURN FALSE; END IF;
     IF v_mod = 'rondas' AND v_acao IN ('setores', 'excluir') THEN RETURN FALSE; END IF;
     IF v_mod = 'bancada' AND v_acao IN ('zerar', 'excluir') THEN RETURN FALSE; END IF;
     IF v_mod = 'reservas' AND v_acao IN ('gerenciar_areas', 'excluir') THEN RETURN FALSE; END IF;
     IF v_mod = 'controle_acesso' AND v_acao IN ('configurar_portoes', 'excluir') THEN RETURN FALSE; END IF;
     IF v_mod = 'cadastros' THEN
-      RETURN v_acao IN ('visualizar_moradores', 'cadastrar_morador', 'editar_morador', 'gerenciar_veiculos', 'vincular_tags', 'status_acesso_morador', 'exportar_moradores', 'visualizar_operadores', 'criar', 'editar');
+      RETURN v_acao IN (
+        'visualizar', 'criar', 'editar', 'moradores', 'visualizar_moradores', 'cadastrar_morador',
+        'editar_morador', 'gerenciar_veiculos', 'vincular_tags', 'status_acesso_morador',
+        'exportar_moradores', 'visualizar_operadores'
+      );
     END IF;
     IF v_acao IN ('excluir', 'excluir_pacote', 'excluir_lotes') THEN
       RETURN v_mod = 'encomendas';
@@ -539,33 +698,35 @@ BEGIN
   END IF;
 
   IF v_mod = 'encomendas' THEN
-    RETURN v_acao IN ('criar', 'entrada_lote', 'criar_lote', 'cadastrar_entregador', 'triagem', 'baixa', 'historico');
+    RETURN v_acao IN ('visualizar', 'criar', 'entrada_lote', 'criar_lote', 'cadastrar_entregador', 'triagem', 'baixa', 'historico');
   ELSIF v_mod = 'custodia' THEN
-    RETURN v_acao IN ('criar', 'receber', 'baixa');
+    RETURN v_acao IN ('visualizar', 'criar', 'receber', 'baixa');
   ELSIF v_mod = 'chaves' THEN
-    RETURN v_acao IN ('criar', 'emprestar', 'devolver');
+    RETURN v_acao IN ('visualizar', 'criar', 'emprestar', 'devolver');
   ELSIF v_mod = 'rondas' THEN
-    RETURN v_acao IN ('criar', 'iniciar_ronda');
+    RETURN v_acao IN ('visualizar', 'criar', 'iniciar_ronda');
   ELSIF v_mod = 'autorizados' THEN
-    RETURN v_acao IN ('criar', 'cadastrar', 'dar_entrada', 'dar_saida');
+    RETURN v_acao IN ('visualizar', 'criar', 'cadastrar', 'dar_entrada', 'dar_saida');
   ELSIF v_mod = 'materiais' THEN
-    RETURN v_acao = 'alterar_status';
+    RETURN v_acao IN ('visualizar', 'alterar_status');
   ELSIF v_mod = 'manutencao' THEN
-    RETURN v_acao IN ('criar', 'abrir_os');
+    RETURN v_acao IN ('visualizar', 'criar', 'abrir_os');
   ELSIF v_mod = 'ocorrencias' THEN
-    RETURN v_acao = 'criar';
+    RETURN v_acao IN ('visualizar', 'criar');
   ELSIF v_mod = 'passagem_posto' THEN
-    RETURN v_acao IN ('criar', 'editar', 'assumir_posto');
+    RETURN v_acao IN ('visualizar', 'criar', 'editar', 'assumir_posto', 'relatorio');
   ELSIF v_mod = 'cadastros' THEN
     RETURN v_acao IN ('visualizar_moradores', 'cadastrar_morador', 'gerenciar_veiculos');
   ELSIF v_mod = 'moradores' THEN
-    RETURN v_acao IN ('criar', 'adicionar', 'cadastrar');
+    RETURN v_acao IN ('visualizar', 'criar', 'adicionar', 'cadastrar');
+  ELSIF v_mod = 'historico_absoluto' THEN
+    RETURN v_acao IN ('visualizar', 'ver_feed');
   ELSIF v_mod = 'bancada' THEN
-    RETURN v_acao IN ('criar', 'lancar', 'baixa');
+    RETURN v_acao IN ('visualizar', 'criar', 'lancar', 'baixa');
   ELSIF v_mod = 'reservas' THEN
-    RETURN v_acao IN ('criar', 'vistoria');
+    RETURN v_acao IN ('visualizar', 'criar', 'vistoria');
   ELSIF v_mod = 'controle_acesso' THEN
-    RETURN v_acao IN ('criar', 'editar', 'liberar_entrada', 'registrar_saida', 'gerar_passe_qr');
+    RETURN v_acao IN ('visualizar', 'criar', 'editar', 'liberar_entrada', 'registrar_saida', 'gerar_passe_qr');
   END IF;
 
   RETURN FALSE;
@@ -584,6 +745,208 @@ SECURITY DEFINER
 SET search_path = public, auth
 AS $$
   SELECT public.operador_tem_permissao_modulo(p_condominio_id::text, p_modulo, p_acao);
+$$;
+
+CREATE OR REPLACE FUNCTION public.operador_pode_registrar_auditoria(
+  p_condominio_id TEXT,
+  p_modulo TEXT,
+  p_acao TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, auth
+AS $$
+DECLARE
+  v_condo TEXT := trim(COALESCE(p_condominio_id, ''));
+  v_mod TEXT := lower(trim(COALESCE(p_modulo, '')));
+  v_acao TEXT := lower(trim(COALESCE(p_acao, '')));
+BEGIN
+  IF auth.uid() IS NULL OR v_mod = '' OR v_acao = '' THEN
+    RETURN FALSE;
+  END IF;
+
+  IF public.operador_tem_acesso_global() THEN
+    RETURN TRUE;
+  END IF;
+
+  IF v_condo = '' OR NOT public.operador_pode_acessar_condominio(v_condo) THEN
+    RETURN FALSE;
+  END IF;
+
+  v_mod := replace(replace(replace(replace(v_mod, 'ó', 'o'), 'ã', 'a'), 'ç', 'c'), 'á', 'a');
+
+  IF v_mod = 'sistema' THEN
+    IF v_acao IN ('login', 'logout') THEN
+      RETURN public.operador_pode_acessar_condominio(v_condo);
+    END IF;
+    IF v_acao = 'mute_alerta' THEN
+      RETURN public.operador_pode_gerenciar_operadores(v_condo);
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod IN ('limpeza de dados', 'historico_absoluto') THEN
+    IF v_acao IN ('limpeza_periodo', 'limpar_dados', 'excluir') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'historico_absoluto', 'limpar_dados');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'lembretes_portaria' THEN
+    IF v_acao IN ('lembrete_ciente', 'lembrete_finalizado', 'todos_lembretes_cientes', 'criar', 'editar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'liberar_entrada')
+          OR public.operador_tem_permissao_modulo(v_condo, 'ocorrencias', 'criar');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'encomendas' THEN
+    IF v_acao IN ('criar', 'entrada_lote', 'criar_lote', 'triagem', 'baixa', 'cadastrar_entregador', 'editar', 'editar_pacote', 'editar_lotes', 'excluir', 'excluir_pacote', 'excluir_lotes') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'encomendas', v_acao);
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'custodia' THEN
+    IF v_acao IN ('receber', 'criar', 'baixa', 'editar', 'excluir') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'custodia', v_acao);
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'chaves' THEN
+    IF v_acao IN ('criar', 'cadastrar', 'emprestar', 'editar', 'devolver', 'excluir') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'chaves', v_acao);
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod IN ('autorizados', 'prestadores') THEN
+    IF v_acao IN ('criar', 'cadastrar', 'dar_entrada', 'entrada') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'autorizados', CASE WHEN v_acao = 'entrada' THEN 'dar_entrada' ELSE v_acao END);
+    END IF;
+    IF v_acao IN ('editar', 'dar_saida', 'saida') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'autorizados', CASE WHEN v_acao = 'saida' THEN 'dar_saida' ELSE v_acao END);
+    END IF;
+    IF v_acao = 'excluir' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'autorizados', 'excluir');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'ocorrencias' THEN
+    IF v_acao IN ('criar', 'nova_ocorrencia_sindico') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'ocorrencias', 'criar');
+    END IF;
+    IF v_acao IN ('editar', 'resolver') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'ocorrencias', 'resolver');
+    END IF;
+    IF v_acao = 'excluir' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'ocorrencias', 'excluir');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'manutencao' THEN
+    IF v_acao IN ('criar', 'abrir_os', 'nova_os_sindico') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'manutencao', 'abrir_os');
+    END IF;
+    IF v_acao IN ('editar', 'concluir') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'manutencao', 'concluir');
+    END IF;
+    IF v_acao = 'excluir' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'manutencao', 'excluir');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod IN ('passagem de posto', 'passagem_posto', 'passagem') THEN
+    IF v_acao IN ('troca_operador_solicitada', 'troca_operador_efetivada', 'assumir_posto', 'criar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'passagem_posto', 'assumir_posto')
+          OR public.operador_tem_permissao_modulo(v_condo, 'passagem_posto', 'criar');
+    END IF;
+    IF v_acao = 'editar' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'passagem_posto', 'editar');
+    END IF;
+    IF v_acao = 'excluir' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'passagem_posto', 'excluir');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod = 'bancada' THEN
+    IF v_acao IN ('lancar', 'criar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'bancada', 'lancar')
+          OR public.operador_tem_permissao_modulo(v_condo, 'bancada', 'criar');
+    END IF;
+    IF v_acao IN ('baixa', 'baixa_volume', 'editar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'bancada', 'baixa')
+          OR public.operador_tem_permissao_modulo(v_condo, 'bancada', 'editar');
+    END IF;
+    IF v_acao = 'conferencia_realizada' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'bancada', 'zerar')
+          OR public.operador_tem_permissao_modulo(v_condo, 'bancada', 'lancar')
+          OR public.operador_tem_permissao_modulo(v_condo, 'bancada', 'criar');
+    END IF;
+    IF v_acao IN ('remover_item', 'zerar_bancada', 'zerar', 'excluir') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'bancada', 'zerar')
+          OR public.operador_tem_permissao_modulo(v_condo, 'bancada', 'excluir');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod IN ('controle de acesso', 'controle_acesso') THEN
+    IF v_acao IN ('entrada_registrada', 'passe_qr_consumido', 'liberar_entrada', 'criar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'liberar_entrada');
+    END IF;
+    IF v_acao IN ('saida_registrada', 'registrar_saida') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'registrar_saida');
+    END IF;
+    IF v_acao IN ('blacklist_atualizada', 'bloquear') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'bloquear');
+    END IF;
+    IF v_acao IN ('passe_virtual_gerado', 'gerar_passe_qr') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'gerar_passe_qr');
+    END IF;
+    IF v_acao IN ('configurar_portoes', 'editar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'configurar_portoes');
+    END IF;
+    IF v_acao = 'excluir' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'controle_acesso', 'excluir');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod IN ('reserva de areas', 'reservas') THEN
+    IF v_acao IN ('reserva_criada', 'criar') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'reservas', 'criar');
+    END IF;
+    IF v_acao IN ('reserva_atualizada', 'editar', 'vistoria', 'gerenciar_areas') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'reservas', CASE WHEN v_acao = 'reserva_atualizada' THEN 'editar' ELSE v_acao END)
+          OR (v_acao = 'reserva_atualizada' AND public.operador_tem_permissao_modulo(v_condo, 'reservas', 'criar'));
+    END IF;
+    IF v_acao IN ('status_cancelada', 'cancelar', 'excluir') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'reservas', 'cancelar')
+          OR public.operador_tem_permissao_modulo(v_condo, 'reservas', 'excluir');
+    END IF;
+    IF v_acao LIKE 'status_%' OR v_acao = 'aprovar' THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, 'reservas', 'aprovar')
+          OR public.operador_tem_permissao_modulo(v_condo, 'reservas', 'editar');
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  IF v_mod IN ('rondas', 'materiais', 'cadastros', 'moradores') THEN
+    IF v_acao NOT IN ('visualizar', 'ver_feed', 'ver_metricas', 'exportar_csv', 'historico', 'relatorio', 'dossie', 'auditoria', 'visualizar_moradores', 'visualizar_operadores', 'exportar_moradores') THEN
+      RETURN public.operador_tem_permissao_modulo(v_condo, v_mod, v_acao);
+    END IF;
+    RETURN FALSE;
+  END IF;
+
+  RETURN FALSE;
+END;
 $$;
 
 CREATE OR REPLACE FUNCTION public.operador_preserva_proprio_perfil(
@@ -671,6 +1034,7 @@ REVOKE ALL ON FUNCTION public.operador_pode_acessar_condominio(UUID) FROM PUBLIC
 REVOKE ALL ON FUNCTION public.operador_auth_email_corresponde(UUID, TEXT) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.operador_tem_permissao_modulo(TEXT, TEXT, TEXT) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.operador_tem_permissao_modulo(UUID, TEXT, TEXT) FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.operador_pode_registrar_auditoria(TEXT, TEXT, TEXT) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.operador_preserva_proprio_perfil(UUID, TEXT, TEXT, TEXT, INTEGER, TEXT, JSONB, BOOLEAN, UUID, BOOLEAN, TEXT, TEXT, BOOLEAN, UUID) FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.operador_pode_editar_alvo_local(UUID, UUID, TEXT, INTEGER, BOOLEAN) FROM PUBLIC, anon;
 
@@ -684,12 +1048,23 @@ GRANT EXECUTE ON FUNCTION public.operador_pode_acessar_condominio(UUID) TO authe
 GRANT EXECUTE ON FUNCTION public.operador_auth_email_corresponde(UUID, TEXT) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.operador_tem_permissao_modulo(TEXT, TEXT, TEXT) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.operador_tem_permissao_modulo(UUID, TEXT, TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.operador_pode_registrar_auditoria(TEXT, TEXT, TEXT) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.operador_preserva_proprio_perfil(UUID, TEXT, TEXT, TEXT, INTEGER, TEXT, JSONB, BOOLEAN, UUID, BOOLEAN, TEXT, TEXT, BOOLEAN, UUID) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.operador_pode_editar_alvo_local(UUID, UUID, TEXT, INTEGER, BOOLEAN) TO authenticated, service_role;
 
 -- ============================================================================
--- 2. RPC TRANSACIONAL DO PASSE VIRTUAL QR (SEM BYPASS POR current_user)
+-- 2. RPC TRANSACIONAL DO PASSE VIRTUAL QR (SCHEMA INTERNO PRIVADO + SEM BYPASS)
 -- ============================================================================
+CREATE SCHEMA IF NOT EXISTS porttohub_internal;
+REVOKE ALL ON SCHEMA porttohub_internal FROM PUBLIC, anon, authenticated;
+
+CREATE TABLE IF NOT EXISTS porttohub_internal.passe_qr_tx_autorizacao (
+  txid BIGINT PRIMARY KEY,
+  passe_id UUID NOT NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+REVOKE ALL ON TABLE porttohub_internal.passe_qr_tx_autorizacao FROM PUBLIC, anon, authenticated;
+
 CREATE OR REPLACE FUNCTION public.validar_e_consumir_passe_qr(
   p_condominio_id UUID,
   p_token TEXT,
@@ -700,7 +1075,7 @@ CREATE OR REPLACE FUNCTION public.validar_e_consumir_passe_qr(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, auth
+SET search_path = public, auth, porttohub_internal, pg_catalog
 AS $$
 DECLARE
   v_passe RECORD;
@@ -817,11 +1192,15 @@ BEGIN
   END IF;
 
   IF v_passe.data_validade IS NOT NULL AND v_passe.data_validade < v_hoje_br THEN
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
+    INSERT INTO porttohub_internal.passe_qr_tx_autorizacao (txid, passe_id, criado_em)
+    VALUES (txid_current(), v_passe.id, NOW())
+    ON CONFLICT (txid) DO UPDATE SET passe_id = EXCLUDED.passe_id, criado_em = EXCLUDED.criado_em;
+
     UPDATE public.passes_virtuais_qr
     SET status = 'expirado', updated_at = NOW()
     WHERE id = v_passe.id;
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
+
+    DELETE FROM porttohub_internal.passe_qr_tx_autorizacao WHERE txid = txid_current();
     v_passe.status := 'expirado';
     RETURN jsonb_build_object(
       'valido', FALSE,
@@ -864,11 +1243,15 @@ BEGIN
   v_usos_atuais := GREATEST(0, COALESCE(v_passe.usos_realizados, 0));
 
   IF v_usos_atuais >= v_max_usos THEN
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
+    INSERT INTO porttohub_internal.passe_qr_tx_autorizacao (txid, passe_id, criado_em)
+    VALUES (txid_current(), v_passe.id, NOW())
+    ON CONFLICT (txid) DO UPDATE SET passe_id = EXCLUDED.passe_id, criado_em = EXCLUDED.criado_em;
+
     UPDATE public.passes_virtuais_qr
     SET status = 'utilizado', updated_at = NOW()
     WHERE id = v_passe.id;
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
+
+    DELETE FROM porttohub_internal.passe_qr_tx_autorizacao WHERE txid = txid_current();
     v_passe.status := 'utilizado';
     RETURN jsonb_build_object(
       'valido', FALSE,
@@ -887,7 +1270,10 @@ BEGIN
   v_novos_usos := v_usos_atuais + 1;
   v_novo_status := CASE WHEN v_novos_usos >= v_max_usos THEN 'utilizado' ELSE 'valido' END;
 
-  PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
+  INSERT INTO porttohub_internal.passe_qr_tx_autorizacao (txid, passe_id, criado_em)
+  VALUES (txid_current(), v_passe.id, NOW())
+  ON CONFLICT (txid) DO UPDATE SET passe_id = EXCLUDED.passe_id, criado_em = EXCLUDED.criado_em;
+
   UPDATE public.passes_virtuais_qr
   SET
     usos_realizados = v_novos_usos,
@@ -895,7 +1281,6 @@ BEGIN
     updated_at = NOW()
   WHERE id = v_passe.id
   RETURNING * INTO v_passe;
-  PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
 
   INSERT INTO public.registros_acesso (
     condominio_id,
@@ -925,6 +1310,8 @@ BEGIN
     v_passe.id
   )
   RETURNING id INTO v_registro_id;
+
+  DELETE FROM porttohub_internal.passe_qr_tx_autorizacao WHERE txid = txid_current();
 
   RETURN jsonb_build_object(
     'valido', TRUE,
@@ -1070,12 +1457,11 @@ CREATE OR REPLACE FUNCTION public.proteger_campos_passe_qr()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
-SET search_path = public
+SET search_path = public, auth, pg_catalog
 AS $$
 DECLARE
   v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
   v_jwt_claims JSONB;
-  v_rpc_consumo TEXT := COALESCE(NULLIF(current_setting('porttohub.rpc_passe_qr_consumo', TRUE), ''), '');
   v_eh_admin_condo_ou_global BOOLEAN := FALSE;
 BEGIN
   IF v_jwt_role = '' THEN
@@ -1088,9 +1474,20 @@ BEGIN
   END IF;
 
   IF v_jwt_role = 'service_role'
-     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL)
-     OR (current_user IN ('postgres', 'supabase_admin') AND v_rpc_consumo = '1') THEN
+     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL) THEN
     RETURN NEW;
+  END IF;
+
+  IF current_user IN ('postgres', 'supabase_admin') AND TG_OP = 'UPDATE' THEN
+    IF EXISTS (
+      SELECT 1
+      FROM porttohub_internal.passe_qr_tx_autorizacao tx
+      WHERE tx.txid = txid_current()
+        AND tx.passe_id = OLD.id
+        AND tx.criado_em >= NOW() - INTERVAL '5 minutes'
+    ) THEN
+      RETURN NEW;
+    END IF;
   END IF;
 
   IF TG_OP = 'INSERT' THEN
@@ -1155,8 +1552,237 @@ CREATE TRIGGER trg_proteger_campos_passe_qr
   FOR EACH ROW
   EXECUTE FUNCTION public.proteger_campos_passe_qr();
 
+-- 3B. TRIGGERS DE PROTEÇÃO DE AUTORIA E INTEGRIDADE (historico_absoluto e registros_acesso)
+CREATE OR REPLACE FUNCTION public.proteger_autoria_historico_absoluto()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, auth, pg_catalog
+AS $$
+DECLARE
+  v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
+  v_jwt_claims JSONB;
+  v_op RECORD;
+  v_op_nome TEXT;
+BEGIN
+  IF v_jwt_role = '' THEN
+    BEGIN
+      v_jwt_claims := NULLIF(current_setting('request.jwt.claims', TRUE), '')::jsonb;
+      v_jwt_role := lower(trim(COALESCE(v_jwt_claims ->> 'role', '')));
+    EXCEPTION WHEN OTHERS THEN
+      v_jwt_role := '';
+    END;
+  END IF;
+
+  IF v_jwt_role = 'service_role'
+     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL) THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.condominio_id IS DISTINCT FROM OLD.condominio_id
+       OR NEW.operador_id::text IS DISTINCT FROM OLD.operador_id::text
+       OR NEW.operador_nome IS DISTINCT FROM OLD.operador_nome
+       OR NEW.operador_login IS DISTINCT FROM OLD.operador_login
+       OR NEW.modulo IS DISTINCT FROM OLD.modulo
+       OR NEW.acao IS DISTINCT FROM OLD.acao
+       OR NEW.descricao IS DISTINCT FROM OLD.descricao
+       OR NEW.criado_em IS DISTINCT FROM OLD.criado_em
+       OR NEW.data_hora IS DISTINCT FROM OLD.data_hora
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+      RAISE EXCEPTION 'Acesso negado: registros de auditoria (historico_absoluto) são imutáveis quanto à autoria, conteúdo e carimbo de tempo.';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Acesso negado: autenticação obrigatória para gravar auditoria.';
+  END IF;
+
+  SELECT o.id, o.nome, o.login, o.email
+  INTO v_op
+  FROM public.operadores o
+  WHERE o.auth_user_id = auth.uid()
+    AND COALESCE(o.ativo, TRUE) = TRUE
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Acesso negado: operador autenticado inativo ou sem vínculo válido para auditoria.';
+  END IF;
+
+  IF NOT public.operador_pode_registrar_auditoria(NEW.condominio_id::text, NEW.modulo, NEW.acao) THEN
+    RAISE EXCEPTION 'Acesso negado: operador não possui autorização para registrar auditoria no módulo "%" (ação "%").',
+      COALESCE(NEW.modulo, ''),
+      COALESCE(NEW.acao, '');
+  END IF;
+
+  v_op_nome := COALESCE(
+    NULLIF(trim(v_op.nome), ''),
+    NULLIF(trim(v_op.login), ''),
+    NULLIF(trim(v_op.email), ''),
+    'Operador Autenticado'
+  );
+
+  NEW.operador_id := v_op.id;
+  NEW.operador_nome := v_op_nome;
+  NEW.operador_login := COALESCE(NULLIF(trim(v_op.login), ''), v_op.email);
+  NEW.criado_em := NOW();
+  NEW.data_hora := NOW();
+  NEW.created_at := NOW();
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.proteger_autoria_historico_absoluto() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.proteger_autoria_historico_absoluto() TO authenticated, service_role;
+
+DO $$
+BEGIN
+  IF to_regclass('public.historico_absoluto') IS NOT NULL THEN
+    ALTER TABLE public.historico_absoluto
+      ADD COLUMN IF NOT EXISTS data_hora TIMESTAMPTZ DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+
+    DROP TRIGGER IF EXISTS trg_proteger_autoria_historico_absoluto ON public.historico_absoluto;
+    CREATE TRIGGER trg_proteger_autoria_historico_absoluto
+      BEFORE INSERT OR UPDATE ON public.historico_absoluto
+      FOR EACH ROW
+      EXECUTE FUNCTION public.proteger_autoria_historico_absoluto();
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.proteger_autoria_registros_acesso()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, auth, pg_catalog
+AS $$
+DECLARE
+  v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
+  v_jwt_claims JSONB;
+  v_op RECORD;
+  v_op_nome TEXT;
+  v_saida_ja_registrada BOOLEAN := FALSE;
+  v_marcando_saida BOOLEAN := FALSE;
+BEGIN
+  IF v_jwt_role = '' THEN
+    BEGIN
+      v_jwt_claims := NULLIF(current_setting('request.jwt.claims', TRUE), '')::jsonb;
+      v_jwt_role := lower(trim(COALESCE(v_jwt_claims ->> 'role', '')));
+    EXCEPTION WHEN OTHERS THEN
+      v_jwt_role := '';
+    END;
+  END IF;
+
+  IF v_jwt_role = 'service_role'
+     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL) THEN
+    RETURN NEW;
+  END IF;
+
+  IF current_user IN ('postgres', 'supabase_admin') AND TG_OP = 'INSERT' AND NEW.passe_qr_id IS NOT NULL THEN
+    IF EXISTS (
+      SELECT 1
+      FROM porttohub_internal.passe_qr_tx_autorizacao tx
+      WHERE tx.txid = txid_current()
+        AND tx.passe_id = NEW.passe_qr_id
+        AND tx.criado_em >= NOW() - INTERVAL '5 minutes'
+    ) THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Acesso negado: autenticação obrigatória para manipular registros de acesso.';
+  END IF;
+
+  SELECT o.id, o.nome, o.login, o.email
+  INTO v_op
+  FROM public.operadores o
+  WHERE o.auth_user_id = auth.uid()
+    AND COALESCE(o.ativo, TRUE) = TRUE
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Acesso negado: operador autenticado inativo ou sem vínculo válido.';
+  END IF;
+
+  v_op_nome := COALESCE(
+    NULLIF(trim(v_op.nome), ''),
+    NULLIF(trim(v_op.login), ''),
+    NULLIF(trim(v_op.email), ''),
+    'Operador Autenticado'
+  );
+
+  IF TG_OP = 'INSERT' THEN
+    NEW.operador_entrada_nome := v_op_nome;
+    NEW.data_hora := NOW();
+    NEW.data_hora_entrada := NOW();
+    NEW.created_at := NOW();
+    NEW.updated_at := NOW();
+    NEW.operador_saida_nome := NULL;
+    NEW.data_hora_saida := NULL;
+    IF NEW.status IS NULL OR trim(NEW.status) = '' THEN
+      NEW.status := 'presente';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.condominio_id IS DISTINCT FROM OLD.condominio_id
+     OR NEW.operador_entrada_nome IS DISTINCT FROM OLD.operador_entrada_nome
+     OR NEW.data_hora IS DISTINCT FROM OLD.data_hora
+     OR NEW.data_hora_entrada IS DISTINCT FROM OLD.data_hora_entrada
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at
+     OR NEW.passe_qr_id IS DISTINCT FROM OLD.passe_qr_id THEN
+    RAISE EXCEPTION 'Acesso negado: autoria e horário de entrada de registros_acesso são imutáveis.';
+  END IF;
+
+  v_saida_ja_registrada := (
+    OLD.data_hora_saida IS NOT NULL
+    OR NULLIF(trim(COALESCE(OLD.operador_saida_nome, '')), '') IS NOT NULL
+  );
+
+  v_marcando_saida := (
+    lower(COALESCE(NEW.status, '')) = 'saiu'
+    AND lower(COALESCE(OLD.status, '')) <> 'saiu'
+  ) OR (
+    NEW.data_hora_saida IS DISTINCT FROM OLD.data_hora_saida
+    OR NEW.operador_saida_nome IS DISTINCT FROM OLD.operador_saida_nome
+  );
+
+  IF v_saida_ja_registrada THEN
+    IF NEW.operador_saida_nome IS DISTINCT FROM OLD.operador_saida_nome
+       OR NEW.data_hora_saida IS DISTINCT FROM OLD.data_hora_saida THEN
+      RAISE EXCEPTION 'Acesso negado: autoria e horário de saída já registrados não podem ser alterados.';
+    END IF;
+  ELSIF v_marcando_saida THEN
+    NEW.operador_saida_nome := v_op_nome;
+    NEW.data_hora_saida := NOW();
+  END IF;
+
+  NEW.updated_at := NOW();
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.proteger_autoria_registros_acesso() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.proteger_autoria_registros_acesso() TO authenticated, service_role;
+
+DO $$
+BEGIN
+  IF to_regclass('public.registros_acesso') IS NOT NULL THEN
+    DROP TRIGGER IF EXISTS trg_proteger_autoria_registros_acesso ON public.registros_acesso;
+    CREATE TRIGGER trg_proteger_autoria_registros_acesso
+      BEFORE INSERT OR UPDATE ON public.registros_acesso
+      FOR EACH ROW
+      EXECUTE FUNCTION public.proteger_autoria_registros_acesso();
+  END IF;
+END $$;
+
 -- ============================================================================
--- 4. HIGIENIZAÇÃO DE PRIVILÉGIOS E DROP APENAS NAS 35 TABELAS CANÔNICAS
+-- 4. HIGIENIZAÇÃO DE PRIVILÉGIOS E DROP RESTRITO ÀS 35 TABELAS CANÔNICAS
 -- ============================================================================
 DO $$
 DECLARE
@@ -1179,7 +1805,9 @@ BEGIN
     SELECT c.relname
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    WHERE n.nspname = 'public'
+      AND c.relkind = 'r'
+      AND c.relname = ANY(todas_tabelas)
   LOOP
     EXECUTE format('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon;', rec.relname);
     EXECUTE format('REVOKE TRUNCATE, TRIGGER, REFERENCES ON TABLE public.%I FROM authenticated;', rec.relname);
@@ -1189,10 +1817,17 @@ BEGIN
   END LOOP;
 
   FOR rec IN
-    SELECT c.relname
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'S'
+    SELECT DISTINCT s.relname
+    FROM pg_class s
+    JOIN pg_namespace ns ON ns.oid = s.relnamespace
+    JOIN pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i')
+    JOIN pg_class t ON t.oid = d.refobjid
+    JOIN pg_namespace nt ON nt.oid = t.relnamespace
+    WHERE ns.nspname = 'public'
+      AND s.relkind = 'S'
+      AND nt.nspname = 'public'
+      AND t.relkind = 'r'
+      AND t.relname = ANY(todas_tabelas)
   LOOP
     EXECUTE format('REVOKE ALL ON SEQUENCE public.%I FROM PUBLIC, anon;', rec.relname);
     EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE public.%I TO authenticated;', rec.relname);
@@ -1446,7 +2081,15 @@ CREATE POLICY rls_historico_absoluto_select ON public.historico_absoluto
 
 CREATE POLICY rls_historico_absoluto_insert ON public.historico_absoluto
   FOR INSERT TO authenticated
-  WITH CHECK (condominio_id IS NOT NULL AND public.operador_pode_acessar_condominio(condominio_id::text));
+  WITH CHECK (
+    public.operador_atual_id() IS NOT NULL
+    AND (
+      (condominio_id IS NOT NULL AND public.operador_pode_acessar_condominio(condominio_id::text))
+      OR (condominio_id IS NULL AND public.operador_tem_acesso_global())
+    )
+    AND (operador_id IS NULL OR operador_id::text = public.operador_atual_id()::text)
+    AND public.operador_pode_registrar_auditoria(condominio_id::text, modulo, acao)
+  );
 
 CREATE POLICY rls_historico_absoluto_update ON public.historico_absoluto
   FOR UPDATE TO authenticated

@@ -108,6 +108,8 @@ import {
   MODULOS_DEFINICAO_RBAC,
   obterPermissoesPadraoNivel,
   obterPermissoesOperador,
+  extrairOverridesOperador,
+  extrairIdNivel,
   salvarPermissoesOperador,
   contarModulosHabilitados,
   verificarPermissao
@@ -738,9 +740,15 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
     setSalvandoPermissoesModal(true);
     try {
       const opId = operadorPermissoesModal.id || operadorPermissoesModal.login;
+      const overridesFinais: any = extrairOverridesOperador(
+        permissoesModalState,
+        extrairIdNivel(operadorPermissoesModal),
+        listaNiveis,
+        operadorPermissoesModal.unidade || operadorPermissoesModal.permissoes?.unidade_acesso || operadorPermissoesModal.permissoes?.unidade
+      );
       await salvarPermissoesOperador(
         opId,
-        permissoesModalState,
+        overridesFinais,
         operadorPermissoesModal.login,
         operadorPermissoesModal.condominio_id || condoAtivoId
       );
@@ -748,7 +756,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
       // Atualiza na lista de operadores após confirmação do servidor
       setOperadores(prev => prev.map(o => {
         if (o.id === operadorPermissoesModal.id || o.login === operadorPermissoesModal.login) {
-          return { ...o, permissoes: permissoesModalState };
+          return { ...o, permissoes: overridesFinais };
         }
         return o;
       }));
@@ -1116,9 +1124,7 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
           : opData.filter(op => idsPermitidosUsuario.includes(op.condominio_id) || (mapaLinks[op.id] || []).some(cid => idsPermitidosUsuario.includes(cid)));
         const opComPermissoes = opFiltrados.map(op => ({
           ...op,
-          permissoes: (op.permissoes && typeof op.permissoes === 'object' && Object.keys(op.permissoes).length > 0)
-            ? op.permissoes
-            : obterPermissoesOperador(op)
+          permissoes: (op.permissoes && typeof op.permissoes === 'object') ? op.permissoes : {}
         }));
         setOperadores(opComPermissoes);
         salvarCacheLocal('operadores', opComPermissoes, cacheEscopo);
@@ -1730,11 +1736,12 @@ export default function Cadastros({ usuarioLogado, condominioAtivoProp, onTrocar
         ? (funcaoCustomizada.trim() || 'Operador')
         : (funcaoOperador.trim() || 'Porteiro'));
 
-      const permissoesFinais: any = {
-        ...permissoesOperador,
-        unidade_acesso: unidadeFinal,
-        unidade: unidadeFinal
-      };
+      const permissoesFinais: any = extrairOverridesOperador(
+        permissoesOperador,
+        nivelAcesso,
+        listaNiveis,
+        unidadeFinal
+      );
 
       const fotoUrlNormalizada = normalizarCaminhoStorageParaBanco(fotoOperador) || null;
       const emailOriginalLimpo = String(opOriginal?.email || '').trim().toLowerCase();

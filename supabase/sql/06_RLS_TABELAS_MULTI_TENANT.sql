@@ -9,11 +9,14 @@
 --      `passes_virtuais_qr` bloqueando alteração direta pelo cliente de
 --      `usos_realizados`, `max_usos`, `limite_usos`, `status`, `token`,
 --      `token_hash`, `condominio_id`, datas e horários (consumo exclusivo pela
---      RPC `validar_e_consumir_passe_qr` ou `service_role`; cancelamento/ajuste
---      de validade apenas por admin autorizado sobre passe 'valido').
---   3. Revoga privilégios excessivos (PUBLIC, anon e TRUNCATE/TRIGGER/REFERENCES
---      de authenticated) em todas as tabelas e sequences do schema public.
---   4. Substitui políticas das 35 tabelas por políticas RLS granulares por
+--      RPC `validar_e_consumir_passe_qr` via marcador transacional em
+--      `porttohub_internal.passe_qr_tx_autorizacao` ou `service_role`).
+--   3. Cria triggers `SECURITY INVOKER` protegendo autoria e carimbos de
+--      tempo em `historico_absoluto` e `registros_acesso`.
+--   4. Pré-audita tabelas e sequences extras fora da lista canônica das 35
+--      tabelas sem alterá-las, e restringe revogação/concessão de privilégios
+--      e RLS estritamente às 35 tabelas oficiais e suas sequences vinculadas.
+--   5. Substitui políticas das 35 tabelas por políticas RLS granulares por
 --      operação (SELECT, INSERT, UPDATE, DELETE) exigindo permissões reais do
 --      módulo (`operador_tem_permissao_modulo`) e consistência relacional entre
 --      tabelas filhas e pais (sem referências cruzando condomínios).
@@ -166,16 +169,25 @@ END $$;
 -- 0B. PROTECAO DE CAMPOS CRITICOS DE PASSES QR (SECURITY INVOKER)
 --     Impede adulteração direta pelo cliente de usos_realizados, max_usos, limite_usos,
 --     status, token, condominio_id, datas e horários fora da RPC transacional autorizada.
+CREATE SCHEMA IF NOT EXISTS porttohub_internal;
+REVOKE ALL ON SCHEMA porttohub_internal FROM PUBLIC, anon, authenticated;
+
+CREATE TABLE IF NOT EXISTS porttohub_internal.passe_qr_tx_autorizacao (
+  txid BIGINT PRIMARY KEY,
+  passe_id UUID NOT NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+REVOKE ALL ON TABLE porttohub_internal.passe_qr_tx_autorizacao FROM PUBLIC, anon, authenticated;
+
 CREATE OR REPLACE FUNCTION public.proteger_campos_passe_qr()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY INVOKER
-SET search_path = public
+SET search_path = public, auth, pg_catalog
 AS $$
 DECLARE
   v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
   v_jwt_claims JSONB;
-  v_rpc_consumo TEXT := COALESCE(NULLIF(current_setting('porttohub.rpc_passe_qr_consumo', TRUE), ''), '');
   v_eh_admin_condo_ou_global BOOLEAN := FALSE;
 BEGIN
   IF v_jwt_role = '' THEN
@@ -190,11 +202,23 @@ BEGIN
   -- Permitido APENAS para:
   -- 1) Backend explícito (service_role)
   -- 2) Sessão SQL administrativa direta no banco (auth.uid() IS NULL)
-  -- 3) Atualização executada internamente pela RPC SECURITY DEFINER validar_e_consumir_passe_qr
   IF v_jwt_role = 'service_role'
-     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL)
-     OR (current_user IN ('postgres', 'supabase_admin') AND v_rpc_consumo = '1') THEN
+     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL) THEN
     RETURN NEW;
+  END IF;
+
+  -- 3) Atualização executada internamente pela RPC SECURITY DEFINER validar_e_consumir_passe_qr
+  --    (avaliado somente quando current_user já é o owner da RPC, evitando consulta à tabela privada por authenticated)
+  IF current_user IN ('postgres', 'supabase_admin') AND TG_OP = 'UPDATE' THEN
+    IF EXISTS (
+      SELECT 1
+      FROM porttohub_internal.passe_qr_tx_autorizacao tx
+      WHERE tx.txid = txid_current()
+        AND tx.passe_id = OLD.id
+        AND tx.criado_em >= NOW() - INTERVAL '5 minutes'
+    ) THEN
+      RETURN NEW;
+    END IF;
   END IF;
 
   IF TG_OP = 'INSERT' THEN
@@ -267,41 +291,246 @@ BEGIN
   END IF;
 END $$;
 
--- 1. HIGIENIZACAO DE PRIVILEGIOS EM TABELAS E SEQUENCES DO SCHEMA PUBLIC
+-- 0C. PROTECAO DE AUTORIA E INTEGRIDADE EM historico_absoluto E registros_acesso (SECURITY INVOKER)
+CREATE OR REPLACE FUNCTION public.proteger_autoria_historico_absoluto()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, auth, pg_catalog
+AS $$
+DECLARE
+  v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
+  v_jwt_claims JSONB;
+  v_op RECORD;
+  v_op_nome TEXT;
+BEGIN
+  IF v_jwt_role = '' THEN
+    BEGIN
+      v_jwt_claims := NULLIF(current_setting('request.jwt.claims', TRUE), '')::jsonb;
+      v_jwt_role := lower(trim(COALESCE(v_jwt_claims ->> 'role', '')));
+    EXCEPTION WHEN OTHERS THEN
+      v_jwt_role := '';
+    END;
+  END IF;
+
+  IF v_jwt_role = 'service_role'
+     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL) THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.condominio_id IS DISTINCT FROM OLD.condominio_id
+       OR NEW.operador_id::text IS DISTINCT FROM OLD.operador_id::text
+       OR NEW.operador_nome IS DISTINCT FROM OLD.operador_nome
+       OR NEW.operador_login IS DISTINCT FROM OLD.operador_login
+       OR NEW.modulo IS DISTINCT FROM OLD.modulo
+       OR NEW.acao IS DISTINCT FROM OLD.acao
+       OR NEW.descricao IS DISTINCT FROM OLD.descricao
+       OR NEW.criado_em IS DISTINCT FROM OLD.criado_em
+       OR NEW.data_hora IS DISTINCT FROM OLD.data_hora
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+      RAISE EXCEPTION 'Acesso negado: registros de auditoria (historico_absoluto) são imutáveis quanto à autoria, conteúdo e carimbo de tempo.';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Acesso negado: autenticação obrigatória para gravar auditoria.';
+  END IF;
+
+  SELECT o.id, o.nome, o.login, o.email
+  INTO v_op
+  FROM public.operadores o
+  WHERE o.auth_user_id = auth.uid()
+    AND COALESCE(o.ativo, TRUE) = TRUE
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Acesso negado: operador autenticado inativo ou sem vínculo válido para auditoria.';
+  END IF;
+
+  IF NOT public.operador_pode_registrar_auditoria(NEW.condominio_id::text, NEW.modulo, NEW.acao) THEN
+    RAISE EXCEPTION 'Acesso negado: operador não possui autorização para registrar auditoria no módulo "%" (ação "%").',
+      COALESCE(NEW.modulo, ''),
+      COALESCE(NEW.acao, '');
+  END IF;
+
+  v_op_nome := COALESCE(
+    NULLIF(trim(v_op.nome), ''),
+    NULLIF(trim(v_op.login), ''),
+    NULLIF(trim(v_op.email), ''),
+    'Operador Autenticado'
+  );
+
+  -- Força autoria real derivada de auth.uid() e carimbos de tempo do servidor
+  NEW.operador_id := v_op.id;
+  NEW.operador_nome := v_op_nome;
+  NEW.operador_login := COALESCE(NULLIF(trim(v_op.login), ''), v_op.email);
+  NEW.criado_em := NOW();
+  NEW.data_hora := NOW();
+  NEW.created_at := NOW();
+
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.proteger_autoria_historico_absoluto() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.proteger_autoria_historico_absoluto() TO authenticated, service_role;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'historico_absoluto') THEN
+    ALTER TABLE public.historico_absoluto
+      ADD COLUMN IF NOT EXISTS data_hora TIMESTAMPTZ DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+
+    DROP TRIGGER IF EXISTS trg_proteger_autoria_historico_absoluto ON public.historico_absoluto;
+    CREATE TRIGGER trg_proteger_autoria_historico_absoluto
+      BEFORE INSERT OR UPDATE ON public.historico_absoluto
+      FOR EACH ROW
+      EXECUTE FUNCTION public.proteger_autoria_historico_absoluto();
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.proteger_autoria_registros_acesso()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, auth, pg_catalog
+AS $$
+DECLARE
+  v_jwt_role TEXT := lower(trim(COALESCE(NULLIF(current_setting('request.jwt.claim.role', TRUE), ''), '')));
+  v_jwt_claims JSONB;
+  v_op RECORD;
+  v_op_nome TEXT;
+  v_saida_ja_registrada BOOLEAN := FALSE;
+  v_marcando_saida BOOLEAN := FALSE;
+BEGIN
+  IF v_jwt_role = '' THEN
+    BEGIN
+      v_jwt_claims := NULLIF(current_setting('request.jwt.claims', TRUE), '')::jsonb;
+      v_jwt_role := lower(trim(COALESCE(v_jwt_claims ->> 'role', '')));
+    EXCEPTION WHEN OTHERS THEN
+      v_jwt_role := '';
+    END;
+  END IF;
+
+  IF v_jwt_role = 'service_role'
+     OR (current_user IN ('postgres', 'supabase_admin') AND auth.uid() IS NULL) THEN
+    RETURN NEW;
+  END IF;
+
+  -- Permite inserção controlada proveniente da RPC SECURITY DEFINER validar_e_consumir_passe_qr
+  IF current_user IN ('postgres', 'supabase_admin') AND TG_OP = 'INSERT' AND NEW.passe_qr_id IS NOT NULL THEN
+    IF EXISTS (
+      SELECT 1
+      FROM porttohub_internal.passe_qr_tx_autorizacao tx
+      WHERE tx.txid = txid_current()
+        AND tx.passe_id = NEW.passe_qr_id
+        AND tx.criado_em >= NOW() - INTERVAL '5 minutes'
+    ) THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Acesso negado: autenticação obrigatória para manipular registros de acesso.';
+  END IF;
+
+  SELECT o.id, o.nome, o.login, o.email
+  INTO v_op
+  FROM public.operadores o
+  WHERE o.auth_user_id = auth.uid()
+    AND COALESCE(o.ativo, TRUE) = TRUE
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Acesso negado: operador autenticado inativo ou sem vínculo válido.';
+  END IF;
+
+  v_op_nome := COALESCE(
+    NULLIF(trim(v_op.nome), ''),
+    NULLIF(trim(v_op.login), ''),
+    NULLIF(trim(v_op.email), ''),
+    'Operador Autenticado'
+  );
+
+  IF TG_OP = 'INSERT' THEN
+    NEW.operador_entrada_nome := v_op_nome;
+    NEW.data_hora := NOW();
+    NEW.data_hora_entrada := NOW();
+    NEW.created_at := NOW();
+    NEW.updated_at := NOW();
+    NEW.operador_saida_nome := NULL;
+    NEW.data_hora_saida := NULL;
+    IF NEW.status IS NULL OR trim(NEW.status) = '' THEN
+      NEW.status := 'presente';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  -- UPDATE: impede alteração de dados históricos de entrada
+  IF NEW.id IS DISTINCT FROM OLD.id
+     OR NEW.condominio_id IS DISTINCT FROM OLD.condominio_id
+     OR NEW.operador_entrada_nome IS DISTINCT FROM OLD.operador_entrada_nome
+     OR NEW.data_hora IS DISTINCT FROM OLD.data_hora
+     OR NEW.data_hora_entrada IS DISTINCT FROM OLD.data_hora_entrada
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at
+     OR NEW.passe_qr_id IS DISTINCT FROM OLD.passe_qr_id THEN
+    RAISE EXCEPTION 'Acesso negado: autoria e horário de entrada de registros_acesso são imutáveis.';
+  END IF;
+
+  v_saida_ja_registrada := (
+    OLD.data_hora_saida IS NOT NULL
+    OR NULLIF(trim(COALESCE(OLD.operador_saida_nome, '')), '') IS NOT NULL
+  );
+
+  v_marcando_saida := (
+    lower(COALESCE(NEW.status, '')) = 'saiu'
+    AND lower(COALESCE(OLD.status, '')) <> 'saiu'
+  ) OR (
+    NEW.data_hora_saida IS DISTINCT FROM OLD.data_hora_saida
+    OR NEW.operador_saida_nome IS DISTINCT FROM OLD.operador_saida_nome
+  );
+
+  IF v_saida_ja_registrada THEN
+    IF NEW.operador_saida_nome IS DISTINCT FROM OLD.operador_saida_nome
+       OR NEW.data_hora_saida IS DISTINCT FROM OLD.data_hora_saida THEN
+      RAISE EXCEPTION 'Acesso negado: autoria e horário de saída já registrados não podem ser alterados.';
+    END IF;
+  ELSIF v_marcando_saida THEN
+    NEW.operador_saida_nome := v_op_nome;
+    NEW.data_hora_saida := NOW();
+  END IF;
+
+  NEW.updated_at := NOW();
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.proteger_autoria_registros_acesso() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.proteger_autoria_registros_acesso() TO authenticated, service_role;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'registros_acesso') THEN
+    DROP TRIGGER IF EXISTS trg_proteger_autoria_registros_acesso ON public.registros_acesso;
+    CREATE TRIGGER trg_proteger_autoria_registros_acesso
+      BEFORE INSERT OR UPDATE ON public.registros_acesso
+      FOR EACH ROW
+      EXECUTE FUNCTION public.proteger_autoria_registros_acesso();
+  END IF;
+END $$;
+
+-- 1. PRE-AUDITORIA + HIGIENIZACAO ESTRITA AS 35 TABELAS CANONICAS E SUAS SEQUENCES
 DO $$
 DECLARE
   rec RECORD;
-BEGIN
-  FOR rec IN
-    SELECT c.relname
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
-  LOOP
-    EXECUTE format('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon;', rec.relname);
-    EXECUTE format('REVOKE TRUNCATE, TRIGGER, REFERENCES ON TABLE public.%I FROM authenticated;', rec.relname);
-    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO authenticated;', rec.relname);
-    EXECUTE format('GRANT ALL ON TABLE public.%I TO service_role;', rec.relname);
-    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY;', rec.relname);
-  END LOOP;
-
-  FOR rec IN
-    SELECT c.relname
-    FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'S'
-  LOOP
-    EXECUTE format('REVOKE ALL ON SEQUENCE public.%I FROM PUBLIC, anon;', rec.relname);
-    EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE public.%I TO authenticated;', rec.relname);
-    EXECUTE format('GRANT ALL ON SEQUENCE public.%I TO service_role;', rec.relname);
-  END LOOP;
-END $$;
-
--- Remove apenas políticas das 35 tabelas oficiais antes de recriar políticas granulares
-DO $$
-DECLARE
   tbl TEXT;
   pol RECORD;
+  v_extra_tables TEXT := '';
+  v_extra_sequences TEXT := '';
   todas_tabelas TEXT[] := ARRAY[
     'condominios', 'operadores', 'operador_condominios',
     'configuracoes', 'templates_whatsapp', 'locais_armazenamento', 'pontos_acesso',
@@ -314,6 +543,74 @@ DECLARE
     'bancada_conferencias', 'agenda_emergencia', 'areas_comuns', 'blacklist_bloqueios'
   ];
 BEGIN
+  SELECT COALESCE(string_agg(c.relname, ', ' ORDER BY c.relname), '')
+  INTO v_extra_tables
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE n.nspname = 'public'
+    AND c.relkind = 'r'
+    AND NOT (c.relname = ANY(todas_tabelas));
+
+  IF v_extra_tables <> '' THEN
+    RAISE NOTICE 'AVISO (06): Tabelas extras detectadas em public que NAO pertencem as 35 oficiais e serao preservadas intactas (privilegios, RLS e politicas inalterados): %', v_extra_tables;
+  END IF;
+
+  SELECT COALESCE(string_agg(s.relname, ', ' ORDER BY s.relname), '')
+  INTO v_extra_sequences
+  FROM pg_class s
+  JOIN pg_namespace ns ON ns.oid = s.relnamespace
+  WHERE ns.nspname = 'public'
+    AND s.relkind = 'S'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_depend d
+      JOIN pg_class t ON t.oid = d.refobjid
+      JOIN pg_namespace nt ON nt.oid = t.relnamespace
+      WHERE d.objid = s.oid
+        AND d.deptype IN ('a', 'i')
+        AND nt.nspname = 'public'
+        AND t.relkind = 'r'
+        AND t.relname = ANY(todas_tabelas)
+    );
+
+  IF v_extra_sequences <> '' THEN
+    RAISE NOTICE 'AVISO (06): Sequences nao vinculadas as 35 tabelas oficiais serao preservadas intactas: %', v_extra_sequences;
+  END IF;
+
+  FOR rec IN
+    SELECT c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind = 'r'
+      AND c.relname = ANY(todas_tabelas)
+  LOOP
+    EXECUTE format('REVOKE ALL ON TABLE public.%I FROM PUBLIC, anon;', rec.relname);
+    EXECUTE format('REVOKE TRUNCATE, TRIGGER, REFERENCES ON TABLE public.%I FROM authenticated;', rec.relname);
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO authenticated;', rec.relname);
+    EXECUTE format('GRANT ALL ON TABLE public.%I TO service_role;', rec.relname);
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY;', rec.relname);
+  END LOOP;
+
+  FOR rec IN
+    SELECT DISTINCT s.relname
+    FROM pg_class s
+    JOIN pg_namespace ns ON ns.oid = s.relnamespace
+    JOIN pg_depend d ON d.objid = s.oid AND d.deptype IN ('a', 'i')
+    JOIN pg_class t ON t.oid = d.refobjid
+    JOIN pg_namespace nt ON nt.oid = t.relnamespace
+    WHERE ns.nspname = 'public'
+      AND s.relkind = 'S'
+      AND nt.nspname = 'public'
+      AND t.relkind = 'r'
+      AND t.relname = ANY(todas_tabelas)
+  LOOP
+    EXECUTE format('REVOKE ALL ON SEQUENCE public.%I FROM PUBLIC, anon;', rec.relname);
+    EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE public.%I TO authenticated;', rec.relname);
+    EXECUTE format('GRANT ALL ON SEQUENCE public.%I TO service_role;', rec.relname);
+  END LOOP;
+
+  -- Remove apenas políticas das 35 tabelas oficiais antes de recriar políticas granulares
   FOREACH tbl IN ARRAY todas_tabelas LOOP
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = tbl) THEN
       FOR pol IN SELECT policyname FROM pg_policies WHERE schemaname = 'public' AND tablename = tbl LOOP
@@ -583,7 +880,15 @@ BEGIN
 
     CREATE POLICY rls_historico_absoluto_insert ON public.historico_absoluto
       FOR INSERT TO authenticated
-      WITH CHECK (condominio_id IS NOT NULL AND public.operador_pode_acessar_condominio(condominio_id::text));
+      WITH CHECK (
+        public.operador_atual_id() IS NOT NULL
+        AND (
+          (condominio_id IS NOT NULL AND public.operador_pode_acessar_condominio(condominio_id::text))
+          OR (condominio_id IS NULL AND public.operador_tem_acesso_global())
+        )
+        AND (operador_id IS NULL OR operador_id::text = public.operador_atual_id()::text)
+        AND public.operador_pode_registrar_auditoria(condominio_id::text, modulo, acao)
+      );
 
     CREATE POLICY rls_historico_absoluto_update ON public.historico_absoluto
       FOR UPDATE TO authenticated

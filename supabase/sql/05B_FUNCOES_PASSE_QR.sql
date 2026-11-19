@@ -14,15 +14,25 @@
 --     comprovadamente `service_role`.
 --   - Usuário autenticado exige operador ativo, vínculo ao condomínio e
 --     permissão no módulo `controle_acesso` (`operador_tem_permissao_modulo`).
---   - Define flag transacional interna `porttohub.rpc_passe_qr_consumo = '1'`
---     apenas durante o UPDATE autorizado da RPC, permitindo que a trigger
---     `proteger_campos_passe_qr` bloqueie alterações diretas do cliente.
+--   - Registra autorização transacional interna em tabela privada do schema
+--     `porttohub_internal.passe_qr_tx_autorizacao` (sem acesso para PUBLIC,
+--     anon ou authenticated), eliminando qualquer GUC manipulável por cliente.
 --
 -- PRE-REQUISITO OBRIGATORIO:
 --   Execute após 01_CRIAR_TABELAS_DO_ZERO.sql e 05_FUNCOES_AUTORIZACAO.sql.
 -- ============================================================================
 
 BEGIN;
+
+CREATE SCHEMA IF NOT EXISTS porttohub_internal;
+REVOKE ALL ON SCHEMA porttohub_internal FROM PUBLIC, anon, authenticated;
+
+CREATE TABLE IF NOT EXISTS porttohub_internal.passe_qr_tx_autorizacao (
+  txid BIGINT PRIMARY KEY,
+  passe_id UUID NOT NULL,
+  criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+REVOKE ALL ON TABLE porttohub_internal.passe_qr_tx_autorizacao FROM PUBLIC, anon, authenticated;
 
 CREATE OR REPLACE FUNCTION public.validar_e_consumir_passe_qr(
   p_condominio_id UUID,
@@ -34,7 +44,7 @@ CREATE OR REPLACE FUNCTION public.validar_e_consumir_passe_qr(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, auth
+SET search_path = public, auth, porttohub_internal, pg_catalog
 AS $$
 DECLARE
   v_passe RECORD;
@@ -154,11 +164,15 @@ BEGIN
   END IF;
 
   IF v_passe.data_validade IS NOT NULL AND v_passe.data_validade < v_hoje_br THEN
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
+    INSERT INTO porttohub_internal.passe_qr_tx_autorizacao (txid, passe_id, criado_em)
+    VALUES (txid_current(), v_passe.id, NOW())
+    ON CONFLICT (txid) DO UPDATE SET passe_id = EXCLUDED.passe_id, criado_em = EXCLUDED.criado_em;
+
     UPDATE public.passes_virtuais_qr
     SET status = 'expirado', updated_at = NOW()
     WHERE id = v_passe.id;
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
+
+    DELETE FROM porttohub_internal.passe_qr_tx_autorizacao WHERE txid = txid_current();
     v_passe.status := 'expirado';
     RETURN jsonb_build_object(
       'valido', FALSE,
@@ -203,11 +217,15 @@ BEGIN
   v_usos_atuais := GREATEST(0, COALESCE(v_passe.usos_realizados, 0));
 
   IF v_usos_atuais >= v_max_usos THEN
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
+    INSERT INTO porttohub_internal.passe_qr_tx_autorizacao (txid, passe_id, criado_em)
+    VALUES (txid_current(), v_passe.id, NOW())
+    ON CONFLICT (txid) DO UPDATE SET passe_id = EXCLUDED.passe_id, criado_em = EXCLUDED.criado_em;
+
     UPDATE public.passes_virtuais_qr
     SET status = 'utilizado', updated_at = NOW()
     WHERE id = v_passe.id;
-    PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
+
+    DELETE FROM porttohub_internal.passe_qr_tx_autorizacao WHERE txid = txid_current();
     v_passe.status := 'utilizado';
     RETURN jsonb_build_object(
       'valido', FALSE,
@@ -226,7 +244,10 @@ BEGIN
   v_novos_usos := v_usos_atuais + 1;
   v_novo_status := CASE WHEN v_novos_usos >= v_max_usos THEN 'utilizado' ELSE 'valido' END;
 
-  PERFORM set_config('porttohub.rpc_passe_qr_consumo', '1', TRUE);
+  INSERT INTO porttohub_internal.passe_qr_tx_autorizacao (txid, passe_id, criado_em)
+  VALUES (txid_current(), v_passe.id, NOW())
+  ON CONFLICT (txid) DO UPDATE SET passe_id = EXCLUDED.passe_id, criado_em = EXCLUDED.criado_em;
+
   UPDATE public.passes_virtuais_qr
   SET
     usos_realizados = v_novos_usos,
@@ -234,7 +255,6 @@ BEGIN
     updated_at = NOW()
   WHERE id = v_passe.id
   RETURNING * INTO v_passe;
-  PERFORM set_config('porttohub.rpc_passe_qr_consumo', '', TRUE);
 
   INSERT INTO public.registros_acesso (
     condominio_id,
@@ -264,6 +284,8 @@ BEGIN
     v_passe.id
   )
   RETURNING id INTO v_registro_id;
+
+  DELETE FROM porttohub_internal.passe_qr_tx_autorizacao WHERE txid = txid_current();
 
   RETURN jsonb_build_object(
     'valido', TRUE,

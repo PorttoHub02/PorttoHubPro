@@ -43,48 +43,46 @@ export function isCondominioIdValido(id?: string | null): boolean {
 }
 
 /**
- * Regra C: Administrador Geral SOMENTE com flag explícito de banco/backend.
- * NUNCA concede acesso global por login === 'admin', 'master', nivel_acesso <= 1
- * ou condominio_id vazio / 'todos' / 'global'.
+ * Regra C: Administrador Geral SOMENTE com perfil = 'admin_geral',
+ * acesso_global_condominios === true e operador ativo (ativo !== false).
+ * Perfis desconhecidos, admin_local, admin, master, nivel_acesso <= 1 ou
+ * condominio_id vazio / 'todos' / 'global' NUNCA concedem acesso global ou administrativo.
  */
 export function temAcessoGlobalExplicito(operador?: any | null): boolean {
-  return Boolean(operador && operador.acesso_global_condominios === true);
+  if (!operador || operador.ativo === false || operador.acesso_global_condominios !== true) return false;
+  const perfil = String(operador.perfil || '').trim().toLowerCase();
+  return perfil === 'admin_geral';
 }
 
 /**
- * Normaliza perfis legados para o padrão oficial do banco:
+ * Normaliza perfis para o padrão oficial do banco:
  * admin_geral | admin_condominio | supervisor | operador
- * Regra estrita: sem `acesso_global_condominios = true`, NENHUM perfil vira `admin_geral`.
+ * Regra estrita:
+ * - admin_geral: somente perfil = 'admin_geral' com acesso_global_condominios = true e ativo
+ * - admin_condominio: somente perfil = 'admin_condominio'
+ * - admin_local, admin, master, desconhecidos, nivel_acesso e nivel_acesso_custom_id NÃO promovem a administrador.
  */
 export function normalizarPerfilOperador(operador?: any | null): PerfilPadrao {
+  if (!operador) return 'operador';
   if (temAcessoGlobalExplicito(operador)) {
     return 'admin_geral';
   }
-  if (!operador) return 'operador';
 
   const perfil = String(operador.perfil || '').trim().toLowerCase();
-  const nivel =
-    operador.nivel_acesso !== undefined && operador.nivel_acesso !== null
-      ? Number(operador.nivel_acesso)
-      : NaN;
 
-  if (
-    perfil === 'admin_condominio' ||
-    perfil === 'admin_local' ||
-    perfil === 'admin' ||
-    perfil === 'master' ||
-    nivel === 1
-  ) {
+  if (perfil === 'admin_condominio') {
     return 'admin_condominio';
   }
-  if (perfil === 'supervisor' || nivel === 2) {
+  if (perfil === 'supervisor') {
     return 'supervisor';
   }
   return 'operador';
 }
 
 export function ehAdminCondominio(operador?: any | null): boolean {
-  return !temAcessoGlobalExplicito(operador) && normalizarPerfilOperador(operador) === 'admin_condominio';
+  if (!operador || operador.ativo === false) return false;
+  if (temAcessoGlobalExplicito(operador)) return false;
+  return String(operador.perfil || '').trim().toLowerCase() === 'admin_condominio';
 }
 
 /**
@@ -117,28 +115,16 @@ export function podeGerenciarOperadoresNoCondominio(
 
 export function ehPerfilSupervisor(operador?: any | null): boolean {
   if (!operador || temAcessoGlobalExplicito(operador) || ehAdminCondominio(operador)) return false;
-  const perfil = String(operador.perfil || '').toLowerCase();
-  const funcao = String(operador.funcao || operador.cargo || '').toLowerCase();
-  return (
-    Number(operador.nivel_acesso) === 2 ||
-    perfil === 'supervisor' ||
-    funcao.includes('supervisor')
-  );
+  const perfil = String(operador.perfil || '').trim().toLowerCase();
+  return perfil === 'supervisor';
 }
 
 export function ehPerfilSindico(operador?: any | null): boolean {
-  if (!operador) return false;
-  const perfil = String(operador.perfil || '').toLowerCase();
-  const funcao = String(operador.funcao || operador.cargo || '').toLowerCase();
-  const nivelCustom = String(operador.nivel_acesso_custom_id || '').toLowerCase();
-  return (
-    Number(operador.nivel_acesso) === 4 ||
-    nivelCustom === 'nivel_4' ||
-    perfil === 'sindico' ||
-    perfil === 'síndico' ||
-    funcao.includes('síndic') ||
-    funcao.includes('sindic')
-  );
+  if (!operador || temAcessoGlobalExplicito(operador) || ehAdminCondominio(operador) || ehPerfilSupervisor(operador)) {
+    return false;
+  }
+  const perfil = String(operador.perfil || '').trim().toLowerCase();
+  return perfil === 'sindico' || perfil === 'síndico' || perfil.includes('sind');
 }
 
 export function ehPerfilPorteiroOuComum(operador?: any | null): boolean {
@@ -151,13 +137,7 @@ export function ehPerfilPorteiroOuComum(operador?: any | null): boolean {
   ) {
     return false;
   }
-  const perfil = String(operador.perfil || '').toLowerCase();
-  const nivel = operador.nivel_acesso !== undefined && operador.nivel_acesso !== null ? Number(operador.nivel_acesso) : 3;
-  // Nível 3+ ou perfil porteiro/operador/custom sem flag global são operadores comuns
-  if (perfil === 'operador' || perfil === 'porteiro' || nivel >= 3) {
-    return true;
-  }
-  return false;
+  return normalizarPerfilOperador(operador) === 'operador';
 }
 
 /**

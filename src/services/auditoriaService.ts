@@ -8,6 +8,8 @@
  */
 
 import { supabase } from './supabase';
+import { verificarPermissao } from './permissoesService';
+import { temAcessoGlobalExplicito, ehAdminCondominio, isCondominioIdValido } from './autorizacaoService';
 
 export interface RegistroAuditoria {
   id: string;
@@ -58,15 +60,55 @@ CREATE INDEX IF NOT EXISTS idx_hist_abs_criado_em ON public.historico_absoluto(c
 -- Habilitar RLS (Row Level Security)
 ALTER TABLE public.historico_absoluto ENABLE ROW LEVEL SECURITY;
 
--- Política restritiva isolada por condomínio para usuários autenticados
+-- Políticas granulares isoladas por condomínio e autoria para usuários autenticados
 DROP POLICY IF EXISTS "Acesso total portaria historico_absoluto" ON public.historico_absoluto;
 DROP POLICY IF EXISTS "rls_tenant_historico_absoluto" ON public.historico_absoluto;
-CREATE POLICY "rls_tenant_historico_absoluto"
+DROP POLICY IF EXISTS "rls_historico_absoluto_select" ON public.historico_absoluto;
+DROP POLICY IF EXISTS "rls_historico_absoluto_insert" ON public.historico_absoluto;
+DROP POLICY IF EXISTS "rls_historico_absoluto_update" ON public.historico_absoluto;
+DROP POLICY IF EXISTS "rls_historico_absoluto_delete" ON public.historico_absoluto;
+
+CREATE POLICY "rls_historico_absoluto_select"
   ON public.historico_absoluto
-  FOR ALL
+  FOR SELECT
   TO authenticated
-  USING (public.operador_pode_acessar_condominio(condominio_id::text))
-  WITH CHECK (public.operador_pode_acessar_condominio(condominio_id::text));
+  USING (
+    public.operador_pode_acessar_condominio(condominio_id::text)
+    AND public.operador_tem_permissao_modulo(condominio_id::text, 'historico_absoluto', 'visualizar')
+  );
+
+CREATE POLICY "rls_historico_absoluto_insert"
+  ON public.historico_absoluto
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    public.operador_atual_id() IS NOT NULL
+    AND (
+      (condominio_id IS NOT NULL AND public.operador_pode_acessar_condominio(condominio_id::text))
+      OR (condominio_id IS NULL AND public.operador_tem_acesso_global())
+    )
+    AND (operador_id IS NULL OR operador_id::text = COALESCE(public.operador_atual_id()::text, ''))
+    AND public.operador_pode_registrar_auditoria(condominio_id::text, modulo, acao)
+  );
+
+CREATE POLICY "rls_historico_absoluto_update"
+  ON public.historico_absoluto
+  FOR UPDATE
+  TO authenticated
+  USING (public.operador_tem_acesso_global())
+  WITH CHECK (public.operador_tem_acesso_global());
+
+CREATE POLICY "rls_historico_absoluto_delete"
+  ON public.historico_absoluto
+  FOR DELETE
+  TO authenticated
+  USING (
+    public.operador_pode_acessar_condominio(condominio_id::text)
+    AND (
+      public.operador_tem_acesso_global()
+      OR public.operador_tem_permissao_modulo(condominio_id::text, 'historico_absoluto', 'limpar_dados')
+    )
+  );
 
 -- Habilitar Realtime do Supabase com proteção contra duplicação
 DO $$
@@ -262,6 +304,222 @@ function salvarRegistroEmCacheLocal(registro: RegistroAuditoria): void {
   }
 }
 
+function removerRegistroCacheLocal(id: string): void {
+  try {
+    const raw = localStorage.getItem(CHAVE_STORAGE_HISTORICO);
+    if (!raw) return;
+    const lista: RegistroAuditoria[] = JSON.parse(raw);
+    const filtrados = Array.isArray(lista) ? lista.filter(r => r?.id !== id) : [];
+    localStorage.setItem(CHAVE_STORAGE_HISTORICO, JSON.stringify(filtrados));
+  } catch {
+    // noop
+  }
+}
+
+function normalizarModuloAuditoria(modulo: string): string {
+  return String(modulo || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+/**
+ * Valida se o operador ativo possui permissão operacional correspondente ao par (modulo, acao)
+ * antes de gravar evento no Histórico Absoluto (espelha public.operador_pode_registrar_auditoria).
+ */
+export function validarPermissaoAuditoriaLocal(
+  operador: any,
+  modulo: string,
+  acao: string,
+  condominioId?: string | null
+): boolean {
+  if (!operador || operador.ativo === false) return false;
+  const mod = normalizarModuloAuditoria(modulo);
+  const act = String(acao || '').trim().toLowerCase();
+  if (!mod || !act) return false;
+
+  if (temAcessoGlobalExplicito(operador)) {
+    return true;
+  }
+
+  if (condominioId !== undefined && condominioId !== null && !isCondominioIdValido(condominioId)) {
+    return false;
+  }
+
+  if (mod === 'sistema') {
+    if (act === 'login' || act === 'logout') return true;
+    if (act === 'mute_alerta') {
+      return ehAdminCondominio(operador);
+    }
+    return false;
+  }
+
+  if (mod === 'limpeza de dados' || mod === 'historico_absoluto') {
+    if (['limpeza_periodo', 'limpar_dados', 'excluir'].includes(act)) {
+      return verificarPermissao(operador, 'historico_absoluto', 'limpar_dados');
+    }
+    return false;
+  }
+
+  if (mod === 'lembretes_portaria') {
+    if (['lembrete_ciente', 'lembrete_finalizado', 'todos_lembretes_cientes', 'criar', 'editar'].includes(act)) {
+      return (
+        verificarPermissao(operador, 'controle_acesso', 'liberar_entrada') ||
+        verificarPermissao(operador, 'ocorrencias', 'criar')
+      );
+    }
+    return false;
+  }
+
+  if (mod === 'encomendas') {
+    const valid = [
+      'criar', 'entrada_lote', 'criar_lote', 'triagem', 'baixa', 'cadastrar_entregador',
+      'editar', 'editar_pacote', 'editar_lotes', 'excluir', 'excluir_pacote', 'excluir_lotes'
+    ];
+    return valid.includes(act) ? verificarPermissao(operador, 'encomendas', act) : false;
+  }
+
+  if (mod === 'custodia') {
+    return ['receber', 'criar', 'baixa', 'editar', 'excluir'].includes(act)
+      ? verificarPermissao(operador, 'custodia', act)
+      : false;
+  }
+
+  if (mod === 'chaves') {
+    return ['criar', 'cadastrar', 'emprestar', 'editar', 'devolver', 'excluir'].includes(act)
+      ? verificarPermissao(operador, 'chaves', act)
+      : false;
+  }
+
+  if (mod === 'autorizados' || mod === 'prestadores') {
+    if (['criar', 'cadastrar', 'dar_entrada', 'entrada'].includes(act)) {
+      return verificarPermissao(operador, 'autorizados', act === 'entrada' ? 'dar_entrada' : act);
+    }
+    if (['editar', 'dar_saida', 'saida'].includes(act)) {
+      return verificarPermissao(operador, 'autorizados', act === 'saida' ? 'dar_saida' : act);
+    }
+    if (act === 'excluir') {
+      return verificarPermissao(operador, 'autorizados', 'excluir');
+    }
+    return false;
+  }
+
+  if (mod === 'ocorrencias') {
+    if (['criar', 'nova_ocorrencia_sindico'].includes(act)) {
+      return verificarPermissao(operador, 'ocorrencias', 'criar');
+    }
+    if (['editar', 'resolver'].includes(act)) {
+      return verificarPermissao(operador, 'ocorrencias', 'resolver');
+    }
+    if (act === 'excluir') {
+      return verificarPermissao(operador, 'ocorrencias', 'excluir');
+    }
+    return false;
+  }
+
+  if (mod === 'manutencao') {
+    if (['criar', 'abrir_os', 'nova_os_sindico'].includes(act)) {
+      return verificarPermissao(operador, 'manutencao', 'abrir_os');
+    }
+    if (['editar', 'concluir'].includes(act)) {
+      return verificarPermissao(operador, 'manutencao', 'concluir');
+    }
+    if (act === 'excluir') {
+      return verificarPermissao(operador, 'manutencao', 'excluir');
+    }
+    return false;
+  }
+
+  if (mod === 'passagem de posto' || mod === 'passagem_posto' || mod === 'passagem') {
+    if (['troca_operador_solicitada', 'troca_operador_efetivada', 'assumir_posto', 'criar'].includes(act)) {
+      return (
+        verificarPermissao(operador, 'passagem_posto', 'assumir_posto') ||
+        verificarPermissao(operador, 'passagem_posto', 'criar')
+      );
+    }
+    if (act === 'editar' || act === 'excluir') {
+      return verificarPermissao(operador, 'passagem_posto', act);
+    }
+    return false;
+  }
+
+  if (mod === 'bancada') {
+    if (['lancar', 'criar'].includes(act)) {
+      return verificarPermissao(operador, 'bancada', 'lancar') || verificarPermissao(operador, 'bancada', 'criar');
+    }
+    if (['baixa', 'baixa_volume', 'editar'].includes(act)) {
+      return verificarPermissao(operador, 'bancada', 'baixa') || verificarPermissao(operador, 'bancada', 'editar');
+    }
+    if (act === 'conferencia_realizada') {
+      return (
+        verificarPermissao(operador, 'bancada', 'zerar') ||
+        verificarPermissao(operador, 'bancada', 'lancar') ||
+        verificarPermissao(operador, 'bancada', 'criar')
+      );
+    }
+    if (['remover_item', 'zerar_bancada', 'zerar', 'excluir'].includes(act)) {
+      return verificarPermissao(operador, 'bancada', 'zerar') || verificarPermissao(operador, 'bancada', 'excluir');
+    }
+    return false;
+  }
+
+  if (mod === 'controle de acesso' || mod === 'controle_acesso') {
+    if (['entrada_registrada', 'passe_qr_consumido', 'liberar_entrada', 'criar'].includes(act)) {
+      return verificarPermissao(operador, 'controle_acesso', 'liberar_entrada');
+    }
+    if (['saida_registrada', 'registrar_saida'].includes(act)) {
+      return verificarPermissao(operador, 'controle_acesso', 'registrar_saida');
+    }
+    if (['blacklist_atualizada', 'bloquear'].includes(act)) {
+      return verificarPermissao(operador, 'controle_acesso', 'bloquear');
+    }
+    if (['passe_virtual_gerado', 'gerar_passe_qr'].includes(act)) {
+      return verificarPermissao(operador, 'controle_acesso', 'gerar_passe_qr');
+    }
+    if (['configurar_portoes', 'editar'].includes(act)) {
+      return verificarPermissao(operador, 'controle_acesso', 'configurar_portoes');
+    }
+    if (act === 'excluir') {
+      return verificarPermissao(operador, 'controle_acesso', 'excluir');
+    }
+    return false;
+  }
+
+  if (mod === 'reserva de areas' || mod === 'reservas') {
+    if (['reserva_criada', 'criar'].includes(act)) {
+      return verificarPermissao(operador, 'reservas', 'criar');
+    }
+    if (['reserva_atualizada', 'editar', 'vistoria', 'gerenciar_areas'].includes(act)) {
+      const mapped = act === 'reserva_atualizada' ? 'editar' : act;
+      return (
+        verificarPermissao(operador, 'reservas', mapped) ||
+        (act === 'reserva_atualizada' && verificarPermissao(operador, 'reservas', 'criar'))
+      );
+    }
+    if (['status_cancelada', 'cancelar', 'excluir'].includes(act)) {
+      return verificarPermissao(operador, 'reservas', 'cancelar') || verificarPermissao(operador, 'reservas', 'excluir');
+    }
+    if (act.startsWith('status_') || act === 'aprovar') {
+      return verificarPermissao(operador, 'reservas', 'aprovar') || verificarPermissao(operador, 'reservas', 'editar');
+    }
+    return false;
+  }
+
+  if (['rondas', 'materiais', 'cadastros', 'moradores'].includes(mod)) {
+    const somenteLeitura = [
+      'visualizar', 'ver_feed', 'ver_metricas', 'exportar_csv', 'historico',
+      'relatorio', 'dossie', 'auditoria', 'visualizar_moradores', 'visualizar_operadores', 'exportar_moradores'
+    ];
+    if (!somenteLeitura.includes(act)) {
+      return verificarPermissao(operador, mod, act);
+    }
+    return false;
+  }
+
+  return false;
+}
+
 /**
  * Obtém os registros salvos em cache local
  */
@@ -280,13 +538,14 @@ export function obterHistoricoCacheLocal(): RegistroAuditoria[] {
 /**
  * REGISTRO CENTRAL DE ATIVIDADE:
  * Grava toda e qualquer atividade no sistema (quem, quando, o que, detalhes),
- * enviando para o Supabase e mantendo réplica local com disparo em tempo real.
+ * validando permissão do operador, enviando para o Supabase e mantendo réplica local após aceite do banco.
  */
 export async function registrarAtividade(params: {
   modulo: string;
   acao: string;
   descricao: string;
   detalhes?: any;
+  operador?: any;
   operador_nome?: string;
   operador_id?: string | null;
   operador_login?: string | null;
@@ -295,9 +554,16 @@ export async function registrarAtividade(params: {
   const agora = new Date().toISOString();
   const id = 'hist_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
 
-  let opNome = params.operador_nome;
-  let opId = params.operador_id;
-  let opLogin = params.operador_login;
+  const operadorContexto =
+    params.operador && typeof params.operador === 'object'
+      ? params.operador
+      : typeof window !== 'undefined'
+        ? (window as any).__operadorAtivo
+        : null;
+
+  let opNome = operadorContexto?.nome || operadorContexto?.login || params.operador_nome;
+  let opId = operadorContexto?.id || params.operador_id;
+  let opLogin = operadorContexto?.login || operadorContexto?.email || params.operador_login;
   let condoId = params.condominio_id;
 
   if (!opNome && typeof window !== 'undefined') {
@@ -313,7 +579,11 @@ export async function registrarAtividade(params: {
   }
 
   if (!condoId && typeof window !== 'undefined') {
-    condoId = (window as any).idCondominioAtivo || null;
+    condoId = (window as any).idCondominioAtivo || operadorContexto?.condominio_id || null;
+  }
+
+  if (operadorContexto && !validarPermissaoAuditoriaLocal(operadorContexto, params.modulo, params.acao, condoId)) {
+    throw new Error(`Acesso negado: operador sem autorização para registrar auditoria em ${params.modulo} (${params.acao}).`);
   }
 
   const registro: RegistroAuditoria = {
@@ -330,7 +600,7 @@ export async function registrarAtividade(params: {
     criado_em: agora
   };
 
-  // 1. Persistência imediata no cache local
+  // 1. Persistência imediata no cache local (revertida em caso de rejeição RLS/trigger no banco)
   salvarRegistroEmCacheLocal(registro);
 
   // 2. Dispara evento local para atualização instantânea na UI em tempo real
@@ -338,7 +608,7 @@ export async function registrarAtividade(params: {
     window.dispatchEvent(new CustomEvent('infport_historico_novo', { detail: registro }));
   }
 
-  // 3. Persistência na tabela do Supabase (assíncrona e resiliente)
+  // 3. Persistência no Supabase (trigger protege autoria e timestamps no servidor)
   try {
     const sanitizeUuid = (val: any): string | null => {
       if (!val || typeof val !== 'string') return null;
@@ -348,22 +618,42 @@ export async function registrarAtividade(params: {
 
     const payloadSupabase = {
       condominio_id: sanitizeUuid(registro.condominio_id),
-      operador_id: sanitizeUuid(registro.operador_id),
-      operador_nome: registro.operador_nome,
-      operador_login: registro.operador_login,
       modulo: registro.modulo,
       acao: registro.acao,
       descricao: registro.descricao,
       detalhes: registro.detalhes,
-      ip: registro.ip,
-      criado_em: registro.criado_em
+      ip: registro.ip
     };
 
     const { error } = await supabase.from('historico_absoluto').insert([payloadSupabase]);
     if (error) {
+      const msg = String(error.message || '').toLowerCase();
+      const erroAutorizacao =
+        error.code === '42501' ||
+        error.code === 'P0001' ||
+        msg.includes('acesso negado') ||
+        msg.includes('row-level security') ||
+        msg.includes('permission denied') ||
+        msg.includes('violates');
+
+      if (erroAutorizacao) {
+        removerRegistroCacheLocal(registro.id);
+        throw new Error(error.message || 'Registro de auditoria bloqueado pelas regras de segurança do servidor.');
+      }
+
       console.warn('[Auditoria] Aviso ao salvar no Supabase (verifique se a tabela historico_absoluto foi criada):', error.message);
     }
   } catch (err: any) {
+    const msg = String(err?.message || '').toLowerCase();
+    if (
+      msg.includes('acesso negado') ||
+      msg.includes('row-level security') ||
+      msg.includes('permission denied') ||
+      msg.includes('regras de segurança')
+    ) {
+      removerRegistroCacheLocal(registro.id);
+      throw err;
+    }
     console.warn('[Auditoria] Exceção de rede ao enviar histórico para Supabase:', err.message);
   }
 
